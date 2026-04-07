@@ -29,7 +29,7 @@ class TraceContext:
 
     def __repr__(self) -> str:  # noqa: D105
         chain = []
-        node: Self | None = self
+        node: TraceContext | None = self
         while node:
             chain.append(node.name)
             node = node.parent

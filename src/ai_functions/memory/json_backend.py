@@ -15,10 +15,9 @@ from tinydb.table import Document, Table
 from .. import ai_function
 from ..tools.local_python_executor import SAFE_BUILTINS  # noqa: F401
 from ..types.graph import ParameterGradient
-from ..utils import (
-    quiet_console,
-    to_yaml,  # noqa: F401
-)
+from ..utils import bullet_points as bullet_points  # noqa: F401
+from ..utils import quiet_console
+from ..utils import to_yaml as to_yaml  # noqa: F401
 from .base import DynamicToolProvider, MemoryBackend, ParameterMeta, ValueType
 from .procedural import Procedural, validate_procedural
 from .utils import flatten_schema, is_list_field, unflatten_fields
