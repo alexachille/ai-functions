@@ -601,7 +601,7 @@ class AIFunction[**P, R](ToolProvider):
         if self.config.code_execution_mode == CodeExecutionMode.LOCAL:
             # Exclude procedural parameters from initial_state — they are
             # executed as code, not injected as variables.
-            initial_state = {k: v for k, v in bound_args.items() if k not in procedural_inputs}
+            initial_state = {k: unwrap_nodes(v) for k, v in bound_args.items() if k not in procedural_inputs}
             python_executor_tool = LocalPythonExecutorTool(
                 output_type=self._structured_output_type,
                 initial_state=initial_state,
@@ -610,8 +610,11 @@ class AIFunction[**P, R](ToolProvider):
             )
             # Execute procedural parameter code in the python environment
             for name, param in procedural_inputs.items():
-                python_executor_tool._execute_code(param.value)
-                logger.debug(f"Executed procedural parameter '{name}' in python environment")
+                exec_result = python_executor_tool._execute_code(param.value)
+                if exec_result.success:
+                    logger.debug(f"Executed procedural parameter '{name}' in python environment")
+                else:
+                    logger.warning(f"Procedural parameter '{name}' failed to execute: {exec_result.error}")
             # Inject ai_function tools as callables in the code execution environment
             ai_fn_tools = {t.__name__: t.call for t in tools if isinstance(t, AIFunction)}
             if ai_fn_tools:

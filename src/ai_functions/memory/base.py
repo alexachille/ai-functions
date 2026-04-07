@@ -6,6 +6,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
+from pydantic_core import PydanticUndefinedType
 from strands import tool
 from strands.tools import ToolProvider
 from strands.types.tools import AgentTool
@@ -14,6 +15,7 @@ from ..types.graph import Derivation, ParameterGradient, ParameterMeta, Paramete
 from ..utils._formatting import unique_name
 from .frozen import FrozenMarker
 from .procedural import ProceduralMarker
+from .utils import flatten_schema
 
 ValueType = str | list[str]
 
@@ -23,6 +25,16 @@ class MemoryBackend(ABC):
 
     def __init__(self, schema: type[BaseModel], actor_id: str) -> None:
         """Initialize the memory backend."""
+        missing = [
+            path
+            for path, fi in flatten_schema(schema)
+            if isinstance(fi.default, PydanticUndefinedType) and fi.default_factory is None
+        ]
+        if missing:
+            raise ValueError(
+                f"All fields in the memory schema must have a default value or default_factory. "
+                f"Missing defaults for: {missing}"
+            )
         self.actor_id = actor_id
         self.schema = schema
         self._refs: dict[str, ParameterRef] = {}

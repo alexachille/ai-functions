@@ -29,6 +29,7 @@ from ai_functions import ai_function
 from ai_functions.memory.json_backend import JSONMemoryBackend
 from ai_functions.optimizer.textgrad import TextGradOptimizer
 from ai_functions.types.graph import Result
+from ai_functions.utils import bullet_points as bullet_points  # noqa: F401
 from ai_functions.utils import get_console, show_graph
 
 model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -77,7 +78,7 @@ def main(path: str | Path):
     cat_joke = joke_writer.trace('a joke about cats', joke_guidelines=memory.recall('joke_guidelines'))
     programmer_joke = joke_writer.trace('a joke about programmers', joke_guidelines=memory.recall('joke_guidelines'))
     result: Result[str] = email_writer.trace([cat_joke, programmer_joke],
-                                              formatting_guidelines=memory.recall('formatting_guidelines'))
+                                             formatting_guidelines=memory.recall('formatting_guidelines'))
 
     # `result` contains the representation of the entire graph leading to it. To extract the actual output we use .value
     display("Email Written", result.value, lang="markdown")
