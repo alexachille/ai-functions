@@ -3,7 +3,7 @@
 import contextvars
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Self
 
 # Stores the current trace context (used during graph construction to automatically register new graph nodes)
 
@@ -15,7 +15,7 @@ class TraceContext:
     forming a parent/child chain that mirrors the call stack.
     """
 
-    def __init__(self, name: str, parent: "TraceContext" | None = None) -> None:
+    def __init__(self, name: str, parent: Self | None = None) -> None:
         """Initialize a trace context node.
 
         Args:
@@ -29,7 +29,7 @@ class TraceContext:
 
     def __repr__(self) -> str:  # noqa: D105
         chain = []
-        node: TraceContext | None = self
+        node: Self | None = self
         while node:
             chain.append(node.name)
             node = node.parent
