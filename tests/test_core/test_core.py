@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from ai_functions.core import AIFunction
 from ai_functions.types.ai_function import AIFunctionConfig, CodeExecutionMode
 from ai_functions.types.errors import AIFunctionError, ValidationError
+from ai_functions.types.graph import Result
 from ai_functions.utils._template import Interpolation, Template
 from ai_functions.validation.post_conditions import PostConditionResult
 
@@ -462,7 +463,6 @@ class TestAIFunctionPromptBuilding:
 
         assert "Hello, Alice! Please help me." in prompt
         assert "docstring" not in prompt.lower()
-        assert "FinalAnswer" in prompt  # Structured output instructions added
 
     @pytest.mark.asyncio
     async def test_falls_back_to_docstring_when_return_is_none(self):
@@ -1309,7 +1309,12 @@ class TestAsyncFunctionCall:
         ai_func = AIFunction(async_func, config)
 
         with patch.object(ai_func, "_run_agent", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = (SampleModel(name="test", value=42), [])
+            mock_run.return_value = Result(
+                value=SampleModel(name="test", value=42),
+                name="async_func",
+                func=ai_func,
+                agent=MagicMock(),
+            )
 
             result = await ai_func(5)
 
@@ -1350,10 +1355,17 @@ class TestExecuteAsyncRetryLogic:
 
         call_count = 0
 
-        async def mock_run_agent(bound_args, messages):
+        async def mock_run_agent(bound_args, result):
             nonlocal call_count
             call_count += 1
-            return SampleModel(name="test", value=call_count), messages
+            mock_agent = MagicMock()
+            mock_agent.messages = []
+            return Result(
+                value=SampleModel(name="test", value=call_count),
+                name="func",
+                func=ai_func,
+                agent=mock_agent,
+            )
 
         validation_call_count = 0
 
@@ -1381,8 +1393,15 @@ class TestExecuteAsyncRetryLogic:
         config = AIFunctionConfig(code_execution_mode=CodeExecutionMode.DISABLED, max_attempts=1)
         ai_func = AIFunction(func, config)
 
-        async def mock_run_agent(bound_args, messages):
-            return SampleModel(name="test", value=1), messages
+        async def mock_run_agent(bound_args, result):
+            mock_agent = MagicMock()
+            mock_agent.messages = []
+            return Result(
+                value=SampleModel(name="test", value=1),
+                name="func",
+                func=ai_func,
+                agent=mock_agent,
+            )
 
         async def mock_validate(result, bound_args):
             raise ValidationError(function_name="func", validation_errors={"check": "Always fails"})
@@ -1451,17 +1470,17 @@ class TestRunAgent:
 
         mock_agent = MagicMock()
         mock_agent.invoke_async = AsyncMock(return_value=MagicMock(structured_output=SampleModel(name="test", value=1)))
-        mock_agent.messages = [{"role": "user", "content": [{"text": "test"}]}]
+        mock_agent.messages = []
 
         with patch.object(ai_func, "_create_agent", return_value=mock_agent):
             with patch.object(ai_func, "_build_prompt", new_callable=AsyncMock) as mock_prompt:
                 mock_prompt.return_value = "Test prompt"
 
-                result, messages = await ai_func._run_agent({"x": 5}, [])
+                await ai_func._run_agent({"x": 5}, None)
 
                 mock_prompt.assert_called_once_with({"x": 5})
                 mock_agent.invoke_async.assert_called_once()
-                assert mock_agent.invoke_async.call_args[0][0] == "Test prompt"
+                assert mock_agent.invoke_async.call_args[0][0].startswith("Test prompt")
 
     @pytest.mark.asyncio
     async def test_run_agent_skips_prompt_on_retry(self):
@@ -1478,12 +1497,17 @@ class TestRunAgent:
         mock_agent.invoke_async = AsyncMock(return_value=MagicMock(structured_output=SampleModel(name="test", value=1)))
         mock_agent.messages = [{"role": "user", "content": [{"text": "test"}]}]
 
-        existing_messages = [{"role": "user", "content": [{"text": "previous"}]}]
+        existing_result = Result(
+            value=SampleModel(name="prev", value=0),
+            name="func",
+            func=ai_func,
+            agent=mock_agent,
+        )
 
         with patch.object(ai_func, "_create_agent", return_value=mock_agent):
             with patch.object(ai_func, "_build_prompt", new_callable=AsyncMock) as mock_prompt:
                 mock_prompt.return_value = "Test prompt"
-                result, messages = await ai_func._run_agent({"x": 5}, existing_messages)
+                await ai_func._run_agent({"x": 5}, existing_result)
 
                 # _build_prompt is still called to get prompt for invocation_state
                 mock_prompt.assert_called_once()

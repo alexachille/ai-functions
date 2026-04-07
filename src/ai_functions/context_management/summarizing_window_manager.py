@@ -9,7 +9,7 @@ from strands.types.content import Message
 from strands.types.exceptions import ContextWindowOverflowException
 
 from ai_functions import ai_function
-from ai_functions.core import AIFunction
+from ai_functions.core import SyncAIFunction
 
 if TYPE_CHECKING:
     from strands.agent import Agent
@@ -66,19 +66,19 @@ class SummarizingWindowConversationManager(ConversationManager):
         self,
         max_tokens: int,
         preserve_recent_messages: int,
-        summarization_function: AIFunction | None = None,
+        summarization_function: SyncAIFunction | None = None,
     ):
         """Initialize the summarizing conversation manager.
 
         Args:
             max_tokens: Maximum number of tokens before triggering summarization.
             preserve_recent_messages: Number of recent messages to always preserve.
-            summarization_function: AI Function to use to summarize the conversation history.
+            summarization_function: Synchronous AI Function to use to summarize the conversation history.
         """
         super().__init__()
         self.max_tokens = max_tokens
         self.preserve_recent_messages = preserve_recent_messages
-        self.summarization_function = summarization_function or _default_summarizer
+        self.summarization_function: SyncAIFunction = summarization_function or _default_summarizer
         self._max_words_per_message: int = 8000
 
     def _extract_text_from_message(self, message: Message) -> str:

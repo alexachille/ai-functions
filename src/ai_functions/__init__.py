@@ -12,12 +12,17 @@ Usage:
         '''Summarize: {text}'''
 """
 
+from .core import AsyncAIFunction, SyncAIFunction
 from .decorator import ai_function
-from .types import AIFunctionConfig, CodeExecutionMode, PostConditionResult
+from .types import AIFunctionConfig, CodeExecutionMode, ParameterView, PostConditionResult, Result
 
 __all__ = [
+    "AsyncAIFunction",
+    "SyncAIFunction",
     "AIFunctionConfig",
     "CodeExecutionMode",
     "PostConditionResult",
     "ai_function",
+    "Result",
+    "ParameterView",
 ]

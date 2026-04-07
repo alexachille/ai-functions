@@ -3,7 +3,6 @@
 Tests for is_pydantic_model and is_json_serializable_type functions.
 """
 
-
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import BaseModel

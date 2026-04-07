@@ -8,6 +8,8 @@ Direct integration of AI agents in standard workflows is often avoided due to th
 
 Through AI Functions, developers can construct agentic workflows and agent graphs — including asynchronous ones — by writing and composing functions. They can build shareable libraries of robust, reusable agentic flows in exactly the same way they build software libraries today, and can use standard software development practices to collaborate on refining and ensuring the safety of each component.
 
+AI Functions also support persistent memory and workflow optimization. Just as PyTorch or JAX let you optimize parameters via backpropagation through a computation graph, AI Functions let you optimize agentic workflows via natural-language feedback propagation. You define named parameters (prompt fragments, learned facts, or reusable Python code), store them in a pluggable memory backend, and trace your workflow to build a graph. The optimizer walks it backward, propagates the feedback, and updates the parameters accordingly.
+
 
 ## Getting Started
 
@@ -189,6 +191,57 @@ def report_writer(topic: str) -> str:
     """
 ```
 
+### Memory & Optimization
+
+AI Functions support persistent memory and workflow optimization through a three-part system: a *memory backend* stores named parameters, `.trace()` builds a *computation graph* recording which parameters contributed to each output, and an *optimizer* propagates natural-language feedback backward through the graph to update only the parameters responsible for an issue.
+
+```python
+from pydantic import BaseModel, Field
+from ai_functions import ai_function, Result
+from ai_functions.memory import JSONMemoryBackend
+from ai_functions.optimizer import TextGradOptimizer
+from ai_functions.utils import show_graph
+
+@ai_function
+def write_summary(text: str, tone_guidelines: str) -> str:
+    """
+    Summarize the following text:
+    {text}
+
+    Follow these tone guidelines:
+    {tone_guidelines}
+    """
+
+# Memory parameters are defined as a Pydantic schema: types, defaults, and descriptions
+# guide the optimizer in understanding what each parameter represents
+class WritingMemory(BaseModel):
+    tone_guidelines: str = Field(
+        "No specific guidelines yet.",
+        description="Guidelines for the tone of the writing",
+    )
+
+# Both backends and optimizers are pluggable: subclass MemoryBackend or Optimizer to provide your own
+memory = JSONMemoryBackend(WritingMemory, actor_id="user-1", path="memory.json")
+optimizer = TextGradOptimizer()
+
+# Use .trace() instead of a direct call to record the computation graph
+guidelines = memory.recall("tone_guidelines")
+result: Result[str] = write_summary.trace("some long document...", tone_guidelines=guidelines)
+print(result.value)  # the actual output string
+
+# Propagate feedback backward through the graph to determine which parameters need to change
+optimizer.backward(result, "The summary should be more concise and use bullet points.")
+
+# Visualize the graph with propagated feedback before committing changes
+show_graph(result, open_browser=True)
+
+# Commit the updated parameter values to memory; next run will use the improved guidelines
+optimizer.consolidate(result)
+memory.close()
+```
+
+The graph extends naturally across multi-step workflows: intermediate `Result` nodes can be passed as inputs to downstream functions, and the optimizer will attribute feedback to the right step. See `examples/memory_optimization.py` for a full multi-agent example, and the [tutorial](docs/tutorial.md) for details on memory backends, procedural parameters, and exposing memory as agent tools.
+
 
 ## Tutorial
 
@@ -203,7 +256,7 @@ The `"local"` execution mode uses AST-based validation of the generated code wit
 This repository includes several complete examples demonstrating different capabilities. To run the examples:
 ```bash
 # Clone the repository
-git clone https://github.com/strandslabs/strands-ai-functions
+git clone https://github.com/strands-labs/ai-functions
 cd strands-ai-functions/examples
 
 # optional: set env variable to enable rich tool visualization in the terminal

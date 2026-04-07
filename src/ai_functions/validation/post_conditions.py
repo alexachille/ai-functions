@@ -207,7 +207,7 @@ class PostConditionRunner:
         # Convert any infrastructure exceptions to PostConditionResult
         processed_results = []
         for i, result_or_exception in enumerate(results):
-            if isinstance(result_or_exception, Exception):
+            if isinstance(result_or_exception, BaseException):
                 condition_name = _get_callable_name(conditions[i])
                 logger.error(
                     f"Post-condition '{condition_name}' validation infrastructure failure: "

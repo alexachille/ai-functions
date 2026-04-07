@@ -4,11 +4,14 @@ Tests for Template, Interpolation, generate_template, render_template_with_inden
 and _count_leading_spaces_to_match functions.
 """
 
+import pytest
+from tstr import f as render_t
+from tstr import generate_template
+
 from ai_functions.utils._template import (
     Interpolation,
     Template,
     _count_leading_spaces_to_match,
-    generate_template,
     render_template_with_indent,
 )
 
@@ -19,32 +22,32 @@ class TestGenerateTemplate:
     def test_substitutes_simple_placeholder(self):
         """Simple {name} placeholder is substituted."""
         result = generate_template("Hello {name}!", {"name": "World"})
-        assert result == "Hello World!"
+        assert render_t(result) == "Hello World!"
 
     def test_substitutes_multiple_placeholders(self):
         """Multiple placeholders are all substituted."""
         result = generate_template("{a} + {b} = {c}", {"a": "1", "b": "2", "c": "3"})
-        assert result == "1 + 2 = 3"
+        assert render_t(result) == "1 + 2 = 3"
 
-    def test_leaves_unknown_placeholder_unchanged(self):
-        """Unknown placeholders are left as-is."""
-        result = generate_template("Hello {name}!", {})
-        assert result == "Hello {name}!"
+    def test_raises_key_error_for_unknown_placeholder(self):
+        """Unknown placeholders raise KeyError."""
+        with pytest.raises(KeyError):
+            generate_template("Hello {name}!", {})
 
     def test_eval_mode_evaluates_expressions(self):
         """With use_eval=True, expressions are evaluated."""
         result = generate_template("{x + y}", {"x": 1, "y": 2}, use_eval=True)
-        assert result == "3"
+        assert render_t(result) == "3"
 
     def test_eval_mode_handles_string_methods(self):
         """With use_eval=True, string methods work."""
         result = generate_template("{name.upper()}", {"name": "hello"}, use_eval=True)
-        assert result == "HELLO"
+        assert render_t(result) == "HELLO"
 
-    def test_eval_mode_leaves_invalid_expr_unchanged(self):
-        """Invalid expressions are left unchanged in eval mode."""
-        result = generate_template("{undefined_var}", {}, use_eval=True)
-        assert result == "{undefined_var}"
+    def test_eval_mode_raises_for_undefined_var(self):
+        """Undefined expressions raise NameError in eval mode."""
+        with pytest.raises(NameError):
+            generate_template("{undefined_var}", {}, use_eval=True)
 
 
 class TestRenderTemplateWithIndent:
@@ -153,47 +156,47 @@ class TestGenerateTemplateEdgeCases:
     def test_escaped_braces_become_literal(self):
         """Escaped braces {{}} become literal braces."""
         result = generate_template("Use {{braces}} for literals", {})
-        assert result == "Use {braces} for literals"
+        assert render_t(result) == "Use {braces} for literals"
 
     def test_format_spec_applied(self):
         """Format specifications are applied to values."""
         result = generate_template("Pi is {pi:.2f}", {"pi": 3.14159})
-        assert result == "Pi is 3.14"
+        assert render_t(result) == "Pi is 3.14"
 
     def test_format_spec_with_width(self):
         """Width format spec works correctly."""
         result = generate_template("Value: {x:>5}", {"x": 42})
-        assert result == "Value:    42"
+        assert render_t(result) == "Value:    42"
 
     def test_conversion_str(self):
         """!s conversion calls str()."""
         result = generate_template("Value: {x!s}", {"x": 123})
-        assert result == "Value: 123"
+        assert render_t(result) == "Value: 123"
 
     def test_conversion_repr(self):
         """!r conversion calls repr()."""
         result = generate_template("Value: {x!r}", {"x": "hello"})
-        assert result == "Value: 'hello'"
+        assert render_t(result) == "Value: 'hello'"
 
     def test_conversion_ascii(self):
         """!a conversion calls ascii()."""
         result = generate_template("Value: {x!a}", {"x": "héllo"})
-        assert result == "Value: 'h\\xe9llo'"
+        assert render_t(result) == "Value: 'h\\xe9llo'"
 
     def test_mixed_escaped_and_placeholders(self):
         """Mix of escaped braces and placeholders works."""
         result = generate_template("{{literal}} and {var}", {"var": "value"})
-        assert result == "{literal} and value"
+        assert render_t(result) == "{literal} and value"
 
     def test_format_spec_with_conversion(self):
         """Format spec combined with conversion works."""
         result = generate_template("{x!s:>10}", {"x": 42})
-        assert result == "        42"
+        assert render_t(result) == "        42"
 
-    def test_empty_placeholder_left_unchanged(self):
-        """Empty placeholder {} is left unchanged."""
-        result = generate_template("Empty: {}", {})
-        assert result == "Empty: {}"
+    def test_empty_placeholder_raises_key_error(self):
+        """Empty placeholder {} raises KeyError."""
+        with pytest.raises(KeyError):
+            generate_template("Empty: {}", {})
 
     def test_nested_attribute_with_eval(self):
         """Nested attribute access works with eval."""
@@ -202,9 +205,9 @@ class TestGenerateTemplateEdgeCases:
             value = 42
 
         result = generate_template("Value: {obj.value}", {"obj": Obj()}, use_eval=True)
-        assert result == "Value: 42"
+        assert render_t(result) == "Value: 42"
 
     def test_list_index_with_eval(self):
         """List indexing works with eval."""
         result = generate_template("First: {items[0]}", {"items": ["a", "b", "c"]}, use_eval=True)
-        assert result == "First: a"
+        assert render_t(result) == "First: a"

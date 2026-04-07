@@ -19,6 +19,47 @@ from strands import ToolContext, tool
 
 from ..utils._type import generate_signature_from_model
 
+SAFE_BUILTINS = [
+    "math",
+    "cmath",
+    "decimal",
+    "fractions",
+    "random",
+    "statistics",
+    "numbers",
+    "collections",
+    "heapq",
+    "bisect",
+    "array",
+    "queue",
+    "copy",
+    "pprint",
+    "enum",
+    "dataclasses",
+    "graphlib",
+    "string",
+    "re",
+    "textwrap",
+    "unicodedata",
+    "difflib",
+    "stringprep",
+    "datetime",
+    "calendar",
+    "zoneinfo",
+    "itertools",
+    "functools",
+    "operator",
+    "typing",
+    "types",
+    "abc",
+    "contextlib",
+    "json",
+    "base64",
+    "binascii",
+    "html",
+    "hashlib",
+]
+
 
 class PythonExecuteResult(BaseModel):
     """Result from local Python code execution.
@@ -95,8 +136,8 @@ class LocalPythonExecutorTool:
         # Create the smolagents executor with final_answer as a static tool.
         # final_answer is the callback used to capture the final answer from execution env.
         self._code_executor = LocalPythonExecutor(
-            additional_authorized_imports=additional_authorized_imports if additional_authorized_imports else [],
-            additional_functions={"final_answer": self._set_execution_result},
+            additional_authorized_imports=SAFE_BUILTINS + list(additional_authorized_imports or []),
+            additional_functions={"final_answer": self._set_execution_result, "repr": repr},
             **(executor_kwargs or {}),
         )
 

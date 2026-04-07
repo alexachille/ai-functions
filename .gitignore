@@ -5,7 +5,13 @@ __pycache__/
 .hypothesis/
 dist/
 uv.lock
+.mypy_cache/
+.ruff_cache/
+
 
 # MkDocs
 site/
 .cache/
+
+# example output
+examples/*.html

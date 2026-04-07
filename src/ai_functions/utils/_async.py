@@ -8,9 +8,6 @@ import asyncio
 import contextvars
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TypeVar
-
-T = TypeVar("T")
 
 
 def run_async[T](async_func: Callable[[], Awaitable[T]]) -> T:

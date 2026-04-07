@@ -17,7 +17,7 @@ To install the Strands AI Functions extension, run:
 ```bash
 # using pip:
 pip install strands-ai-functions
-# using, if using uv, add strands-ai-function as a dependency to your project:
+# using  uv: add strands-ai-function as a dependency to your project:
 uv add strands-ai-functions
 ```
 
@@ -25,9 +25,9 @@ This repo provides several examples. To run the examples, first configure the cr
 Then, clone the repo and run the examples using `uv` from within their folder: 
 ```bash
 # clone the repo
-git clone https://github.com/strandslabs/strands-ai-functions
+git clone https://github.com/strands-labs/ai-functions
 cd strands-ai-functions/examples
-# optional: set env variable to enable rich tool visualization in the terminal
+# recommended: set env variable to enable rich tool visualization in the terminal
 export STRANDS_TOOL_CONSOLE_MODE="enabled"
 # run the examples using uv
 # (change the model settings inside the example if not using Bedrock as the model provider)
@@ -396,3 +396,214 @@ async def stock_research_workflow(stock: str):
     # Use their results to write a report
     write_report(stock, news, prices)
 ```
+
+## Memory & Optimization
+
+Just as PyTorch or JAX let you optimize parameters via backpropagation through a computation graph, AI Functions let you optimize agentic workflows via natural-language feedback propagation. You define named parameters — prompt fragments, learned facts, or reusable Python code — store them in a memory backend, and trace your workflow to build a graph. The optimizer walks it backward and updates only what needs to change. Procedural parameters take this further: the optimizer can distill an agent's execution trace into cached Python functions, so the next run reuses proven code rather than regenerating it from scratch — a form of JIT compilation for agentic logic.
+
+The system has three main pieces:
+
+1. A **computation graph** tracks which parameters and AI Function results contributed to a given output. This is built automatically when you use `.trace()` instead of calling the function directly.
+2. A **memory backend** stores named parameters (strings, lists, or code) and exposes them through `recall` (full value), `search` (top-k matching entries), and `query` (question-answering over the content). Each access is tracked in the computation graph.
+3. An **optimizer** walks the computation graph backward from the feedback, determines which parameters are responsible and how they need to change, and consolidates the updates into the memory backend.
+
+### Quick Example
+
+```python
+from pydantic import BaseModel, Field
+from ai_functions import ai_function, Result
+from ai_functions.memory import JSONMemoryBackend
+from ai_functions.optimizer import TextGradOptimizer
+from ai_functions.utils import show_graph
+
+
+@ai_function
+def write_summary(text: str, tone_guidelines: str) -> str:
+    """
+    Summarize the following text:
+    {text}
+
+    Follow these tone guidelines:
+    {tone_guidelines}
+    """
+
+# Memory parameters are described using Pydantic schemas. This provides types, defaults, and descriptions for the optimizer
+class WritingMemory(BaseModel):
+    tone_guidelines: str = Field("No specific guidelines yet.", description="Guidelines for the tone of the writing")
+
+# Create a memory backend and an optimizer. Both are pluggable: subclass MemoryBackend or Optimizer
+# to provide your own. The library ships with a file-based JSONMemoryBackend and a TextGrad-inspired optimizer.
+memory = JSONMemoryBackend(WritingMemory, actor_id="user-1", path="memory.json")
+optimizer = TextGradOptimizer()
+
+# To optimize memory, we need to track the graph of all function calls and memory parameter used
+# Using .trace(...) automatically adds the necessary tracking information to the result
+guidelines = memory.recall("tone_guidelines")
+result: Result[str] = write_summary.trace("some long document...", tone_guidelines=guidelines)
+
+# `result` contains the representation of the entire graph leading to it. To extract the actual output we use .value
+print(result.value)  # the actual output string
+
+# We can now use feedback to optimize the memory, adjusting to user preferences or preventing errors
+feedback = "The summary should be more concise and use bullet points."
+# First, we need to propagate the feedback through the graph to determine which functions is responsible for what
+# issue and which parameters need to be updated
+optimizer.backward(result, feedback)
+
+# We can now visualize the entire agent and parameter graph and see how the feedback has been propagated
+show_graph(result, open_browser=True)
+
+# Finally, we consolidate the feedback propagated to each parameter, and commit the new value to memory
+# On the next run, the new value will be retrieved and used to generate better outputs
+optimizer.consolidate(result)
+
+# We can now show the new value of the memory
+print(str(memory))
+
+# At the end we close the memory to ensure the new memory is written and resources are released properly
+memory.close()
+```
+
+See `examples/memory_optimization.py` for a full example of a memory optimization workflow on a multi-agent graph.
+
+### Memory Backends
+
+A memory backend manages the storage, retrieval, and consolidation of parameters. The `MemoryBackend` base class handles all graph wiring — subclass it and implement the storage methods to build your own. The library ships with two implementations: `JSONMemoryBackend` (file-based, uses TinyDB) and `AgentCoreMemoryBackend` (backed by Amazon Bedrock AgentCore memory).
+
+Every backend manages a set of named parameters whose types, defaults, and metadata are defined through a Pydantic schema:
+
+```python
+from pydantic import BaseModel, Field
+from ai_functions.memory import Procedural, Frozen
+
+class MemorySchema(BaseModel):
+    # A regular string parameter — optimizable by default
+    user_preferences: str = Field(
+        "No preferences known.",
+        description="Known facts and preferences about the user",
+    )
+
+    # A list parameter — each entry is a separate piece of knowledge
+    learned_rules: list[str] = Field(
+        default_factory=list,
+        description="Rules learned from past interactions",
+    )
+
+    # A procedural parameter — stores reusable Python code
+    helper_functions: Procedural
+
+    # A frozen parameter — recalled but not updated by the optimizer
+    system_prompt: Frozen[str] = Field(
+        "You are a helpful assistant.",
+        description="Base system prompt (not optimized)",
+    )
+```
+
+The `description` on each field guides the optimizer in understanding what kind of content belongs in that parameter. `Procedural` parameters store Python functions that are automatically loaded into the agent's code execution environment — the optimizer can generate and refine code from scratch based on feedback. `Frozen` parameters are skipped them during optimization (useful if you are only using the backend for storage).
+
+Parameters can be retrieved in three ways: `recall` returns the full value, `search` returns the top-k matching entries (useful for large list parameters), and `query` answers a question against the parameter's content. The exact implementation of these methods is left to each MemoryBackend subclass. All three return a `ParameterView` — a wrapper that records how the value was derived (full recall, search, or query). This derivation context is taken into account during optimization, so the optimizer knows how each piece of feedback relates to the underlying parameter.
+
+```python
+# Full recall — returns the entire parameter value
+guidelines = memory.recall("tone_guidelines")
+
+# Query — asks the backend to answer a question given the parameter content
+answer = memory.query("learned_rules", query="What do we know about date formatting?")
+
+# Search — returns the top-k matching entries (for list parameters)
+matches = memory.search("learned_rules", query="formatting", k=3)
+```
+
+You pass a `ParameterView` directly to an AI Function as if it were a regular string or list. The library automatically unwraps the value for the prompt and wires the parameter into the computation graph.
+
+### Tracing and the Computation Graph
+
+To propagate feedback back to parameters, the optimizer needs to know which parameters and function calls contributed to a given output. Calling an AI Function normally (`my_func("hello")`) returns the raw result with no tracking. Calling `.trace()` instead returns a `Result` node that records the full computation graph — every parameter access and intermediate result that led to the output:
+
+```python
+# Normal call — returns str, no graph
+answer = write_summary("some text", tone_guidelines="be concise")
+
+# Trace — returns Result[str] with graph edges for backward pass
+result = write_summary.trace("some text", tone_guidelines=memory.recall("tone_guidelines"))
+print(result.value)
+```
+
+The graph naturally extends across multiple AI Function calls. Intermediate `Result` nodes can be passed as inputs to downstream functions:
+
+```python
+@ai_function
+def research(topic: str, research_guidelines: str) -> str:
+    """Research {topic} following: {research_guidelines}"""
+
+@ai_function
+def write_report(findings: str, formatting_rules: str) -> str:
+    """Write a report based on: {findings}. Format: {formatting_rules}"""
+
+findings = research.trace("AI safety", research_guidelines=memory.recall("research_guidelines"))
+report = write_report.trace(findings, formatting_rules=memory.recall("formatting_rules"))
+
+# report now contains the full graph linking back to both parameters
+optimizer.backward(report, "The report lacks specific citations.")
+optimizer.consolidate(report)
+```
+
+The optimizer walks the graph backward from `report`, determines whether the issue originated in the research step or the report-writing step, and updates only the relevant parameters.
+
+### The Optimizer
+
+Like memory backends, optimizers are pluggable. Subclass `Optimizer` and implement `backward` to define any feedback propagation strategy — for example, a global optimizer that reflects on the entire trace at once. The shipped `TextGradOptimizer` takes a local approach loosely inspired by [TextGrad](https://arxiv.org/abs/2406.07496): it walks the graph backward node by node, using an LLM to distribute feedback from each `Result` to its inputs until it reaches the leaf parameters.
+
+```python
+optimizer = TextGradOptimizer(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+# 1. Backward: propagate feedback through the graph
+optimizer.backward(result, "The output should include more detail.")
+
+# 2. Consolidate: apply accumulated feedback to each parameter's backend
+optimizer.consolidate(result)
+
+# 3. (Optional) Zero grad: clear feedback for the next iteration
+optimizer.zero_grad(result)
+```
+
+The three steps are separate so you can inspect the gradients before committing them, or accumulate feedback from multiple runs before consolidating.
+
+### Memory as a Tool Provider
+
+A memory backend can expose its parameters as tools that an agent calls dynamically during execution, letting the agent decide when and what to retrieve. Every memory access will still be tracked in the computation graph, allowing
+to optimize memories retrieved trough tool calls.
+
+```python
+from pydantic import BaseModel, Field
+from ai_functions import ai_function
+from ai_functions.memory import JSONMemoryBackend
+
+class TravelMemory(BaseModel):
+    preferences: str = Field(
+        default="Prefers warm destinations. Likes hiking and local food.",
+        description="Travel preferences and style of the user",
+    )
+    visited: list[str] = Field(
+        default=[
+            "Tokyo, Japan - loved the street food and temples",
+            "Barcelona, Spain - enjoyed the architecture and beaches",
+        ],
+        description="Places the user has visited with brief notes",
+    )
+
+memory = JSONMemoryBackend(TravelMemory, "traveler-1", path="travel.json")
+tools = memory.tool_provider("preferences", "visited")
+
+@ai_function(tools=[tools])
+def travel_assistant(request: str) -> str:
+    """You are a travel planning assistant with access to the user's travel memory.
+    Use the available tools to look up their preferences and past trips.
+
+    User request: {request}
+    """
+
+response = travel_assistant("Suggest a destination for next month.")
+```
+
+You can restrict which operations are available, for example `memory.tool_provider(..., operations={"recall", "search", "query"})` will provide read-only access.

@@ -9,33 +9,69 @@ The decorator supports:
 """
 
 import dataclasses
-from collections.abc import Callable
-from typing import TypeVar, Unpack, overload
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import Unpack, cast, overload
 
-from .core import AIFunction
+from .core import AsyncAIFunction, SyncAIFunction
 from .types.ai_function import AIFunctionConfig, AIFunctionMergedKwargs, split_config_and_agent_kwargs
 from .validation.post_conditions import (
     validate_post_condition_params,
     validate_post_condition_signature,
 )
 
-# Type variable for the decorated function
-F = TypeVar("F", bound=Callable)
+
+def _build[**P, R](
+    fn: Callable[P, R | Awaitable[R]],
+    config: AIFunctionConfig | None,
+    **kwargs: Unpack[AIFunctionMergedKwargs],
+) -> SyncAIFunction[P, R] | AsyncAIFunction[P, R]:
+    """Build a SyncAIFunction or AsyncAIFunction from a callable and config/kwargs."""
+    config_args, agent_args = split_config_and_agent_kwargs(**kwargs)
+    base_config = config or AIFunctionConfig()
+    config_args["agent_kwargs"] = base_config.agent_kwargs | agent_args
+    resolved_config = dataclasses.replace(base_config, **config_args) if config_args else base_config
+
+    for condition in resolved_config.post_conditions or []:
+        validate_post_condition_signature(condition)
+        validate_post_condition_params(condition, fn)
+
+    if inspect.iscoroutinefunction(fn):
+        return AsyncAIFunction(func=cast(Callable[P, Awaitable[R]], fn), config=resolved_config)
+    return SyncAIFunction(func=cast(Callable[P, R], fn), config=resolved_config)
 
 
-# Overload: parameterized usage - @ai_function(), @ai_function(config=...), @ai_function(max_attempts=5)
+class _Decorator:
+    """Utility class to get the correct typing."""
+
+    def __init__(self, config: AIFunctionConfig | None, **kwargs: Unpack[AIFunctionMergedKwargs]):
+        self.config = config
+        self.kwargs = kwargs
+
+    @overload
+    def __call__[**P, R](self, fn: Callable[P, Awaitable[R]], /) -> AsyncAIFunction[P, R]: ...  # type: ignore[overload-overlap]
+    @overload
+    def __call__[**P, R](self, fn: Callable[P, R], /) -> SyncAIFunction[P, R]: ...
+
+    def __call__[**P, R](self, fn: Callable[P, R | Awaitable[R]]) -> SyncAIFunction[P, R] | AsyncAIFunction[P, R]:
+        return _build(fn, self.config, **self.kwargs)
+
+
+# Bare decorator: @ai_function
 @overload
-def ai_function(
+def ai_function[**P, R](func: Callable[P, Awaitable[R]], /) -> AsyncAIFunction[P, R]: ...  # type: ignore[overload-overlap]
+@overload
+def ai_function[**P, R](func: Callable[P, R], /) -> SyncAIFunction[P, R]: ...
+
+
+# Parameterized decorator: @ai_function(...), @ai_function(config=...), etc.
+@overload
+def ai_function[**P, R](
     func: None = None,
     *,
     config: AIFunctionConfig | None = None,
     **kwargs: Unpack[AIFunctionMergedKwargs],
-) -> Callable[[F], AIFunction]: ...
-
-
-# Overload: bare decorator usage - @ai_function
-@overload
-def ai_function[F: Callable](func: F) -> AIFunction: ...
+) -> _Decorator: ...
 
 
 def ai_function(
@@ -43,7 +79,7 @@ def ai_function(
     *,
     config: AIFunctionConfig | None = None,
     **kwargs: Unpack[AIFunctionMergedKwargs],
-) -> AIFunction | Callable[[Callable], AIFunction]:
+) -> SyncAIFunction | AsyncAIFunction | _Decorator:
     """Transform a Python function into an AI-powered function.
 
     The function's docstring serves as the prompt template with ``{param_name}``
@@ -78,33 +114,6 @@ def ai_function(
         def generate(prompt: str) -> str:
             '''Generate: {prompt}'''
     """
-
-    def decorator(fn: Callable) -> AIFunction:
-        # Partition kwargs into config fields vs agent kwargs
-        config_args, agent_args = split_config_and_agent_kwargs(**kwargs)
-
-        # Merge agent_args into agent_kwargs if present
-        base_config = config or AIFunctionConfig()
-
-        # Apply merged agent_kwargs
-        config_args["agent_kwargs"] = base_config.agent_kwargs | agent_args
-
-        # Create resolved config (replace only if we have overrides)
-        resolved_config = dataclasses.replace(base_config, **config_args) if config_args else base_config
-
-        # Validate post-condition signatures and parameters
-        for condition in resolved_config.post_conditions or []:
-            validate_post_condition_signature(condition)
-            validate_post_condition_params(condition, fn)
-
-        # Create the AIFunction wrapper
-        wrapper = AIFunction(func=fn, config=resolved_config)
-
-        return wrapper
-
-    # Handle bare decorator usage: @ai_function
     if func is not None:
-        return decorator(func)
-
-    # Handle parameterized decorator usage: @ai_function(...)
-    return decorator
+        return _build(func, config, **kwargs)
+    return _Decorator(config=config, **kwargs)

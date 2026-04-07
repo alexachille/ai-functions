@@ -28,8 +28,6 @@ class NoCacheModel(StrEnum):
 
 
 # Token tracking constants
-# _TOKEN_KEYS = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens"]
-# _ZERO_TOKENS = {k: 0 for k in _TOKEN_KEYS}
 _ZERO_TOKENS = Usage(inputTokens=0, outputTokens=0, totalTokens=0, cacheReadInputTokens=0, cacheWriteInputTokens=0)
 
 

@@ -5,6 +5,7 @@ This module re-exports all types and errors for the AI Functions interface.
 
 from .ai_function import AIFunctionConfig, CodeExecutionMode, PostCondition, PostConditionResult
 from .errors import AIFunctionError, ValidationError
+from .graph import ParameterView, Result
 
 __all__ = [
     "AIFunctionConfig",
@@ -13,4 +14,6 @@ __all__ = [
     "PostConditionResult",
     "AIFunctionError",
     "ValidationError",
+    "Result",
+    "ParameterView",
 ]
