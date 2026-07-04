@@ -11,13 +11,13 @@ access the original contract text and requested clause types.
 import re
 import textwrap
 
+from _utils import display
 from pydantic import BaseModel, Field
 
 from ai_functions import ai_function
 
-# ── Pydantic Models ─────────────────────────────────────────────────────────
-# Nested Pydantic models: ExtractedClause and RiskFlag are composed inside ContractAnalysis.
-# Field descriptions guide the LLM on what to produce for each field.
+# ExtractedClause and RiskFlag are nested inside ContractAnalysis; Field
+# descriptions guide the LLM on what to produce for each field.
 
 
 class ExtractedClause(BaseModel):
@@ -50,12 +50,9 @@ class ContractAnalysis(BaseModel):
 VALID_SEVERITIES = {"low", "medium", "high"}
 
 
-# ── Post-condition 1: Clause coverage ───────────────────────────────────────
-# Three chained post-conditions run in order after each LLM attempt.
-# If any fail, the error message is fed back to the LLM for retry (up to max_attempts).
+# Three chained post-conditions run in order after each LLM attempt; if one
+# raises, its error is fed back to the LLM for retry (up to max_attempts).
 # `clause_types` is injected from analyze_contract's parameter of the same name.
-
-
 def validate_clause_coverage(result: ContractAnalysis, clause_types: list[str]) -> None:
     """Validate that every requested clause type has at least one extracted clause."""
     extracted_types = {c.clause_type.lower() for c in result.clauses}
@@ -66,8 +63,7 @@ def validate_clause_coverage(result: ContractAnalysis, clause_types: list[str]) 
         raise ValueError(f"Missing clause types: {sorted(missing)}. Extracted: {sorted(extracted_types)}")
 
 
-# ── Post-condition 2: Excerpt verification (anti-hallucination) ─────────────
-# Prevents the LLM from fabricating quotes that don't exist in the contract.
+# Anti-hallucination: rejects excerpts that don't appear in the contract.
 # `contract_text` is injected from analyze_contract's parameter of the same name.
 def _normalize_whitespace(text: str) -> str:
     """Collapse all whitespace to single spaces for fuzzy matching."""
@@ -92,8 +88,7 @@ def validate_excerpts(result: ContractAnalysis, contract_text: str) -> None:
         raise ValueError("Hallucinated excerpts detected:\n" + "\n".join(hallucinated))
 
 
-# ── Post-condition 3: Risk flag consistency ─────────────────────────────────
-# Only needs `result` (no parameter injection) — checks referential integrity
+# Needs only `result` (no parameter injection): checks referential integrity
 # between risk_flags and the clauses list the LLM produced.
 def validate_risk_flags(result: ContractAnalysis) -> None:
     """Validate risk flag indices and severity values."""
@@ -120,13 +115,9 @@ def validate_risk_flags(result: ContractAnalysis) -> None:
         raise ValueError("\n".join(errors))
 
 
-# ── AI Function ─────────────────────────────────────────────────────────────
-# LLM fills the ContractAnalysis schema directly, no code execution.
-# The docstring is the prompt template — {contract_text} and {clause_types} are
-# substituted with actual argument values. The function body is empty by design.
-
-
-@ai_function[ContractAnalysis](
+# The docstring is the prompt template: {contract_text} and {clause_types} are
+# substituted with the argument values. The function body is empty by design.
+@ai_function(
     post_conditions=[validate_clause_coverage, validate_excerpts, validate_risk_flags],
     max_attempts=6,
 )
@@ -153,8 +144,6 @@ def analyze_contract(contract_text: str, clause_types: list[str]) -> ContractAna
     Set overall_risk to "low", "medium", or "high" based on the aggregate risk.
     """
 
-
-# ── Sample Data ──────────────────────────────────────────────────────────────
 
 SAMPLE_CONTRACT = textwrap.dedent("""\
     SAAS SUBSCRIPTION AGREEMENT
@@ -212,9 +201,7 @@ SAMPLE_CONTRACT = textwrap.dedent("""\
 """)
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     clause_types = ["termination", "liability", "indemnification", "data protection"]
     analysis = analyze_contract.run_sync(contract_text=SAMPLE_CONTRACT, clause_types=clause_types)
-    print(analysis.model_dump_json(indent=2))
+    display("Analysis", analysis.model_dump_json(indent=2), lang="json")

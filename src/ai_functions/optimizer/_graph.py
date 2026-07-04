@@ -8,6 +8,7 @@ caller, since that Python-level dataflow is recorded in no event log.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from ..ai_thread.reconstruction import reconstruct_messages
 from ..types.events import (
     MessageAssistantCompleteEvent,
     ParameterRecalledEvent,
+    ResultEvent,
     ThreadSpawnedEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -31,19 +33,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def leads_to_grad_parameter(node: ThreadNode, _cache: dict[int, bool] | None = None) -> bool:
+    """Return whether ``node`` is (or reaches through children) a grad-enabled parameter.
+
+    A node is a live optimization target when it either owns a
+    ``requires_grad`` parameter or has a child thread that does. This is the
+    grad-subtree pruning predicate shared by :func:`topological_sort` (which
+    prunes grad-free subtrees from the walk) and the optimizer's backward pass
+    (which offers only grad-reaching children as routable feedback targets).
+
+    Args:
+        node: The thread node to test.
+        _cache: Optional memo of ``id(node) -> bool`` reused across a single
+            traversal to keep the check linear on shared/diamond graphs.
+    """
+    cache = _cache if _cache is not None else {}
+    nid = id(node)
+    if nid in cache:
+        return cache[nid]
+    # Seed the cache before recursing so a cycle back to ``node`` terminates.
+    cache[nid] = False
+    result = any(p.requires_grad for p in node.parameters) or any(
+        leads_to_grad_parameter(c, cache) for c in node.child_threads
+    )
+    cache[nid] = result
+    return result
+
+
 def topological_sort(node: ThreadNode) -> list[ThreadNode]:
     """Return ThreadNodes in reverse topological order, pruning grad-free subtrees."""
     visited: set[int] = set()
     order: list[ThreadNode] = []
     _has_grad_cache: dict[int, bool] = {}
-
-    def _has_grad_parameter(n: ThreadNode) -> bool:
-        nid = id(n)
-        if nid in _has_grad_cache:
-            return _has_grad_cache[nid]
-        result = any(p.requires_grad for p in n.parameters) or any(_has_grad_parameter(c) for c in n.child_threads)
-        _has_grad_cache[nid] = result
-        return result
 
     def _dfs(n: ThreadNode) -> None:
         nid = id(n)
@@ -51,7 +72,7 @@ def topological_sort(node: ThreadNode) -> list[ThreadNode]:
             return
         visited.add(nid)
         for child in n.child_threads:
-            if _has_grad_parameter(child):
+            if leads_to_grad_parameter(child, _has_grad_cache):
                 _dfs(child)
         order.append(n)
 
@@ -62,6 +83,20 @@ def topological_sort(node: ThreadNode) -> list[ThreadNode]:
 def _assistant_text(content: list[Any]) -> str:  # pyright: ignore[reportExplicitAny]
     """Concatenate the text blocks of an assistant turn's content."""
     return "".join(block["text"] for block in content if isinstance(block, dict) and "text" in block)
+
+
+def _decode_result_payload(payload: str) -> Any:  # pyright: ignore[reportExplicitAny]
+    """Decode a ``ResultEvent`` payload into a value for the node.
+
+    ``Thread.serialize_result`` JSON-encodes the result (``dump_json``), so a
+    string output type arrives as a quoted JSON string; decoding unquotes it and
+    rehydrates dicts/lists. A non-JSON-serializable result is recorded as a
+    best-effort ``str`` that will not parse — fall back to the raw payload.
+    """
+    try:
+        return json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
 
 
 def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> ThreadNode:
@@ -94,7 +129,8 @@ def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> Thr
     param_nodes: dict[tuple[str, str], ParameterNode] = {}
     tool_calls: list[ToolCallNode] = []
     tc_map: dict[str, ToolCallNode] = {}
-    result_value: Any = None  # pyright: ignore[reportExplicitAny]
+    assistant_text: str = ""
+    result_payload: Any = None  # pyright: ignore[reportExplicitAny]  # ResultEvent.payload (str) or None
 
     for evt in events:
         if isinstance(evt, ParameterRecalledEvent):
@@ -112,6 +148,7 @@ def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> Thr
                 derivation=evt.derivation,
                 backend=backend,
                 description=evt.description,
+                procedural=backend._is_procedural(evt.name),  # noqa: SLF001
                 meta=dict(evt.meta),
             )
         elif isinstance(evt, ToolCallEvent):
@@ -130,11 +167,29 @@ def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> Thr
                 )
                 tc.status = "error" if evt.status == "error" else "success"
         elif isinstance(evt, MessageAssistantCompleteEvent):
-            result_value = _assistant_text(list(evt.content)) or result_value
+            assistant_text = _assistant_text(list(evt.content)) or assistant_text
+        elif isinstance(evt, ResultEvent):
+            result_payload = evt.payload
+
+    # Prefer the thread's serialized result over the assistant's turn text: for
+    # a structured-output cycle the assistant text is only a preamble while the
+    # real output lives in the ResultEvent, and the backward pass needs the true
+    # output to tell one child result from another. Falls back to None.
+    result_value: Any = None  # pyright: ignore[reportExplicitAny]
+    if result_payload is not None:
+        result_value = _decode_result_payload(result_payload)
+    elif assistant_text:
+        result_value = assistant_text
 
     messages = reconstruct_messages(events)
 
-    nid = f"{func_name or 'thread'}-{thread_id[:4]}"
+    # node_id must be injective on thread_id: render_inputs / the backward pass
+    # key routable targets by node_id, so any collision silently drops a target
+    # (e.g. two sibling joke Results would merge into one). thread_ids are
+    # ``thread-<hex>``, so a fixed-length *prefix* is constant across threads —
+    # use the unique trailing segment instead.
+    suffix = thread_id.rsplit("-", 1)[-1] or thread_id
+    nid = f"{func_name or 'thread'}-{suffix}"
     return ThreadNode(
         node_id=nid,
         thread_id=thread_id,

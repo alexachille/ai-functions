@@ -20,16 +20,17 @@ import asyncio
 import os
 import uuid
 
+from _utils import display, rule
 from pydantic import BaseModel, Field
 
-from ai_functions import AgentCoreMemoryBackend, TextGradOptimizer, Traceable, ai_function
+from ai_functions import AgentCoreMemoryBackend, TextGradOptimizer, ai_function
 
 model = None  # use the default model
 region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
 
 
-@ai_function[str](model=model)
-def joke_writer(topic: str, joke_guidelines: Traceable[str]):
+@ai_function(model=model)
+def joke_writer(topic: str, joke_guidelines: str) -> str:
     """
     Write a joke about the following topic: "{topic}".
     Use the following guidelines:
@@ -39,8 +40,8 @@ def joke_writer(topic: str, joke_guidelines: Traceable[str]):
     """
 
 
-@ai_function[str](model=model)
-def email_writer(joke_1: Traceable[str], joke_2: Traceable[str], formatting_guidelines: Traceable[str]):
+@ai_function(model=model)
+def email_writer(joke_1: str, joke_2: str, formatting_guidelines: str) -> str:
     """
     Write an email to Jane Doe containing the following jokes:
     Joke 1: {joke_1}
@@ -82,9 +83,9 @@ async def wait_for_ltm_update(
         elapsed += poll_interval
         _, current_ltm = memory.record_counts()
         if current_ltm > initial_ltm:
-            print(f"LTM updated after {elapsed}s ({initial_ltm} -> {current_ltm} records).")
+            display("LTM Update", f"Updated after {elapsed}s ({initial_ltm} -> {current_ltm} records).")
             return True
-    print(f"Timed out after {max_wait}s waiting for LTM consolidation.")
+    display("LTM Update", f"Timed out after {max_wait}s waiting for LTM consolidation.")
     return False
 
 
@@ -99,58 +100,54 @@ async def main() -> None:
     )
     optimizer = TextGradOptimizer(model=model)
 
-    print("=== Initial Memory ===")
-    print(memory)
+    display("Initial Memory", str(memory))
 
-    # ── Forward pass: trace() records which recalled parameters and prior
-    # results each run consumed — passing them as arguments wires the graph.
+    # Forward pass: trace() records which recalled parameters and prior results
+    # each run consumed — passing them as arguments wires the graph.
     cat_joke = await joke_writer.trace(
         topic="cats",
         joke_guidelines=await memory.recall("joke_guidelines"),
     )
-    print(f"\n=== Cat Joke ===\n{cat_joke}")
+    display("Cat Joke", str(cat_joke))
 
     prog_joke = await joke_writer.trace(
         topic="programmers",
         joke_guidelines=await memory.recall("joke_guidelines"),
     )
-    print(f"\n=== Programmer Joke ===\n{prog_joke}")
+    display("Programmer Joke", str(prog_joke))
 
     email = await email_writer.trace(
         joke_1=cat_joke,
         joke_2=prog_joke,
         formatting_guidelines=await memory.recall("formatting_guidelines"),
     )
-    print(f"\n=== Email ===\n{email}")
+    display("Email", str(email))
 
-    # ── Optimize: build graph + backward + consolidate, in one call ──
+    # Optimize: build graph + backward + consolidate, in one call.
     feedback = (
         "Jokes about cats should always be about Siamese cats. "
         "Jokes about programmers should be about coffee. "
         "The email should include a title for each joke."
     )
-    print(f"\n=== Feedback ===\n{feedback}")
+    display("Feedback", feedback)
 
-    print("\nRunning optimizer step (consolidation appends turns; LTM extraction is async)...")
+    rule("Running optimizer step (consolidation appends turns; LTM extraction is async)")
     await optimizer.step(email, feedback, backends=[memory])
 
     # Short-term memory reflects the new turns immediately.
-    print("\n=== Current Memory (STM) ===")
-    print(memory)
+    display("Current Memory (STM)", str(memory))
 
     # Long-term memory catches up asynchronously as AgentCore's semantic
     # strategy extracts the appended turns — poll until those records appear.
-    print("\nWaiting for LTM consolidation...")
+    rule("Waiting for LTM consolidation")
     await wait_for_ltm_update(memory)
 
-    print("\n=== Current Memory (LTM) ===")
-    print(memory)
+    display("Current Memory (LTM)", str(memory))
 
     # Tidy up the test memory resource. Drop these two lines to inspect LTM
     # in the AgentCore console once semantic extraction has run.
     memory.delete_all(wait=False)
     memory.close()
-    print("\nDone.")
 
 
 if __name__ == "__main__":

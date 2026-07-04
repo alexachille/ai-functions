@@ -66,13 +66,16 @@ async def test_post_condition_retries_until_pass() -> None:
             e for e in await h.events(handle.id, kinds=[EventKind.MESSAGE_USER]) if isinstance(e, MessageUserEvent)
         ]
         assert len(user_events) == 3
-        # The two retry texts name the failed post-condition.
-        assert "Post-condition failures" in user_events[1].text
-        assert "Post-condition failures" in user_events[2].text
+        # The two retry texts carry the validation-error template and name
+        # the failed post-condition.
+        assert "[VALIDATION ERROR]" in user_events[1].text
+        assert "attempt 1 too short" in user_events[1].text
+        assert "[VALIDATION ERROR]" in user_events[2].text
+        assert "Please try again" in user_events[2].text
 
 
 async def test_post_condition_exhausts_max_attempts() -> None:
-    """N persistent failures raise after ``max_attempts`` retries."""
+    """Persistent failures raise after 1 initial try + ``max_attempts`` retries."""
     from ai_functions.ai_thread import AIFunctionError
 
     @ai_function[str](structured_output=False)
@@ -85,7 +88,8 @@ async def test_post_condition_exhausts_max_attempts() -> None:
             del result
             return PostConditionResult(passed=False, message="never good enough")
 
-        model = ScriptedModel([Turn(text="try 1"), Turn(text="try 2")])
+        # max_attempts=2 -> 3 total runs (1 initial + 2 retries).
+        model = ScriptedModel([Turn(text="try 1"), Turn(text="try 2"), Turn(text="try 3")])
         handle = await h.spawn(
             _fn.replace(
                 model=model,
@@ -93,7 +97,7 @@ async def test_post_condition_exhausts_max_attempts() -> None:
                 max_attempts=2,
             )
         )
-        with pytest.raises(AIFunctionError, match="not satisfied after 2 attempt"):
+        with pytest.raises(AIFunctionError, match=r"not satisfied after 3 attempt\(s\) \(1 initial \+ 2 retries\)"):
             await handle.run("go")
 
 

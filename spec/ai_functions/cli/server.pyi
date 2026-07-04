@@ -6,9 +6,8 @@ an OS-assigned port, publishes the runtime file, and blocks until
 interrupted. On SIGINT / SIGTERM it stops the endpoint cleanly and
 removes the runtime file.
 
-Daemonisation is deliberately not implemented in v1 — running the
-server under ``tmux``, ``systemd --user``, or a simple ``&`` is the
-workflow for now.
+Daemonisation is deliberately not built in — run the server under
+``tmux``, ``systemd --user``, or a simple ``&`` to background it.
 
 Port selection
 --------------

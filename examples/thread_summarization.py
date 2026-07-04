@@ -9,7 +9,11 @@ waiting for a context-window overflow. The emitted ``ContextSummarizedEvent`` s
 """
 
 import asyncio
+from typing import Literal
 
+from pydantic import BaseModel
+
+from _utils import display, rule
 from strands import tool
 
 from ai_functions import ai_function
@@ -28,29 +32,31 @@ CHAPTERS = [
 ]
 
 
+class Chapter(BaseModel):
+    title: str
+    content: str
+
+
 class Article:
     """Accumulates the article as the agent writes each chapter."""
 
     def __init__(self) -> None:
-        self.chapters: list[tuple[str, str]] = []
+        self.chapters: list[Chapter] = []
 
     @tool
     def write_chapter(self, title: str, content: str) -> str:
         """Add one chapter (title + a few paragraphs) to the article."""
-        self.chapters.append((title, content))
+        self.chapters.append(Chapter(title=title, content=content))
         return f"Chapter '{title}' saved ({len(self.chapters)} total)."
 
     def to_markdown(self) -> str:
-        return "\n\n".join(f"## {title}\n\n{content}" for title, content in self.chapters)
+        return "\n\n".join(
+            f"## {chapter.title}\n\n{chapter.content}" for chapter in self.chapters)
 
 
 async def main() -> None:
     article = Article()
 
-    # Keep the preserved tail well below the threshold so one compaction brings
-    # the history under it and does not re-fire to the per-cycle cap (see the
-    # summarization_threshold convergence note). preserve_min_messages=1 avoids a
-    # floor that could exceed the threshold when individual turns are large.
     strategy = DefaultSummarizationStrategy(
         summarize_by_forking=False,
         preserve_min_messages=1,
@@ -58,43 +64,49 @@ async def main() -> None:
         preserve_max_tokens=1200,
     )
 
-    @ai_function[str](
+    @ai_function(
         model=MODEL,
         tools=[article.write_chapter],
         summarization_strategy=strategy,
-        summarization_threshold=4000,  # low enough to trigger proactive compaction mid-article
+        summarization_threshold=4000,
+        # low enough to trigger proactive compaction mid-article
     )
-    def chapter_writer(instruction: str):
+    def chapter_writer(instruction: str) -> Literal["done"]:
         """You are writing one chapter of a research article on quantum error correction.
 
         {instruction}
 
         Write the chapter by calling `write_chapter` exactly once with a title and
-        2-3 substantive paragraphs. Then reply with the chapter title.
+        2-3 substantive paragraphs.
         """
 
     coord = InMemoryCoordinator()
     worker = await LocalWorker(coord).register()
     handle = await worker.spawn_locally(chapter_writer, thread_name="chapter_writer")
 
-    print(f"Writing a {len(CHAPTERS)}-chapter article (one cycle per chapter)...\n")
+    rule(f"Writing a {len(CHAPTERS)}-chapter article (one cycle per chapter)")
     for i, topic in enumerate(CHAPTERS, 1):
         instruction = f"Write chapter {i} of {len(CHAPTERS)}. Topic: {topic}."
-        title = await handle.run(instruction=instruction)
+        _ = await handle.run(instruction=instruction)
         events = await coord.get_events(handle.id)
         n_summaries = sum(isinstance(e, ContextSummarizedEvent) for e in events)
-        print(f"  chapter {i}: {title.strip()}   [summarizations so far: {n_summaries}]")
+        chapter = article.chapters[-1]
+        display(
+            f"Chapters {i}. Summarizations: {n_summaries}",
+            chapter.content, lang="md"
+        )
 
     events = await coord.get_events(handle.id)
     summaries = [e for e in events if isinstance(e, ContextSummarizedEvent)]
-    print(f"\nProactive summarizations during the run: {len(summaries)}")
+    lines = [f"Proactive summarizations during the run: {len(summaries)}"]
     if summaries:
+        # The first compaction replaced the history prefix with a summary turn.
         first = summaries[0].new_history[0]
         preview = getattr(first, "text", "")[:200]
-        print(f"First compaction replaced the prefix with a summary turn:\n  {preview!r}")
+        lines.append(f"First summary turn: {preview!r}")
+    display("Summarization", "\n".join(lines), lang="text")
 
-    print("\n=== Article ===")
-    print(article.to_markdown())
+    display("Article", article.to_markdown())
 
     await worker.close()
 

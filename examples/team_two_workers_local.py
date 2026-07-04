@@ -17,20 +17,22 @@ We give ``alice`` two tasks:
    which returns the result through the coordinator back to alice.
 
 Both ``list_threads`` and ``send_message`` are injected automatically by
-``AIThread``'s default ``coordinator_tools`` — no extra wiring needed.
+``AIThread``'s default ``coordinator_tools``.
 """
 
 from __future__ import annotations
 
 import asyncio
 
+from _utils import display, rule
+
 from ai_functions import ai_function
 from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 from ai_functions.types import WorkerId
 
 
-@ai_function[str](structured_output=False)
-def chat(message: str):
+@ai_function(structured_output=False)
+def chat(message: str) -> str:
     """{message}"""
 
 
@@ -46,37 +48,39 @@ async def main() -> None:
     alice = await worker_a.spawn_locally(chat, thread_name="alice")
     bob = await worker_b.spawn_locally(chat, thread_name="bob")
 
-    print(f"alice → {alice.id} (hosted on worker-A)")
-    print(f"bob   → {bob.id} (hosted on worker-B)")
-    print()
+    display(
+        "Threads",
+        "\n".join(
+            [
+                f"alice → {alice.id} (hosted on worker-A)",
+                f"bob   → {bob.id} (hosted on worker-B)",
+            ]
+        ),
+        lang="text",
+    )
 
-    # ── Task 1: alice lists registered threads ───────────────────────
-    # She has list_threads injected as a tool by default.
-    print("── Task 1: ask alice to list threads ──")
+    # alice has list_threads injected as a tool by default.
+    rule("Task 1: ask alice to list threads")
     listing = await alice.run(
         "Call the list_threads tool with no arguments. Then report back "
         "in one sentence: which threads are registered, and which of them is you?",
     )
-    print(f"alice: {listing.strip()}")
-    print()
+    display("Alice", listing.strip())
 
-    # ── Task 2: alice sends a question to bob (blocking) ─────────────
-    print("── Task 2: ask alice to query bob (mode=wait) ──")
+    rule("Task 2: ask alice to query bob (mode=wait)")
     relayed = await alice.run(
         "Use send_message to ask bob "
         "'What is the capital of Japan?' with mode='wait'. "
         "Then report bob's reply verbatim.",
     )
-    print(f"alice: {relayed.strip()}")
-    print()
+    display("Alice", relayed.strip())
 
-    # ── Task 3: continue_then_receive — fire-and-continue, then resume ──
-    # alice dispatches a question to bob with mode='continue_then_receive'
-    # and her cycle ends immediately. When bob replies, the coordinator
-    # tool schedules a fresh cycle on alice with bob's reply as the user
-    # turn. Subscribe to alice's RESULT events so we get the follow-up
+    # continue_then_receive — fire-and-continue, then resume. alice dispatches
+    # a question to bob and her cycle ends immediately. When bob replies, the
+    # coordinator tool schedules a fresh cycle on alice with bob's reply as the
+    # user turn. Subscribe to alice's RESULT events so we get the follow-up
     # cycle's output directly off the queue — no event-log rescan.
-    print("── Task 3: ask alice to query bob (mode=continue_then_receive) ──")
+    rule("Task 3: ask alice to query bob (mode=continue_then_receive)")
     from ai_functions.types import EventKind, ResultEvent
 
     results: asyncio.Queue[ResultEvent] = asyncio.Queue()
@@ -92,17 +96,15 @@ async def main() -> None:
             "using mode='continue_then_receive'. "
             "Then reply 'dispatched, awaiting bob' and stop.",
         )
-        print(f"alice (cycle 1): {cycle1.strip()}")
+        display("Alice (cycle 1)", cycle1.strip())
 
         # First RESULT is cycle 1 (already fired synchronously above);
         # drop it. The second one is the follow-up driven by bob's reply.
         _ = await results.get()
         followup = await results.get()
 
-    print(f"alice (cycle 2, triggered by bob's reply): {followup.payload.strip()}")
-    print()
+    display("Alice (cycle 2, triggered by bob's reply)", followup.payload.strip())
 
-    # Clean up.
     await worker_a.close()
     await worker_b.close()
 

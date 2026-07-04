@@ -362,7 +362,9 @@ class MemoryBackend(ABC):
             requires_grad = not self._is_frozen(name)
         with no_thread_scope():
             value, fetch_meta = await asyncio.to_thread(self._recall, name)  # pyright: ignore[reportAny]
-        return await self._build_view(name, value, "full", coordinator, thread_id, requires_grad, meta=fetch_meta or None)
+        return await self._build_view(
+            name, value, "full", coordinator, thread_id, requires_grad, meta=fetch_meta or None
+        )
 
     async def query(
         self,

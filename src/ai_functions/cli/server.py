@@ -6,10 +6,6 @@ an OS-assigned port, publishes the runtime file, and blocks until
 interrupted. On SIGINT / SIGTERM it stops the endpoint cleanly and
 removes the runtime file.
 
-Daemonisation is deliberately not implemented in v1 — running the
-server under ``tmux``, ``systemd --user``, or a simple ``&`` is the
-workflow for now.
-
 Port selection
 --------------
 The endpoint binds port ``0`` and asks the OS to assign a free port.
@@ -134,7 +130,7 @@ def start(
         Exit code; ``0`` on clean shutdown, non-zero on bind failure
         or if another coordinator is already advertised.
     """
-    del url  # reserved for future test hook; not wired in v1.
+    del url  # reserved for future test hook; not wired currently
 
     async def _run() -> int:
         endpoint = CoordinatorEndpoint()

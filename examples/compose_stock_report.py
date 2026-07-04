@@ -11,26 +11,14 @@ Requires a websearch API key (TAVILY_API_KEY or EXA_API_KEY) in the environment.
 """
 
 import asyncio
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+from _utils import display, get_websearch_tool, rule
 
 from ai_functions import ai_function
 from ai_functions.ai_thread.config import CodeExecutionMode, ThreadConfig
-
-
-def get_websearch_tool():
-    """Return a Strands websearch tool for whichever API key is in the environment."""
-    if os.environ.get("EXA_API_KEY"):
-        from strands_tools import exa as websearch_tool
-    elif os.environ.get("TAVILY_API_KEY"):
-        from strands_tools import tavily as websearch_tool
-    else:
-        raise ValueError("Set EXA_API_KEY or TAVILY_API_KEY to run this example.")
-    return websearch_tool
-
 
 websearch_tool = get_websearch_tool()
 
@@ -52,8 +40,8 @@ class StockInfo:
     prices: pd.DataFrame
 
 
-@ai_function[str](config=Configs.FAST_MODEL, tools=[websearch_tool])
-async def research_news(stock: str):
+@ai_function(config=Configs.FAST_MODEL, tools=[websearch_tool])
+async def research_news(stock: str) -> str:
     """
     Research and summarize the current news regarding the following stock symbol: {stock}
     """
@@ -64,8 +52,8 @@ def check_nan(df: pd.DataFrame):
 
 
 # The sandboxed Python environment lets the agent use libraries and return rich data types.
-@ai_function[pd.DataFrame](config=Configs.DATA_ANALYSIS, post_conditions=[check_nan])
-async def research_price(stock: str):
+@ai_function(config=Configs.DATA_ANALYSIS, post_conditions=[check_nan])
+async def research_price(stock: str) -> pd.DataFrame:
     """
     Use the `yfinance` Python package to retrieve the historical prices of {stock} in the last 30 days.
     Return a dataframe with columns: ["date", "price" (float, price at market close)]
@@ -73,8 +61,8 @@ async def research_price(stock: str):
 
 
 # Function inputs are available inside the Python environment for further processing.
-@ai_function[str](config=Configs.DATA_ANALYSIS)
-def write_report(stock_info: list[StockInfo]):
+@ai_function(config=Configs.DATA_ANALYSIS)
+def write_report(stock_info: list[StockInfo]) -> str:
     """
     Write a html report comparing the trend of the following stocks: {",".join(s.symbol for s in stock_info)}.
     Use the information in `stock_info` for your analysis. Use `plotly` to embed plots illustrating the trend.
@@ -95,11 +83,11 @@ async def write_stock_report(stocks: list[str]) -> str:
 
 
 async def main():
-    print("Generating report...")
+    rule("Generating report")
     html_content = await write_stock_report(["AAPL", "JNJ", "JPM", "XOM"])
     output_path = Path(__file__).parent / "stock_report.html"
     output_path.write_text(html_content)
-    print(f"Report saved to {output_path}")
+    display("Report saved", str(output_path), lang="text")
 
 
 if __name__ == "__main__":

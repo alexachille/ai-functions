@@ -22,10 +22,11 @@ from dataclasses import dataclass
 
 from _ds1000_scipy import TEST_PROBLEMS, TRAIN_PROBLEMS
 from _ds1000_utils import build_feedback, run_batch_parallel, run_problem
+from _utils import display, rule
 from pydantic import BaseModel, Field
 from strands.models import BedrockModel
 
-from ai_functions import JSONMemoryBackend, TextGradOptimizer, Traceable, ai_function
+from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function
 from ai_functions.types.graph import ThreadNode
 
 # temperature=0 for deterministic generation — the demo reproduces run to run.
@@ -59,8 +60,8 @@ class LearningMemory(BaseModel):
     )
 
 
-@ai_function[str](model=_model)
-def generate_code(coding_patterns: Traceable[str], common_pitfalls: Traceable[str], problem_prompt: str, library: str):
+@ai_function(model=_model)
+def generate_code(coding_patterns: str, common_pitfalls: str, problem_prompt: str, library: str) -> str:
     """Solve the data science problem below by generating Python code.
 
     Output ONLY the Python code — no explanations, no markdown fences.
@@ -77,38 +78,39 @@ def generate_code(coding_patterns: Traceable[str], common_pitfalls: Traceable[st
     """
 
 
-def _print_result(tag: str, problem: dict, solution: str, passed: bool, error: str | None) -> None:
+def _show_result(tag: str, problem: dict, solution: str, passed: bool, error: str | None) -> None:
     status = "PASS" if passed else "FAIL"
-    print(f"\n[{tag}] {problem['id']}: {status}")
-    print("--- generated code ---")
-    print(solution.strip())
+    content = solution.strip()
     if not passed and error:
-        print(f"--- error ---\n{error.strip()}")
+        content += "\n\n# error:\n# " + error.strip().replace("\n", "\n# ")
+    display(f"[{tag}] {problem['id']}: {status}", content, lang="python")
 
 
 async def main(path: str) -> None:
-    # ── Step 1: direct test with empty memory ──
-    print("=" * 70, "\nStep 1 — Direct test (empty memory)\n", "=" * 70, sep="")
+    # Step 1: direct test with empty memory (expected to fail).
+    rule("Step 1 — Direct test (empty memory)")
     memory = JSONMemoryBackend(LearningMemory, "demo", path=path, model=_model)
     direct: dict[str, ExecResultView] = {}
     for problem in TEST_PROBLEMS:
         solution, exec_result, _ = await run_problem(problem, memory, generate_code)
-        _print_result("direct", problem, solution, exec_result.passed, exec_result.error)
+        _show_result("direct", problem, solution, exec_result.passed, exec_result.error)
         direct[problem["id"]] = ExecResultView(solution, exec_result.passed)
     memory.close()
 
-    # ── Step 2: train on 8 problems, backprop each, consolidate once ──
-    print("\n", "=" * 70, "\nStep 2 — Training (8 problems)\n", "=" * 70, sep="")
+    # Step 2: train on 8 problems, backprop each, consolidate once.
+    rule("Step 2 — Training (8 problems)")
     memory = JSONMemoryBackend(LearningMemory, "demo", path=path, model=_model)
     optimizer = TextGradOptimizer(model=_model)
 
     batch = await run_batch_parallel(TRAIN_PROBLEMS, memory, generate_code)
     train_nodes: list[ThreadNode] = []
+    train_status: list[str] = []
     for problem, (solution, exec_result, node) in zip(TRAIN_PROBLEMS, batch, strict=True):
         status = "PASS" if exec_result.passed else "FAIL"
-        print(f"  {problem['id']}: {status}")
+        train_status.append(f"{problem['id']}: {status}")
         optimizer.backward(node, build_feedback(problem, solution, exec_result))
         train_nodes.append(node)
+    display("Training Results", "\n".join(train_status), lang="text")
 
     # Gather every training node under a synthetic root so one consolidate call
     # merges all gradients per parameter (grouped by backend + name).
@@ -121,20 +123,18 @@ async def main(path: str) -> None:
 
     memory.close()
 
-    # ── Step 3: re-test with the trained memory ──
-    print("\n", "=" * 70, "\nStep 3 — Trained test\n", "=" * 70, sep="")
+    # Step 3: re-test with the trained memory.
+    rule("Step 3 — Trained test")
     memory = JSONMemoryBackend(LearningMemory, "demo", path=path, model=_model)
-    print("\n--- learned coding_patterns ---")
-    print(await memory.recall("coding_patterns"))
-    print("\n--- learned common_pitfalls ---")
-    print(await memory.recall("common_pitfalls"))
+    display("Learned coding_patterns", str(await memory.recall("coding_patterns")))
+    display("Learned common_pitfalls", str(await memory.recall("common_pitfalls")))
 
     for problem in TEST_PROBLEMS:
         solution, exec_result, _ = await run_problem(problem, memory, generate_code)
-        _print_result("trained", problem, solution, exec_result.passed, exec_result.error)
+        _show_result("trained", problem, solution, exec_result.passed, exec_result.error)
         before = direct[problem["id"]]
         if not before.passed and exec_result.passed:
-            print(f"\n>>> {problem['id']}: FAIL → PASS (memory-driven improvement)")
+            rule(f"{problem['id']}: FAIL → PASS (memory-driven improvement)")
     memory.close()
 
 

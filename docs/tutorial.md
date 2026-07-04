@@ -6,7 +6,7 @@ AI Functions extend the expressivity of standard programming by offering develop
 
 Direct integration of AI agents in standard workflows is often avoided due to their non-deterministic nature and lack of assurance that instructions will be followed, which can cause cascading errors throughout the workflow. AI Functions address this through extensive use of *post-conditions*. Unlike traditional prompt-based approaches, which try to ensure correctness by relying on prompt engineering alone, AI Functions enforce correctness through runtime post-condition checking: users specify explicit conditions that the output of any given step needs to satisfy, and the library automatically initiates self-correcting loops to ensure these properties hold, avoiding cascading errors in complex workflows.
 
-Because AI Functions *are* functions, developers can construct agentic workflows and agent graphs — including parallel and asynchronous ones — by writing and composing functions, and can build shareable libraries of robust, reusable agentic flows exactly the way they build software libraries today. When a workflow needs more than one-shot calls, the same functions scale up: they can be spawned as stateful **AI Threads** that keep their conversation history, form teams that message each other, run distributed across processes and machines, and even improve over time through natural-language **memory optimization**. This tutorial follows that progression, from a single function call to a distributed team of agents.
+Because AI Functions *are* functions, developers can construct agentic workflows and agent graphs (including parallel and asynchronous ones) by writing and composing functions, and can build shareable libraries of robust, reusable agentic flows exactly the way they build software libraries today. When a workflow needs more than one-shot calls, the same functions scale up: they can be spawned as stateful **AI Threads** that keep their conversation history, form teams that message each other, run distributed across processes and machines, and even improve over time through natural-language **memory optimization**. This tutorial follows that progression, from a single function call to a distributed team of agents.
 
 ## Contents
 
@@ -27,7 +27,7 @@ Because AI Functions *are* functions, developers can construct agentic workflows
 
 ## Getting started
 
-The minimum supported Python version is 3.13. We recommend Python >= 3.14 for native [t-string](https://peps.python.org/pep-0750/) template literal support (used in [Providing instructions](#providing-instructions)), and `uv` (see [installation instructions](https://docs.astral.sh/uv/getting-started/installation/)) to run the provided examples.
+The minimum supported Python version is 3.12. We recommend Python >= 3.14 for native [t-string](https://peps.python.org/pep-0750/) template literal support (used in [Providing instructions](#providing-instructions)), and `uv` (see [installation instructions](https://docs.astral.sh/uv/getting-started/installation/)) to run the provided examples.
 
 To install AI Functions:
 
@@ -68,20 +68,20 @@ model = OpenAIModel(
     model_id="gpt-4o"
 )
 
-@ai_function[str](model=model)
-def my_function():
+@ai_function(model=model)
+def my_function() -> str:
     """[...]"""
 ```
 
 ## AI Functions basics
 
-An AI Function behaves like a standard function, but its code is written in natural language rather than Python, and it is executed by an LLM rather than a CPU. To define one, we use the `@ai_function` decorator, specify its return type in brackets, and describe what the function should do inside its docstring (we will cover alternative methods later):
+An AI Function behaves like a standard function, but its code is written in natural language rather than Python, and it is executed by an LLM rather than a CPU. To define one, we use the `@ai_function` decorator, declare the return type with an ordinary return annotation, and describe what the function should do inside its docstring (we will cover alternative methods later):
 
 ```python
 from ai_functions import ai_function
 
-@ai_function[str]
-def translate_text(text: str, lang: str):
+@ai_function
+def translate_text(text: str, lang: str) -> str:
     """
     Translate the text below to the following language: {lang}.
     ---
@@ -115,11 +115,11 @@ Use whichever fits the context: `run_sync` at the top level of simple scripts, `
 
 AI Functions can return arbitrary data types, including primitive types (`str`, `int`, `float`), Pydantic models, and even native Python objects (see [Python integration](#python-integration)). The library takes care of the necessary conversions and validation under the hood: Pydantic models are passed to the agent as a JSON schema and parsed back on return; primitive types are requested through a synthetic wrapper so the agent still answers via structured output.
 
-The output type is declared in brackets on the decorator (`@ai_function[MeetingSummary]`). It may also be inferred from the function's return annotation by using a bare `@ai_function`:
+The output type is declared with an ordinary return annotation, as in the examples so far. It can also be declared in brackets on the decorator instead:
 
 ```python
-@ai_function
-def summarize_meeting(transcripts: str) -> MeetingSummary:
+@ai_function[MeetingSummary]
+def summarize_meeting(transcripts: str):
     """
     Write a summary of the following meeting in less than 50 words.
     <transcripts>
@@ -128,7 +128,9 @@ def summarize_meeting(transcripts: str) -> MeetingSummary:
     """
 ```
 
-The two forms are equivalent. When a type is given in brackets it is always used, regardless of any return annotation; a bare `@ai_function` requires a return annotation to infer the output type from, and raises `TypeError` if none is present. The bracketed form is the one that type-checks cleanly, since a return annotation on the prompt function otherwise describes the value the function body returns.
+The two forms are equivalent. When a type is given in brackets it is always used, regardless of any return annotation; a bare `@ai_function` requires a return annotation to infer the output type from, and raises `TypeError` if none is present.
+
+The annotation form reads like plain Python and is the one used throughout this tutorial and the examples. The bracket form exists for strict type checking: to a type checker, a return annotation describes what the function *body* returns, and the body of a docstring-prompt function returns nothing, so mypy reports errors like "Missing return statement" on `-> MeetingSummary`. Declaring the type in brackets keeps the annotation free for the body's actual return value, which also matters when the body returns the prompt itself (see [Providing instructions](#providing-instructions)). If your codebase runs a strict type checker, migrate to the bracket form; otherwise the annotation form is the natural default.
 
 The following example builds a simple meeting-summarization workflow using structured output:
 
@@ -144,8 +146,8 @@ class MeetingSummary(BaseModel):
     action_items: list[str]
 
 
-@ai_function[MeetingSummary]
-def summarize_meeting(transcripts: str):
+@ai_function
+def summarize_meeting(transcripts: str) -> MeetingSummary:
     """
     Write a summary of the following meeting in less than 50 words.
     <transcripts>
@@ -170,7 +172,7 @@ if __name__ == "__main__":
 
 A core notion of AI Functions is that programmers should not "prompt-and-pray" for the result returned by the agent to be correct. Rather, they should *verify* that the result satisfies the conditions required by their pipeline.
 
-To this end, AI Functions expose *post-conditions* as a fundamental component. Post-conditions are functions — standard Python functions or other AI Functions — that validate the result and provide feedback to the agent. This automatically instantiates a self-correcting feedback loop ensuring the correctness of the final return value.
+To this end, AI Functions expose *post-conditions* as a fundamental component. Post-conditions are functions (standard Python functions or other AI Functions) that validate the result and provide feedback to the agent. This automatically instantiates a self-correcting feedback loop ensuring the correctness of the final return value.
 
 The following example extends the meeting summary above with user-defined post-conditions:
 
@@ -202,8 +204,8 @@ def check_length(response: MeetingSummary) -> PostConditionResult:
 
 
 # A post-condition can also be an AI Function, since AI Functions *are* just functions
-@ai_function[PostConditionResult]
-def check_style(response: MeetingSummary):
+@ai_function
+def check_style(response: MeetingSummary) -> PostConditionResult:
     """
     Check if the summary below satisfies the following criteria:
     - It must use bullet points
@@ -215,8 +217,8 @@ def check_style(response: MeetingSummary):
 
 
 # Now we add the functions above as post-conditions validating the model output
-@ai_function[MeetingSummary](post_conditions=[check_length, check_style])
-def summarize_meeting(transcripts: str):
+@ai_function(post_conditions=[check_length, check_style])
+def summarize_meeting(transcripts: str) -> MeetingSummary:
     """
     Write a summary of the following meeting in less than 50 words.
     <transcripts>
@@ -257,8 +259,8 @@ def run_tests(_answer: Any, feature: FeatureRequest):
         raise RuntimeError(pytest_output)
 
 
-@ai_function[Literal["done"]](post_conditions=[run_tests])
-def implement_feature(feature: FeatureRequest):
+@ai_function(post_conditions=[run_tests])
+def implement_feature(feature: FeatureRequest) -> Literal["done"]:
     """
     Implement the following feature in the current code base:
     <feature>
@@ -280,7 +282,7 @@ Note that we are telling the agent what tests to pass both in the prompt and as 
 
 AI agents are usually limited to working with serializable input-output types (strings, JSON objects, ...) rather than with native objects of the programming language. AI Functions, on the other hand, aim to provide a natural extension of the programming language itself, enabling new kinds of programming patterns and abstractions. In particular, agents can optionally be provided with a Python environment, allowing them to dynamically generate code to process arbitrary input data and return native Python objects.
 
-Consider, for example, a webapp that allows the user to upload an invoice in an arbitrary format (PDF, CSV, JSON, ...). The following snippet implements a "universal data loader": given the path to a file, the agent inspects its content, decides the appropriate processing pipeline, and returns a `DataFrame` in the desired format — validated by a post-condition. A second AI Function then applies a transformation that cannot be expressed in pure Python. See `examples/code_universal_loader.py` for a complete runnable implementation.
+Consider, for example, a webapp that allows the user to upload an invoice in an arbitrary format (PDF, CSV, JSON, ...). The following snippet implements a "universal data loader": given the path to a file, the agent inspects its content, decides the appropriate processing pipeline, and returns a `DataFrame` in the desired format, validated by a post-condition. A second AI Function then applies a transformation that cannot be expressed in pure Python. See `examples/code_universal_loader.py` for a complete runnable implementation.
 
 ```python
 from pandas import DataFrame, api
@@ -299,8 +301,8 @@ def check_invoice_dataframe(df: DataFrame):
 
 
 # code execution has to be explicitly enabled
-@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["pandas.*", "sqlite3", "json"], post_conditions=[check_invoice_dataframe])
-def import_invoice(path: str):
+@ai_function(code_execution_mode="local", code_executor_additional_imports=["pandas.*", "sqlite3", "json"], post_conditions=[check_invoice_dataframe])
+def import_invoice(path: str) -> DataFrame:
     """
     The file `{path}` contains purchase logs. Extract them in a DataFrame with columns:
     - product_name (str)
@@ -310,8 +312,8 @@ def import_invoice(path: str):
     """
 
 
-@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["pandas.*"], post_conditions=[check_invoice_dataframe])
-def fuzzy_merge_products(invoice: DataFrame):
+@ai_function(code_execution_mode="local", code_executor_additional_imports=["pandas.*"], post_conditions=[check_invoice_dataframe])
+def fuzzy_merge_products(invoice: DataFrame) -> DataFrame:
     """
     Find product names that denote different versions of the same product, normalize them
     by removing version suffixes and unifying spelling variants, update the product names
@@ -345,8 +347,8 @@ The instructions/prompt of an AI Function can be provided in two ways. The simpl
 ```python
 from ai_functions import ai_function
 
-@ai_function[str]
-def translate(text: str, lang: str):
+@ai_function
+def translate(text: str, lang: str) -> str:
     """
     Translate the text below to the following language: `{lang}`.
     {text}
@@ -371,7 +373,9 @@ def translate(text: str, lang: str):
     """
 ```
 
-The preferred way is to return a `Template` (t-string, available since Python >= 3.14) like in the example above. This allows the AI Function to apply custom formatting logic to preserve the correct indentation when replacing multi-line values in the template. On Python 3.13, a standard string can be returned instead, but the user has to take care of ensuring the string has correct indentation, to avoid confusing the agent with improper formatting.
+Note the bracket form of the decorator: here the body really does return something (the prompt, a `Template`), so a `-> str` output annotation would misdescribe it to a type checker. Declaring the output type in brackets (see [Return types](#return-types)) keeps the annotation available for the body's actual return value.
+
+The preferred way is to return a `Template` (t-string, available since Python >= 3.14) like in the example above. This allows the AI Function to apply custom formatting logic to preserve the correct indentation when replacing multi-line values in the template. On Python 3.12 and 3.13, a standard string can be returned instead, but the user has to take care of ensuring the string has correct indentation, to avoid confusing the agent with improper formatting.
 
 Internally, the AI Function always executes the function body with the provided arguments. If the body returns a string or a `Template`, that value is used as the prompt to the agent. Otherwise, the library falls back to interpreting the docstring as a template.
 
@@ -387,8 +391,8 @@ from strands_tools import file_read, file_write
 from ai_functions import ai_function
 
 
-@ai_function[Literal["done"]](tools=[file_read, file_write])
-def summarize_file(path: str, output_path: str):
+@ai_function(tools=[file_read, file_write])
+def summarize_file(path: str, output_path: str) -> Literal["done"]:
     """Read the file {path} and write a summary in {output_path}."""
 
 
@@ -414,14 +418,14 @@ class Configs:
 
 
 # reuse a config
-@ai_function[str](config=Configs.RESEARCH)
-def research(topic: str):
+@ai_function(config=Configs.RESEARCH)
+def research(topic: str) -> str:
     """Research the following topic and return a summary: {topic}"""
 
 
 # keyword arguments can be used to override config arguments for this specific function
-@ai_function[str](config=Configs.FAST_MODEL, tools=[web_search])
-def quick_lookup(topic: str):
+@ai_function(config=Configs.FAST_MODEL, tools=[web_search])
+def quick_lookup(topic: str) -> str:
     """Look up the following topic and return a one-line summary: {topic}"""
 ```
 
@@ -448,23 +452,23 @@ from strands_tools import exa as websearch_tool
 from ai_functions import ai_function
 
 
-@ai_function[str](tools=[websearch_tool])
-def research_news(stock: str):
+@ai_function(tools=[websearch_tool])
+def research_news(stock: str) -> str:
     """
     Research and summarize the current news regarding the following stock: {stock}
     """
 
 
-@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["yfinance.*", "pandas.*"])
-def research_price(stock: str, past_days: int):
+@ai_function(code_execution_mode="local", code_executor_additional_imports=["yfinance.*", "pandas.*"])
+def research_price(stock: str, past_days: int) -> DataFrame:
     """
     Use the `yfinance` Python package to retrieve the historical prices of {stock} in the last {past_days} days.
     Return a dataframe with columns [date, price (float, price at market close)]
     """
 
 
-@ai_function[str]
-def write_report(stock: str, news: str, prices: DataFrame):
+@ai_function
+def write_report(stock: str, news: str, prices: DataFrame) -> str:
     """
     Write and return a HTML report on the trend of the stock {stock} in the last 30 days.
     Use the provided `prices` DataFrame and the following summary of recent news:
@@ -490,7 +494,7 @@ Note that nothing agent-specific is happening in `stock_research_workflow`: it i
 
 ## AI Threads: adding state
 
-AI Functions are stateless: each call is a one-shot that runs on a fresh thread, and no history is kept between calls. Some use cases need more — a chatbot accumulating turns, an assistant that remembers the context it was given. For these, an AI Function can be `spawn`ed as an **AI Thread**: a live, stateful object that stays alive across several calls.
+AI Functions are stateless: each call is a one-shot that runs on a fresh thread, and no history is kept between calls. Some use cases need more: a chatbot accumulating turns, an assistant that remembers the context it was given. For these, an AI Function can be `spawn`ed as an **AI Thread**: a live, stateful object that stays alive across several calls.
 
 `spawn()` returns a `ThreadHandle`, a thin reference to a live thread on which every subsequent `run` accumulates history:
 
@@ -500,8 +504,8 @@ import asyncio
 from ai_functions import ai_function
 
 
-@ai_function[str]
-def assistant(message: str):
+@ai_function
+def assistant(message: str) -> str:
     """{message}"""
 
 
@@ -546,7 +550,7 @@ positive, negative = await asyncio.gather(
 )
 ```
 
-Both forks start from the same context turn, but their histories then evolve independently — `positive` never sees what `pessimistic` asked, and vice versa.
+Both forks start from the same context turn, but their histories then evolve independently: `positive` never sees what `pessimistic` asked, and vice versa.
 
 ### Injecting messages
 
@@ -558,7 +562,7 @@ await handle.notify(
 )
 ```
 
-`run` and `notify` are two independent primitives. `run(*args, **kwargs)` is the default path — it enqueues a unit of work and returns a future for its typed result. `notify(text)` is a best-effort side channel: a text payload is handed to the thread with no guarantee about whether, when, or how it surfaces. In particular, `notify` does **not** start a cycle — an idle thread stays idle until the next `run`. An `AIThread` buffers the text and surfaces it as a system-style hint on its next turn, which is useful for attaching out-of-band context the LLM should consider.
+`run` and `notify` are two independent primitives. `run(*args, **kwargs)` is the default path: it enqueues a unit of work and returns a future for its typed result. `notify(text)` is a best-effort side channel: a text payload is handed to the thread with no guarantee about whether, when, or how it surfaces. In particular, `notify` does **not** start a cycle; an idle thread stays idle until the next `run`. An `AIThread` buffers the text and surfaces it as a system-style hint on its next turn, which is useful for attaching out-of-band context the LLM should consider.
 
 ### Lifecycle
 
@@ -587,7 +591,7 @@ await handle.terminate_now()
 
 ## Teams of agents: the coordinator and workers
 
-Calling an AI Function directly, or spawning a single handle with `fn.spawn()`, both rely on a private coordinator and worker created behind the scenes for the duration of the call. As soon as several threads need to coexist — because they run in parallel, talk to each other, or share rate-limit state — these two objects become explicit:
+Calling an AI Function directly, or spawning a single handle with `fn.spawn()`, both rely on a private coordinator and worker created behind the scenes for the duration of the call. As soon as several threads need to coexist (because they run in parallel, talk to each other, or share rate-limit state), these two objects become explicit:
 
 - An **`InMemoryCoordinator`** is the registry and router: it keeps track of which threads and workers exist, stores their event logs, and routes every cross-thread operation.
 - A **`LocalWorker`** is the execution engine: it hosts threads and drives their cycles on an asyncio dispatcher task. A worker must register itself with a coordinator before it can host any thread; a coordinator can have several workers registered, including remote ones (see [Distributed operation](#distributed-operation)).
@@ -622,18 +626,18 @@ class ResearchPlan(BaseModel):
     subtasks: list[str]
 
 
-@ai_function[ResearchPlan]
-def planner(topic: str):
+@ai_function
+def planner(topic: str) -> ResearchPlan:
     """Break down the research topic into 2-3 subtasks: {topic}"""
 
 
-@ai_function[str]
-def researcher(subtask: str):
+@ai_function
+def researcher(subtask: str) -> str:
     """Research this subtask thoroughly: {subtask}"""
 
 
-@ai_function[str]
-def synthesizer(findings: str):
+@ai_function
+def synthesizer(findings: str) -> str:
     """Synthesize these findings into a summary:\n\n{findings}"""
 
 
@@ -645,7 +649,7 @@ async def main() -> None:
     planner_handle = await coord.spawn(planner, thread_name="planner")
     plan = await planner_handle.run(topic="quantum computing applications")
 
-    # Spawn researchers as children of the planner — token usage rolls up.
+    # Spawn researchers as children of the planner; token usage rolls up.
     researcher_handles = [
         await coord.spawn(
             researcher,
@@ -680,7 +684,7 @@ Every `AIThread` is given two extra tools by default:
 - `list_threads()` returns a snapshot of every thread registered with the coordinator, including an `is_self` flag marking the calling thread.
 - `send_message(thread_id, message, mode="wait")` routes a message to a peer through the coordinator. The message is enqueued on the peer's work queue: if the peer is currently busy, the message waits behind any pending work.
 
-This is all it takes to build a two-agent team — a `researcher` that can search the web, and a `writer` that delegates fact-finding to it:
+This is all it takes to build a two-agent team: a `researcher` that can search the web, and a `writer` that delegates fact-finding to it:
 
 ```python
 import asyncio
@@ -692,8 +696,8 @@ from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 
 
 # `researcher` knows how to look things up on the web.
-@ai_function[str](tools=[exa])
-def researcher(topic: str):
+@ai_function(tools=[exa])
+def researcher(topic: str) -> str:
     """
     Research the following topic on the web and return a concise factual
     summary, citing the sources you used:
@@ -705,8 +709,8 @@ def researcher(topic: str):
 # `writer` is a short-form writer. The prompt tells it about its teammate;
 # the `send_message` tool is injected automatically by the coordinator and
 # lets it ask the researcher follow-up questions.
-@ai_function[str]
-def writer(brief: str):
+@ai_function
+def writer(brief: str) -> str:
     """
     Write a short report based on the following brief: {brief}
 
@@ -740,7 +744,7 @@ if __name__ == "__main__":
 
 - `"wait"` (default): await the peer's cycle and return its reply as the tool's result. This blocks the sender's current cycle on the peer's cycle.
 - `"fire_and_forget"`: schedule the peer's cycle as a background task and return immediately. The peer's reply is discarded.
-- `"continue_then_receive"`: schedule the peer's cycle, return immediately, and when the peer completes, enqueue a fresh cycle on the sender with the peer's reply formatted as the user turn. This is the "dispatch-and-resume" pattern — the sender's current cycle ends promptly, and a follow-up cycle is kicked off automatically when the reply arrives.
+- `"continue_then_receive"`: schedule the peer's cycle, return immediately, and when the peer completes, enqueue a fresh cycle on the sender with the peer's reply formatted as the user turn. This is the "dispatch-and-resume" pattern: the sender's current cycle ends promptly, and a follow-up cycle is kicked off automatically when the reply arrives.
 
 ```mermaid
 sequenceDiagram
@@ -833,19 +837,19 @@ coord.append_event(CustomEvent(
 
 ## Memory and optimization
 
-Just as PyTorch or JAX let you optimize parameters via backpropagation through a computation graph, AI Functions let you optimize agentic workflows via natural-language feedback propagation. You define named parameters — prompt fragments, learned facts, or reusable Python code — in a *memory schema*, store them in a memory backend, and pass them to your functions as ordinary arguments. After a run, you attach feedback to the output; the library traces that feedback back through the graph of agentic calls that produced it and updates each contributing parameter, so the next run recalls the improved values. Feedback also propagates across child threads: if a thread spawns a child during its execution, the feedback reaches the child and the child's memory.
+Just as PyTorch or JAX let you optimize parameters via backpropagation through a computation graph, AI Functions let you optimize agentic workflows via natural-language feedback propagation. You define named parameters (prompt fragments, learned facts, or reusable Python code) in a *memory schema*, store them in a memory backend, and pass them to your functions as ordinary arguments. After a run, you attach feedback to the output; the library traces that feedback back through the graph of agentic calls that produced it and updates each contributing parameter, so the next run recalls the improved values. Feedback also propagates across child threads: if a thread spawns a child during its execution, the feedback reaches the child and the child's memory.
 
-The feedback acts as the gradient and the parameters are the values being optimized, except both are expressed in natural language instead of numbers. *Procedural* parameters apply the same idea to code: the optimizer can store the Python an agent wrote to solve a task, so a later run reuses a working implementation instead of regenerating one from scratch — a form of JIT compilation for agentic logic.
+The feedback acts as the gradient and the parameters are the values being optimized, except both are expressed in natural language instead of numbers. *Procedural* parameters apply the same idea to code: the optimizer can store the Python an agent wrote to solve a task, so a later run reuses a working implementation instead of regenerating one from scratch, a form of JIT compilation for agentic logic.
 
 The system has three main pieces:
 
-1. A **memory backend** stores named parameters (strings, lists, or code) and exposes them through `recall` (full value), `search` (top-k matching entries), and `query` (question-answering over the content). Reads return a `ParameterView` — the value plus the metadata that links it into the graph — and are recorded into the consuming thread's event log.
+1. A **memory backend** stores named parameters (strings, lists, or code) and exposes them through `recall` (full value), `search` (top-k matching entries), and `query` (question-answering over the content). Reads return a `ParameterView` (the value plus the metadata that links it into the graph) and are recorded into the consuming thread's event log.
 2. A **computation graph** records which parameters and results contributed to a given output. It is reconstructed after a run from the event logs, plus the dataflow edges `trace` discovers in the call arguments.
 3. An **optimizer** walks the computation graph backward from the feedback, determines which parameters are responsible and how they need to change, and consolidates the updates into the memory backend.
 
 ### Quick example
 
-`trace()` runs a function exactly like a call, but returns a `Result` that remembers its provenance; `optimizer.step` then rebuilds the graph, backpropagates the feedback, and consolidates the updates — no coordinator or graph wiring:
+`trace()` runs a function exactly like a call, but returns a `Result` that remembers its provenance; `optimizer.step` then rebuilds the graph, backpropagates the feedback, and consolidates the updates, with no coordinator or graph wiring:
 
 ```python
 import asyncio
@@ -855,8 +859,8 @@ from pydantic import BaseModel, Field
 from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function
 
 
-@ai_function[str]
-def write_summary(text: str, tone_guidelines: str):
+@ai_function
+def write_summary(text: str, tone_guidelines: str) -> str:
     """
     Summarize the following text:
     {text}
@@ -883,7 +887,7 @@ async def main() -> None:
     optimizer = TextGradOptimizer()
 
     # trace() runs the function and records which recalled parameters it
-    # consumed — passing the ParameterView as an argument wires the edge.
+    # consumed; passing the ParameterView as an argument wires the edge.
     summary = await write_summary.trace(
         text="some long document...",
         tone_guidelines=await memory.recall("tone_guidelines"),
@@ -913,7 +917,7 @@ For a worked end-to-end learning loop on DS-1000 code-generation problems, see `
 
 ### Memory backends
 
-A memory backend manages the storage, retrieval, and consolidation of parameters. The `MemoryBackend` base class handles all graph wiring — subclass it and implement the storage methods to build your own. The library ships with two implementations: `JSONMemoryBackend` (file-based) and `AgentCoreMemoryBackend` (backed by Amazon Bedrock AgentCore memory).
+A memory backend manages the storage, retrieval, and consolidation of parameters. The `MemoryBackend` base class handles all graph wiring: subclass it and implement the storage methods to build your own. The library ships with two implementations: `JSONMemoryBackend` (file-based) and `AgentCoreMemoryBackend` (backed by Amazon Bedrock AgentCore memory).
 
 Every backend manages a set of named parameters whose types, defaults, and metadata are defined through a Pydantic schema:
 
@@ -924,22 +928,22 @@ from ai_functions.memory import Frozen, Procedural
 
 
 class MemorySchema(BaseModel):
-    # A regular string parameter — optimizable by default.
+    # A regular string parameter, optimizable by default.
     user_preferences: str = Field(
         "No preferences known.",
         description="Known facts and preferences about the user",
     )
 
-    # A list parameter — each entry is a separate piece of knowledge.
+    # A list parameter: each entry is a separate piece of knowledge.
     learned_rules: list[str] = Field(
         default_factory=list,
         description="Rules learned from past interactions",
     )
 
-    # A procedural parameter — stores reusable Python code.
+    # A procedural parameter: stores reusable Python code.
     helper_functions: Procedural
 
-    # A frozen parameter — recalled but not updated by the optimizer.
+    # A frozen parameter: recalled but not updated by the optimizer.
     system_prompt: Frozen[str] = Field(
         "You are a helpful assistant.",
         description="Base system prompt (not optimized)",
@@ -951,26 +955,29 @@ The `description` on each field guides the optimizer in understanding what kind 
 Parameters can be retrieved in three ways. Each method is `async` and returns a `ParameterView` — an opaque wrapper carrying the value plus the metadata (name, backend, derivation) that links it into the computation graph:
 
 ```python
-# Full recall — the entire parameter value.
+# Full recall: the entire parameter value.
 guidelines = await memory.recall("tone_guidelines")
 
-# Query — asks the backend to answer a question given the parameter content.
+# Query: asks the backend to answer a question given the parameter content.
 answer = await memory.query("learned_rules", query="What do we know about date formatting?")
 
-# Search — the top-k matching entries (for list parameters).
+# Search: the top-k matching entries (for list parameters).
 matches = await memory.search("learned_rules", query="formatting", k=3)
 ```
 
-A view interpolates into f-strings and prompts like the plain value (`str(view)` is `str(view.value)`), and the runtime unwraps it automatically when it is passed to a function; use `.value` for the raw value. Passing the view itself as an argument — rather than an f-string of it — is what preserves the graph edge. Inside a running thread (e.g. a memory tool call), the read is recorded into that thread's event log immediately; outside one, `trace()` records it when the view is consumed.
+A view interpolates into f-strings and prompts like the plain value (`str(view)` is `str(view.value)`), and the runtime unwraps it automatically when it is passed to a function; use `.value` for the raw value. Passing the view itself as an argument (rather than an f-string of it) is what preserves the graph edge. Inside a running thread (e.g. a memory tool call), the read is recorded into that thread's event log immediately; outside one, `trace()` records it when the view is consumed.
 
-Each read also carries *derivation metadata* (`view.meta`, recorded into the recall event): the query, and — for `search` on the JSON backend — the stable `entry_id` of every returned entry. The optimizer feeds that context back into `consolidate`, so feedback on a run that searched a list updates exactly the entries the run retrieved: the JSON backend consolidates lists with an agentic memory manager that adds, updates, and deletes entries by id instead of rewriting the whole list.
+Each read also carries *derivation metadata* (`view.meta`, recorded into the recall event): the query, and, for `search` on the JSON backend, the stable `entry_id` of every returned entry. The optimizer feeds that context back into `consolidate`, so feedback on a run that searched a list updates exactly the entries the run retrieved: the JSON backend consolidates lists with an agentic memory manager that adds, updates, and deletes entries by id instead of rewriting the whole list.
 
-To keep handle-passing type-checked, annotate the receiving parameter with the `Traceable[T]` alias (`T | ParameterView[T] | Result[T]`):
+Declare the receiving parameter as the plain type it actually uses: the runtime unwraps every handle to its `.value` before the function body runs, so the body only ever sees the plain value. `trace()` accepts the handles regardless (its signature is `*args`/`**kwargs`), so no special annotation is needed to keep handle-passing type-checked:
 
 ```python
-@ai_function[str]
-def write_summary(text: str, tone_guidelines: Traceable[str]):
+@ai_function
+def write_summary(text: str, tone_guidelines: str) -> str:
     """Summarize {text} following {tone_guidelines}."""
+
+# A recalled parameter (a handle) can be passed straight to trace():
+await write_summary.trace(text=doc, tone_guidelines=await memory.recall("tone"))
 ```
 
 ### Reconstructing the computation graph
@@ -1010,7 +1017,7 @@ optimizer.consolidate(node)
 optimizer.zero_grad(node)
 ```
 
-The steps are also exposed separately so you can inspect the propagated feedback before committing it, or accumulate feedback from multiple runs before consolidating. `backward` and `consolidate` operate on the same graph object — gradients accumulate on nodes built once, which is why `step` returns the graph it built.
+The steps are also exposed separately so you can inspect the propagated feedback before committing it, or accumulate feedback from multiple runs before consolidating. `backward` and `consolidate` operate on the same graph object: gradients accumulate on nodes built once, which is why `step` returns the graph it built.
 
 ### Memory as a tool provider
 
@@ -1041,8 +1048,8 @@ memory = JSONMemoryBackend(TravelMemory, "traveler-1", path="travel.json")
 tools = memory.tool_provider("preferences", "visited")
 
 
-@ai_function[str](tools=[tools])
-def travel_assistant(request: str):
+@ai_function(tools=[tools])
+def travel_assistant(request: str) -> str:
     """You are a travel planning assistant with access to the user's travel memory.
     Use the available tools to look up their preferences and past trips.
 
@@ -1050,11 +1057,11 @@ def travel_assistant(request: str):
     """
 ```
 
-`tool_provider` generates schema-scoped tools (`recall_<name>`, `query_<name>`, `search_<name>` for lists, and `save_<name>` / `delete_<name>` for scalars). You can restrict which operations are available — for example, `memory.tool_provider(..., operations={"recall", "search", "query"})` provides read-only access. See `examples/memory_tools.py` for a complete example.
+`tool_provider` generates schema-scoped tools (`recall_<name>`, `query_<name>`, `search_<name>` for lists, and `save_<name>` / `delete_<name>` for scalars). You can restrict which operations are available: for example, `memory.tool_provider(..., operations={"recall", "search", "query"})` provides read-only access. See `examples/memory_tools.py` for a complete example.
 
 ## Distributed operation
 
-Everything so far assumed a single process: one coordinator and one or more workers in the same Python interpreter. Deployments often need to split these across machines — an AI platform running in the cloud, a client connecting to it from a developer laptop, a fleet of workers serving a shared pool of jobs.
+Everything so far assumed a single process: one coordinator and one or more workers in the same Python interpreter. Deployments often need to split these across machines: an AI platform running in the cloud, a client connecting to it from a developer laptop, a fleet of workers serving a shared pool of jobs.
 
 To do this, the in-process `InMemoryCoordinator` is replaced with a `CoordinatorClient` connected to a remote `CoordinatorEndpoint`. **The rest of the API is unchanged**: `spawn`, `run`, `send_message`, and event subscriptions behave identically whether the coordinator is local or remote.
 
@@ -1068,8 +1075,8 @@ from ai_functions.network import CoordinatorClient, CoordinatorEndpoint
 from ai_functions.runtime import LocalWorker
 
 
-@ai_function[str](structured_output=False)
-def chat(message: str):
+@ai_function(structured_output=False)
+def chat(message: str) -> str:
     """{message}"""
 
 
@@ -1155,8 +1162,8 @@ import ai_functions
 from ai_functions import ai_function
 
 
-@ai_function[str](structured_output=False)
-def alice(message: str):
+@ai_function(structured_output=False)
+def alice(message: str) -> str:
     """You are Alice. Bob knows geography; ask him when appropriate. {message}"""
 
 
@@ -1170,8 +1177,8 @@ import ai_functions
 from ai_functions import ai_function
 
 
-@ai_function[str](structured_output=False)
-def bob(message: str):
+@ai_function(structured_output=False)
+def bob(message: str) -> str:
     """You are Bob. Answer geography questions concisely. {message}"""
 
 
@@ -1222,13 +1229,13 @@ $ ai-functions kill thread-a3f2        # graceful terminate
 $ ai-functions kill thread-77c1 --now  # hard stop
 ```
 
-`submit` starts one cycle with the given prompt and blocks until it resolves; `--json` enriches the output with token usage and timing. `notify` is the side channel from [AI Threads](#ai-threads-adding-state): it hands the thread a message without starting a cycle. `attach` opens a TUI with two views — a clean conversation view and a raw event view — so a long log stays readable.
+`submit` starts one cycle with the given prompt and blocks until it resolves; `--json` enriches the output with token usage and timing. `notify` is the side channel from [AI Threads](#ai-threads-adding-state): it hands the thread a message without starting a cycle. `attach` opens a TUI with two views, a clean conversation view and a raw event view, so a long log stays readable.
 
 ## Going further
 
 This tutorial covered the user-facing surface of the library. Two more advanced topics are documented separately:
 
-- **Custom spawnables** — every thread in the library implements two small protocols, `Spawnable` (a factory producing a live thread) and `Thread` (the runtime surface the worker drives). `AIFunction` is the built-in implementation, but any class satisfying the protocols can be hosted by a worker. In particular, a custom spawnable can be a **plain-Python workflow that runs as a thread**: its `execute` contains no LLM call at all, but uses `ctx.coordinator` to spawn AI subagents, run them (in parallel with `asyncio.gather`, sequentially, or in any control flow Python can express), and return a typed result. Because the workflow is itself a thread, it gets everything threads get for free — a handle, lifecycle control, an event log, hierarchical token rollup from its children via `parent_id`, and reachability as a peer through `send_message`. This is the way to define orchestration logic that is not well expressed as a single prompt, or that needs access to unserialized local state. See the [architecture documentation](architecture.md#custom-spawnables) for the protocol details and a worked report-writing workflow.
-- **Under the hood** — a guided walk through the library's internals, tracing a local `run`, a remote `run`, a cross-worker `send_message`, and an event fan-out end to end. See the [architecture documentation](architecture.md#under-the-hood).
+- **Custom spawnables**: every thread in the library implements two small protocols, `Spawnable` (a factory producing a live thread) and `Thread` (the runtime surface the worker drives). `AIFunction` is the built-in implementation, but any class satisfying the protocols can be hosted by a worker. In particular, a custom spawnable can be a **plain-Python workflow that runs as a thread**: its `execute` contains no LLM call at all, but uses `ctx.coordinator` to spawn AI subagents, run them (in parallel with `asyncio.gather`, sequentially, or in any control flow Python can express), and return a typed result. Because the workflow is itself a thread, it gets everything threads get for free: a handle, lifecycle control, an event log, hierarchical token rollup from its children via `parent_id`, and reachability as a peer through `send_message`. This is the way to define orchestration logic that is not well expressed as a single prompt, or that needs access to unserialized local state. See the [architecture documentation](architecture.md#custom-spawnables) for the protocol details and a worked report-writing workflow.
+- **Under the hood**: a guided walk through the library's internals, tracing a local `run`, a remote `run`, a cross-worker `send_message`, and an event fan-out end to end. See the [architecture documentation](architecture.md#under-the-hood).
 
 The complete API surface is documented in the [API reference](https://strandsagents.com/latest/documentation/).

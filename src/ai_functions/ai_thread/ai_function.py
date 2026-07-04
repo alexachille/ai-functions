@@ -272,7 +272,7 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
         """
         return run_blocking(lambda: self(*args, **kwargs))
 
-    async def trace(self, *args: P.args, **kwargs: P.kwargs) -> Result[T]:
+    async def trace(self, *args: Any, **kwargs: Any) -> Result[T]:  # pyright: ignore[reportAny]
         """Run one cycle like ``__call__``, returning a :class:`Result` node.
 
         The traced counterpart of ``__call__`` for optimization workflows:
@@ -283,6 +283,14 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
             cat = await joke_writer.trace(topic="cats", joke_guidelines=await memory.recall("joke_guidelines"))
             email = await email_writer.trace(jokes=cat, formatting_guidelines=await memory.recall("fmt"))
             await optimizer.step(email, "titles please", backends=[memory])
+
+        Accepts ``*args: Any`` rather than the wrapped signature ``P`` on
+        purpose: each argument may be the declared value *or* a
+        ``ParameterView`` / ``Result`` handle wrapping it (also nested in
+        dicts, lists, tuples), and a ``ParamSpec`` cannot express "``P`` with
+        every parameter widened to accept its handle". Handles are recorded as
+        graph edges and unwrapped to their ``.value`` before ``prompt_fn`` runs,
+        so the function body still receives the plain declared types.
 
         Args:
             args: Positional arguments forwarded to ``prompt_fn``. May contain

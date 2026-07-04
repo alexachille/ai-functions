@@ -12,27 +12,30 @@ to the parent. The coordinator never inspects the type — it just calls
 import asyncio
 from typing import Self
 
+from _utils import display
 from pydantic import BaseModel
 
 from ai_functions import ai_function
-from ai_functions.ai_thread import AIFunctionError
+from ai_functions.ai_thread import AIFunctionError, ThreadConfig
 from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 from ai_functions.types import InputShape, ThreadContext
 
+config = ThreadConfig(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
 
 class AnalysisReport(BaseModel):
     topic: str
     sections: list[str]
     word_count: int
+    full_text: str
 
 
-@ai_function[list[str]]
-def outline_generator(topic: str):
+@ai_function(config=config)
+def outline_generator(topic: str) -> list[str]:
     """Generate 3 section titles for a report about: {topic}"""
 
 
-@ai_function[str]
-def section_writer(title: str, topic: str):
+@ai_function(config=config)
+def section_writer(title: str, topic: str) -> str:
     """Write a short section titled '{title}' for a report about: {topic}"""
 
 
@@ -84,6 +87,7 @@ class ReportWorkflow:
             topic=topic,
             sections=sections,
             word_count=len(full_text.split()),
+            full_text=full_text,
         )
 
     async def notify(self, text: str) -> None:
@@ -117,9 +121,18 @@ async def main() -> None:
         await handle.terminate_now()
         await worker.close()
 
-    print(f"Report on: {report.topic}")
-    print(f"Sections: {report.sections}")
-    print(f"Word count: {report.word_count}")
+    display(
+        "Report",
+        "\n\n".join(
+            [
+                f"*Topic:* {report.topic}",
+                f"*Sections:* {report.sections}",
+                f"*Word count:* {report.word_count}",
+                f"# Full text\n\n{report.full_text}",
+            ]
+        ),
+        lang="md",
+    )
 
 
 if __name__ == "__main__":

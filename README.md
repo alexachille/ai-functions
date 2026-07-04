@@ -1,8 +1,8 @@
 # Strands AI Functions
 
-Strands AI Functions is a Python library for building reliable AI-powered applications through a new abstraction: functions that behave like standard Python functions, but are evaluated by reasoning AI agents.
+Strands AI Functions is a Python library built around a new abstraction: functions that behave like standard Python functions, but are evaluated by AI agents.
 
-- **Verified, not prompted**: declare *post-conditions* on every function; the library runs a self-correcting loop until the output provably satisfies them, preventing cascading errors in complex workflows.
+- **Verified, not prompted**: declare *post-conditions* on a function; the library runs a self-correcting loop until the output satisfies them, preventing cascading errors in complex workflows.
 - **Native Python objects**: agents can dynamically generate and execute code, so an AI Function can take and return real Python values (a `DataFrame`, not a JSON blob).
 - **Just functions**: compose them with `await` and `asyncio.gather`, pass them to other agents as tools, and share them as ordinary Python libraries.
 - **Stateful threads and teams**: spawn a function into a live **AI Thread** that keeps its history; run several threads on a coordinator and let them discover and message each other.
@@ -11,7 +11,7 @@ Strands AI Functions is a Python library for building reliable AI-powered applic
 
 ## Getting Started
 
-Requires Python >= 3.13 (3.14+ recommended for native [t-string](https://peps.python.org/pep-0750/) support) and credentials for a supported model provider.
+Requires Python >= 3.12 (3.14+ recommended for native [t-string](https://peps.python.org/pep-0750/) support) and credentials for a supported model provider.
 
 ```bash
 # using pip
@@ -27,20 +27,20 @@ from strands.models.openai import OpenAIModel
 
 model = OpenAIModel(client_args={"api_key": "<KEY>"}, model_id="gpt-4o")
 
-@ai_function[str](model=model)
-def my_function():
+@ai_function(model=model)
+def my_function() -> str:
     """[...]"""
 ```
 
 ## A First AI Function
 
-An AI Function is defined with the `@ai_function` decorator: the return type is declared in brackets (or inferred from the function's return annotation with a bare `@ai_function`), and the task is described in the docstring, which is interpreted as a template and filled in with the call arguments.
+An AI Function is defined with the `@ai_function` decorator: the return type is declared with an ordinary return annotation, and the task is described in the docstring, which is interpreted as a template and filled in with the call arguments.
 
 ```python
 from ai_functions import ai_function
 
-@ai_function[str]
-def translate_text(text: str, lang: str):
+@ai_function
+def translate_text(text: str, lang: str) -> str:
     """Translate the text below to the following language: {lang}.
     ---
     {text}
@@ -49,11 +49,11 @@ def translate_text(text: str, lang: str):
 print(translate_text.run_sync("It was the best of times", lang="fr"))
 ```
 
-That's the whole thing: the library creates an agent, builds the prompt, runs it, and parses and validates the typed result. AI Functions are async-native — `await translate_text(...)` is the canonical form, and `run_sync` is the blocking convenience for scripts.
+That's the whole thing: the library creates an agent, builds the prompt, runs it, and parses and validates the typed result. AI Functions are async-native, so `await translate_text(...)` is the canonical form, and `run_sync` is the blocking convenience for scripts. In codebases with strict type checking, the return type can instead be declared on the decorator (`@ai_function[str]`), which type-checks cleanly; see the [tutorial](docs/tutorial.md#return-types).
 
 ## Post-Conditions
 
-Programmers should not "prompt-and-pray" for an agent's result to be correct — they should *verify* it. Post-conditions are functions (plain Python, or other AI Functions) that validate the result; if any fail, the model is automatically re-prompted with all the errors and tries again, up to `max_attempts` times. The function only returns once every post-condition passes.
+Programmers should not "prompt-and-pray" for an agent's result to be correct, they should *verify* it. Post-conditions are functions (plain Python or other AI Functions) that validate the result; if any fail, the model is automatically re-prompted with the errors and tries again, up to `max_attempts` times. The function only returns once every post-condition passes.
 
 ```python
 from pydantic import BaseModel
@@ -75,8 +75,8 @@ def check_length(response: MeetingSummary):
 
 
 # ... or an AI Function, since AI Functions *are* just functions.
-@ai_function[PostConditionResult]
-def check_style(response: MeetingSummary):
+@ai_function
+def check_style(response: MeetingSummary) -> PostConditionResult:
     """
     Check if the summary below uses bullet points and provides the reader
     with the necessary context:
@@ -86,8 +86,8 @@ def check_style(response: MeetingSummary):
     """
 
 
-@ai_function[MeetingSummary](post_conditions=[check_length, check_style], max_attempts=5)
-def summarize_meeting(transcripts: str):
+@ai_function(post_conditions=[check_length, check_style], max_attempts=5)
+def summarize_meeting(transcripts: str) -> MeetingSummary:
     """
     Write a summary of the following meeting in less than 50 words.
     <transcripts>
@@ -103,7 +103,7 @@ Each direct call is a one-shot: it runs on a fresh, private thread and keeps no 
 
 ## Native Python Objects
 
-Agents are usually limited to serializable inputs and outputs. AI Functions can instead be given a Python execution environment, letting the agent generate and run code to process arbitrary data and return native Python objects — with post-conditions guaranteeing the result's shape.
+Agents are usually limited to serializable inputs and outputs. An AI Function can instead be given a Python execution environment, letting the agent generate and run code to process arbitrary data and return native Python objects, with post-conditions guaranteeing the result's shape.
 
 The "universal loader" below takes a file in *any* format, inspects it, and returns a validated `DataFrame` (see `examples/code_universal_loader.py`):
 
@@ -120,8 +120,8 @@ def check_invoice(df: DataFrame):
 
 
 # code execution has to be explicitly enabled
-@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["pandas.*", "sqlite3", "json"], post_conditions=[check_invoice])
-def import_invoice(path: str):
+@ai_function(code_execution_mode="local", code_executor_additional_imports=["pandas.*", "sqlite3", "json"], post_conditions=[check_invoice])
+def import_invoice(path: str) -> DataFrame:
     """
     The file `{path}` contains purchase logs. Extract them in a DataFrame with
     columns: product_name (str), quantity (int), price (float), purchase_date (datetime).
@@ -136,7 +136,7 @@ See [Security](#security) for the safety properties of local code execution.
 
 ## Multi-Agent Workflows
 
-Because AI Functions are just async functions, multi-agent systems are built with the composition tools Python already has — and the library adds two more styles on top. Pick per use case: **compose** functions in code when the control flow is known, hand functions to an agent as **tools** when it should decide, or spawn **teams of threads** that discover each other and negotiate on their own.
+Because AI Functions are just async functions, multi-agent systems are built with the composition tools Python already has, and the library adds two more styles on top: **compose** functions in code when the control flow is known, hand functions to an agent as **tools** when the agent should decide, or spawn **teams of threads** that discover and message each other.
 
 ### Composing functions
 
@@ -151,21 +151,21 @@ from strands_tools import exa
 from ai_functions import ai_function
 
 
-@ai_function[str](tools=[exa])
-def research_news(stock: str):
+@ai_function(tools=[exa])
+def research_news(stock: str) -> str:
     """Research and summarize the current news for the stock symbol: {stock}"""
 
 
-@ai_function[pd.DataFrame](code_execution_mode="local", code_executor_additional_imports=["pandas.*", "yfinance.*"])
-def research_price(stock: str):
+@ai_function(code_execution_mode="local", code_executor_additional_imports=["pandas.*", "yfinance.*"])
+def research_price(stock: str) -> pd.DataFrame:
     """
     Use the `yfinance` package to retrieve the historical prices of {stock} over
     the last 30 days. Return a DataFrame with columns ["date", "price"].
     """
 
 
-@ai_function[str]
-def write_report(stock: str, news: str, prices: pd.DataFrame):
+@ai_function
+def write_report(stock: str, news: str, prices: pd.DataFrame) -> str:
     """
     Write an HTML report on the trend of the stock {stock}, based on the
     provided `prices` DataFrame and this news summary: {news}
@@ -182,13 +182,13 @@ async def stock_report(stock: str) -> str:
 An AI Function can be handed to another agent as a tool, delegating the decision of when to invoke it (see `examples/compose_research_team.py`):
 
 ```python
-@ai_function[str](description="Perform web searches relevant to a query and return a summary of the results.", tools=[exa])
-def websearch(query: str):
+@ai_function(description="Perform web searches relevant to a query and return a summary of the results.", tools=[exa])
+def websearch(query: str) -> str:
     """Perform a web search on the following topic and summarize your findings: {query}"""
 
 
-@ai_function[str](tools=[websearch])
-def report_writer(topic: str):
+@ai_function(tools=[websearch])
+def report_writer(topic: str) -> str:
     """Research the following topic and write a report: {topic}"""
 ```
 
@@ -208,7 +208,7 @@ A handle also supports `notify` (inject out-of-band context without starting a c
 
 ## A Team of AI Threads
 
-Several threads can run side by side on the same **coordinator** and communicate with each other. An `InMemoryCoordinator` is the registry and router; a `LocalWorker` is the execution engine that hosts threads and drives their cycles. Every AI Thread is automatically given two tools — `list_threads` (to discover its peers) and `send_message` (to delegate work to them) — so no manual wiring is needed:
+Several threads can run side by side on the same **coordinator** and communicate with each other. An `InMemoryCoordinator` is the registry and router; a `LocalWorker` is the execution engine that hosts threads and drives their cycles. Every AI Thread is automatically given two tools, `list_threads` (to discover its peers) and `send_message` (to delegate work to them), so no manual wiring is needed:
 
 ```python
 import asyncio
@@ -220,8 +220,8 @@ from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 
 
 # `researcher` knows how to look things up on the web.
-@ai_function[str](tools=[exa])
-def researcher(topic: str):
+@ai_function(tools=[exa])
+def researcher(topic: str) -> str:
     """
     Research the following topic on the web and return a concise factual
     summary, citing the sources you used: {topic}
@@ -229,8 +229,8 @@ def researcher(topic: str):
 
 
 # `writer` produces short reports and can delegate fact-finding to its teammate.
-@ai_function[str]
-def writer(brief: str):
+@ai_function
+def writer(brief: str) -> str:
     """
     Write a short report based on the following brief: {brief}
 
@@ -258,7 +258,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`send_message` supports three modes — `"wait"` (block on the peer's reply), `"fire_and_forget"` (schedule and return immediately), and `"continue_then_receive"` (dispatch, end the current cycle, and resume automatically when the reply arrives). Children spawned with `parent_id` have their token usage roll up to the parent, and every turn, tool call, and lifecycle transition is available as an event stream via `coordinator.on(...)`. Orchestration logic that is not naturally expressed as a single prompt can be written as a custom **Spawnable**: a plain-Python workflow that runs as a thread and spawns AI subagents of its own. See the [tutorial](docs/tutorial.md) for all of these.
+`send_message` supports three modes: `"wait"` (block on the peer's reply), `"fire_and_forget"` (schedule and return immediately), and `"continue_then_receive"` (dispatch, end the current cycle, and resume automatically when the reply arrives). Children spawned with `parent_id` have their token usage roll up to the parent, and every turn, tool call, and lifecycle transition is available as an event stream via `coordinator.on(...)`. Orchestration logic that is not naturally expressed as a single prompt can be written as a custom **Spawnable**: a plain-Python workflow that runs as a thread and spawns AI subagents of its own. See the [tutorial](docs/tutorial.md) for all of these.
 
 ## Distributed Operation
 
@@ -268,7 +268,7 @@ The coordinator and workers do not have to live in the same process. A `Coordina
 # in-process
 coord = InMemoryCoordinator()
 
-# distributed — nothing else in the application changes
+# distributed: nothing else in the application changes
 coord = await CoordinatorClient.connect("ws://coordinator.internal:9901/rpc")
 ```
 
@@ -276,7 +276,7 @@ coord = await CoordinatorClient.connect("ws://coordinator.internal:9901/rpc")
 
 ## Agents Across Processes, from the CLI
 
-The `ai-functions` CLI turns the coordinator into a machine-wide runtime: agent scripts started in separate terminals register with it and become discoverable by each other — and drivable from the shell:
+The `ai-functions` CLI turns the coordinator into a machine-wide runtime: agent scripts started in separate terminals register with it, become discoverable by each other, and can be driven from the shell:
 
 ```console
 $ ai-functions server
@@ -297,18 +297,24 @@ $ ai-functions logs thread-a3f2 --follow   # stream the event log
 $ ai-functions attach thread-a3f2          # open a live TUI for the thread
 ```
 
+`attach` opens a live view of a running thread (here the writer delegating a fact-check to its researcher teammate via `send_message`), and its input bar can submit new work or inject context mid-run:
+
+<p align="center">
+  <img src="assets/tui.png" alt="The attach TUI showing a live writer thread: the transcript includes a send_message tool call to the researcher thread and its reply, with an input bar for submitting or injecting messages." width="720">
+</p>
+
 See the [tutorial](docs/tutorial.md#running-agents-across-processes) for writing agent scripts with `ai_functions.serve`.
 
 ## Memory & Optimization
 
-Just as PyTorch or JAX optimize parameters via backpropagation through a computation graph, AI Functions optimize agentic workflows via natural-language feedback propagation. Named parameters — prompt fragments, learned facts, or reusable Python code — live in a pluggable *memory backend* and are passed to functions as ordinary arguments. After a run, feedback attached to the output is propagated backward through the *computation graph* of the calls that produced it, and an *optimizer* updates only the parameters responsible:
+Just as PyTorch or JAX optimize parameters via backpropagation through a computation graph, AI Functions optimize agentic workflows via natural-language feedback propagation. Named parameters (prompt fragments, learned facts, or reusable Python code) live in a pluggable *memory backend* and are passed to functions as ordinary arguments. After a run, feedback attached to the output is propagated backward through the *computation graph* of the calls that produced it, and an *optimizer* updates only the parameters responsible:
 
 ```python
 memory = JSONMemoryBackend(WritingMemory, actor_id="user-1", path="memory.json")
 optimizer = TextGradOptimizer()
 
 # Forward pass: trace() runs the function and remembers which recalled
-# parameters (and prior results) it consumed — passing them as arguments
+# parameters (and prior results) it consumed; passing them as arguments
 # is what wires the computation graph.
 summary = await summarize.trace(
     text=document,
@@ -320,15 +326,15 @@ summary = await summarize.trace(
 await optimizer.step(summary, "The summary should be more concise and use bullet points.", backends=[memory])
 ```
 
-*Procedural* parameters extend the same mechanism to code: the optimizer can store the Python an agent wrote to solve a task, so later runs reuse a proven implementation instead of regenerating it — a form of JIT compilation for agentic logic. Backends and optimizers are pluggable, and memory can also be exposed to agents as tools. See the [tutorial](docs/tutorial.md#memory-and-optimization) for the full workflow, `examples/memory_optimization.py` for a multi-agent example, and `examples/memory_backprop_scipy.py` for a complete learning loop on a code-generation benchmark.
+*Procedural* parameters extend the same mechanism to code: the optimizer can store the Python an agent wrote to solve a task, so later runs reuse a proven implementation instead of regenerating it, a form of JIT compilation for agentic logic. Backends and optimizers are pluggable, and memory can also be exposed to agents as tools. See the [tutorial](docs/tutorial.md#memory-and-optimization) for the full workflow, `examples/memory_optimization.py` for a multi-agent example, and `examples/memory_backprop_scipy.py` for a complete learning loop on a code-generation benchmark.
 
 ## Security
 
-The `"local"` execution mode uses AST-based validation of the generated code with controlled imports and timeouts. The validation attempts to prevent malicious imports and block dangerous operations, but does not offer sandboxing and does not prevent resource exhaustion (e.g., infinite loops, excessive memory allocation). For production deployments, run AI Functions inside a container or other isolated environment to provide additional protection against resource exhaustion and process-level isolation. Use `"disabled"` mode for untrusted input or restricted environments. Limit imports to necessary packages and monitor execution in production.
+Code execution is off by default. The `"local"` mode validates generated code with AST checks, restricts imports to the allowlist you pass in, and applies timeouts. But it is not a sandbox: it cannot stop resource exhaustion (an infinite loop, runaway memory allocation) and offers no process-level isolation. For production deployments, run AI Functions inside a container or other isolated environment to provide additional protection against resource exhaustion and process-level isolation. Use `"disabled"` mode for untrusted input or restricted environments. Limit imports to necessary packages and monitor execution in production.
 
 ## Examples
 
-This repository includes several complete, runnable examples demonstrating different capabilities. To run them, first configure credentials for one of the supported model providers (see [Getting Started](#getting-started)), then:
+The `examples/` directory contains complete, runnable examples. Configure credentials for a supported model provider (see [Getting Started](#getting-started)), then:
 
 ```bash
 # Clone the repository
@@ -342,11 +348,11 @@ export STRANDS_TOOL_CONSOLE_MODE="enabled"
 uv run basics_one_shot.py
 ```
 
-**Note**: You may need to change the examples to use a different model provider.
+**Note**: the examples default to Amazon Bedrock model IDs; edit the `model` assignment at the top of a script to run it with a different model or a different provider.
 
 ## Tutorial
 
-For a full walkthrough — AI Functions, stateful threads, teams, distributed operation, custom spawnables, observability, memory, and optimization — see the [tutorial](docs/tutorial.md).
+For a full walkthrough of AI Functions, stateful threads, teams, distributed operation, custom spawnables, observability, memory, and optimization, see the [tutorial](docs/tutorial.md).
 
 ## License
 

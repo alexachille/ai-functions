@@ -220,7 +220,9 @@ def test_agentic_consolidation_edits_entries_by_id(tmp_path: Path) -> None:
     mem = _backend(tmp_path)
     model = ScriptedModel(
         [
-            Turn(tool_calls=(("update_memory", {"entry_id": "1", "value": "salt the water; save a cup for the sauce"}),)),
+            Turn(
+                tool_calls=(("update_memory", {"entry_id": "1", "value": "salt the water; save a cup for the sauce"}),)
+            ),
             Turn(tool_calls=(("delete_memory", {"entry_id": "3"}),)),
             Turn(tool_calls=(("add_memory", {"value": "use San Marzano tomatoes"}),)),
             Turn(text="done"),
@@ -317,9 +319,8 @@ def test_optimizer_consolidate_merges_retrieved_across_nodes(tmp_path: Path) -> 
 
 async def test_meta_flows_search_to_graph_node(tmp_path: Path) -> None:
     """End-to-end: search meta lands on the reconstructed ParameterNode."""
-    from ai_functions.testing import ScriptedModel, Turn
-
     from ai_functions import Traceable
+    from ai_functions.testing import ScriptedModel, Turn
 
     mem = _backend(tmp_path)
 

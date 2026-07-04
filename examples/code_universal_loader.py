@@ -1,12 +1,11 @@
-"""
-Example showing how to use AI Functions with Python integration to solve tasks which would be infeasible
-with standard programming paradigms. The AI Function takes as input a file in an unknown format and
-dynamically writes and execute the code to convert it to DataFrame.
+"""Load a file of unknown format into a DataFrame via a code-executing AI function.
 
-The structure of the DataFrame is validated using a post-condition to ensure it will be compatible with
-the remaining parts of the workflow.
+Given a path, the AI function writes and runs the parsing code itself, so one
+function handles CSV, JSON, and SQLite alike. A post-condition validates the
+resulting DataFrame's structure before it flows into the rest of the workflow.
 """
 
+from _utils import display, rule
 from pandas import DataFrame, api
 
 from ai_functions import ai_function
@@ -23,7 +22,7 @@ def check_invoice_dataframe(df: DataFrame):
     )
 
 
-@ai_function[DataFrame](
+@ai_function(
     post_conditions=[check_invoice_dataframe],
     code_execution_mode="local",
     code_executor_additional_imports=["pandas", "sqlite3"],
@@ -47,14 +46,13 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _invoice_data import create_data
 
-    # Save data in a few different formats (csv, json, sqlite3) and try to load them back
+    # Save the same data as csv, json, and sqlite3, then load each back.
     with tempfile.TemporaryDirectory(delete=True) as temp_dir:
         filenames = create_data(temp_dir)
         results = []
         for filename in filenames:
-            print(f"===== Reading data from {filename.name} =====")
+            rule(f"Reading data from {filename.name}")
             df = import_invoice.run_sync(path=filename)
             results.append(df)
         for filename, df in zip(filenames, results, strict=False):
-            print(f"\n===== Parsed data from {filename.name} =====")
-            print(df)
+            display(f"Parsed data from {filename.name}", df.to_string(), lang="text")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
-import typing
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,8 +32,6 @@ from strands.types.exceptions import (
 from .._type import is_json_serializable_type
 from ..protocols import Thread
 from ..types import (
-    ContextSummarizedEvent,
-    Event,
     MessageAssistantCompleteEvent,
     MessageAssistantStartEvent,
     MessageAssistantThinkingEvent,
@@ -46,26 +43,32 @@ from ..types import (
     TokenUsageEvent,
     ToolCallEvent,
     ToolResultEvent,
-    unwrap_nodes,
+)
+from .code_execution import (
+    CodeExecutionPlan,
+    DisabledPlan,
+    bind_call_args,
+    detect_procedural_params,
 )
 from .config import CodeExecutionMode, ThreadConfig, ThreadKwargs
 from .errors import AIFunctionError
 from .postcondition import PostCondition
-from .reconstruction import reconstruct_messages
 from .summarization import (
+    ContextFitter,
     DefaultSummarizationStrategy,
-    SummarizationFailedError,
     SummarizationStrategy,
-    _estimate_message_tokens,
 )
 
 if TYPE_CHECKING:
     from .ai_function import AIFunction
 
 
-# Hard cap on reactive summarization attempts per cycle. Bounds the worst
-# case when every strategy configuration still overflows.
-_MAX_SUMMARIZATION_ATTEMPTS: int = 3
+# Default system prompt used when the config sets none.
+_DEFAULT_SYSTEM_PROMPT = "You are an expert assistant who can solve any task"
+
+
+class _NoResultProduced(Exception):
+    """Internal sentinel: the cycle produced neither structured output nor a final_answer."""
 
 
 @dataclass(frozen=True)
@@ -119,7 +122,11 @@ class OutputSpec[T]:
               holds so the executor has a typed ``final_answer`` signature.
         """
         if not is_structured:
-            assert output_type is str, "structured_output=False is only supported for str output"
+            if output_type is not str:
+                raise AIFunctionError(
+                    f"structured_output=False is only supported for str output, got {output_type!r}",
+                    function_name="",
+                )
             return cls(
                 output_type=output_type,
                 is_pydantic=False,
@@ -184,10 +191,15 @@ class _EventBridgeHook(HookProvider):
          ``reasoningText`` chunks into ``MESSAGE_ASSISTANT_THINKING``.
     """
 
-    def __init__(self, ctx: ThreadContext, inject_buffer: list[str]) -> None:
+    def __init__(self, ctx: ThreadContext, inject_buffer: list[str], thread_name: str = "") -> None:
         self._ctx = ctx
         self._inject_buffer = inject_buffer
         self._current_message_id: MessageId | None = None
+        self._thread_name = thread_name
+        # AI_FUNCTIONS_SHOW_PROMPTS bookkeeping: messages already printed for
+        # this agent build, and the per-build model-call counter.
+        self._printed_upto = 0
+        self._model_calls = 0
 
     def register_hooks(self, registry: HookRegistry, **kwargs: object) -> None:
         """Register every Strands hook this bridge cares about."""
@@ -259,6 +271,18 @@ class _EventBridgeHook(HookProvider):
             raise asyncio.CancelledError
         # Await rate-limit / manual pause
         await ctx.coordinator.wait_until_unpaused(ctx.thread_id)
+        # Opt-in debug dump of the exact request the model is about to see.
+        # Placed after the drain so injected turns are included.
+        from .debug import print_model_request, prompts_enabled
+
+        if prompts_enabled():
+            self._model_calls += 1
+            self._printed_upto = print_model_request(
+                event.agent,
+                printed_upto=self._printed_upto,
+                call_index=self._model_calls,
+                thread_name=self._thread_name,
+            )
         # Open a fresh assistant-turn span
         self._current_message_id = _new_message_id()
         ctx.on_event(MessageAssistantStartEvent(message_id=self._current_message_id))
@@ -353,8 +377,8 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         "_config",
         "_output_spec",
         "_summarization_strategy",
+        "_procedural_names",
         "_inject_buffer",
-        "_bound_args",
     )
 
     def __init__(
@@ -404,17 +428,29 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
             else DefaultSummarizationStrategy()
         )
 
+        # Precompute procedural-parameter names once (depends on template
+        # annotations, which are immutable). Used per-cycle to build a
+        # CodeExecutionPlan without re-inspecting type hints every time.
+        self._procedural_names: set[str] = detect_procedural_params(template.prompt_fn)
+
+        # A Procedural parameter's code can only run via the python_executor;
+        # with code execution disabled it would silently interpolate into the
+        # prompt as inert text, so reject it at construction.
+        if self._procedural_names and config.code_execution_mode != CodeExecutionMode.LOCAL:
+            names = ", ".join(sorted(self._procedural_names))
+            raise AIFunctionError(
+                f"prompt_fn has Procedural parameter(s) [{names}] but code_execution_mode "
+                "is not 'local'. Procedural code can only be executed by the "
+                "python_executor; set code_execution_mode='local'.",
+                function_name=getattr(template, "name", ""),
+            )
+
         # Thread-owned buffer of pending user turns. execute() appends its
         # generated prompt here; notify() appends arbitrary text
         # (e.g. watcher nudges). The event-bridge hook drains the buffer
         # at the next BeforeModelCallEvent and emits one MESSAGE_USER per
         # entry — atomic pairing preserves I7.
         self._inject_buffer: list[str] = []
-
-        # Bound arguments of the current cycle, captured in execute(). Seeded
-        # into the python_executor's namespace when code_execution_mode=LOCAL,
-        # so recalled Procedural code and other inputs are available to run.
-        self._bound_args: dict[str, object] = {}
 
     # ── Thread ──
 
@@ -439,12 +475,13 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
     async def execute(self, ctx: ThreadContext, *args: P.args, **kwargs: P.kwargs) -> T:
         """Render a prompt and drive the executor for one cycle.
 
-        Builds the prompt via ``self._generate_prompt`` and appends it to
-        the thread's inject buffer (after any messages already pending from
-        :meth:`notify`); the event-bridge hook atomically emits one
-        ``MESSAGE_USER`` event per buffer entry and injects the matching
-        user turn into the live Strands agent at the first
-        ``BeforeModelCallEvent`` boundary.
+        Builds the prompt via ``self._generate_prompt`` and hands it to
+        ``self._run_cycle``, which composes the finished prompt turn (prompt
+        plus any code-env preamble) and enqueues it on the thread's inject
+        buffer after any messages already pending from :meth:`notify`; the
+        event-bridge hook atomically emits one ``MESSAGE_USER`` event per
+        buffer entry and injects the matching user turn into the live
+        Strands agent at the first ``BeforeModelCallEvent`` boundary.
 
         Args:
             ctx: Freshly built per-cycle context.
@@ -462,133 +499,17 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
             event-bridge hook.
 
         Strategy:
-            1. Call ``self._generate_prompt`` to produce the prompt string.
-            2. Append the prompt to ``self._inject_buffer`` so the
-               event-bridge hook emits it (and injects it into the live
-               agent) atomically at the first ``BeforeModelCallEvent``,
-               after any pending inject messages.
-            3. Call ``self._run_cycle(ctx)`` and return its result.
+            1. Bind call arguments and render the prompt.
+            2. Call ``self._run_cycle(ctx, prompt, bound_args)`` and return
+               its result.
         """
-        self._bound_args = self._bind_args(*args, **kwargs)
+        bound_args = bind_call_args(self._template.prompt_fn, args, kwargs)
         prompt = await self._generate_prompt(*args, **kwargs)
-        self._inject_buffer.append(prompt)
-        return await self._run_cycle(ctx)
-
-    def _bind_args(self, *args: P.args, **kwargs: P.kwargs) -> dict[str, object]:
-        """Bind call args to ``prompt_fn``'s signature, returning a name→value dict.
-
-        Used to seed the optional ``python_executor`` namespace. If strict
-        binding fails (e.g. an unexpected positional count), fall back to a
-        best-effort mapping that still names positional args by parameter
-        position — so positionally-passed inputs are not silently dropped.
-        """
-        try:
-            sig = inspect.signature(self._template.prompt_fn)
-            bound = sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-            return dict(bound.arguments)
-        except TypeError:
-            try:
-                sig = inspect.signature(self._template.prompt_fn)
-                names = [
-                    p.name
-                    for p in sig.parameters.values()
-                    if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                ]
-                result: dict[str, object] = dict(kwargs)
-                for name, value in zip(names, args, strict=False):
-                    result.setdefault(name, value)
-                return result
-            except (TypeError, ValueError):
-                return dict(kwargs)
-
-    def _procedural_param_names(self) -> set[str]:
-        """Return the names of ``prompt_fn`` params annotated as ``Procedural``.
-
-        Detected via ``ProceduralMarker`` in the parameter's ``Annotated``
-        metadata — either directly (``x: Procedural``) or on a union member
-        (``x: Traceable[Procedural]``, i.e. ``Procedural | ParameterView[...]
-        | Result[...]``). These hold Python source that the python_executor
-        should *define* (run at setup) rather than inject as a plain string
-        variable.
-        """
-        from ..memory.procedural import ProceduralMarker
-
-        def _is_procedural(hint: object) -> bool:
-            metadata = getattr(hint, "__metadata__", ())
-            if any(isinstance(m, ProceduralMarker) for m in metadata):
-                return True
-            return any(_is_procedural(arg) for arg in typing.get_args(hint))
-
-        try:
-            hints = typing.get_type_hints(self._template.prompt_fn, include_extras=True)
-        except Exception:  # noqa: BLE001 — annotations may reference missing names
-            return set()
-        return {name for name, hint in hints.items() if _is_procedural(hint)}
-
-    def _code_env_preamble(self, cycle_config: ThreadConfig) -> str:
-        """Build the code-execution preamble advertising the sandbox namespace.
-
-        Empty unless ``cycle_config.code_execution_mode`` is LOCAL. Otherwise it
-        tells the agent a Python environment is available, which modules may be
-        imported, and — from the cycle's bound arguments — which ``Procedural``
-        helpers are already defined (by signature *and docstring*, so the agent
-        knows when to call each) and which other variables are in scope. Without
-        this, a recalled ``Procedural`` helper is defined in the sandbox but
-        never surfaced to the model.
-
-        ``_``-prefixed arguments are skipped. Bound values may be dataflow
-        handles (``ParameterView`` / ``Result``); their ``.value`` is used, so
-        the advertisement matches what the executor actually put in scope.
-        """
-        if cycle_config.code_execution_mode != CodeExecutionMode.LOCAL:
-            return ""
-
-        from ..tools.local_python_executor import SAFE_BUILTINS, procedural_signatures
-
-        def _truncate(text: str, limit: int = 200) -> str:
-            return text if len(text) <= limit else text[:limit] + "..."
-
-        modules = SAFE_BUILTINS + list(cycle_config.code_executor_additional_imports)
-        parts = [
-            "You have access to a python execution environment.",
-            "Use it if needed, but prefer answering directly (or via a tool call) when the task "
-            "does not require running code; when you do use it, prefer helpers that already exist "
-            "over writing new logic.",
-            f"The following modules are available for import: {', '.join(modules)}.",
-            "Modules not listed above are not available for security reasons. "
-            "You cannot use the `os` module. You cannot use the `open(...)` builtin.",
-        ]
-
-        procedural_names = self._procedural_param_names()
-        helper_blocks: list[str] = []
-        variables: list[str] = []
-        for name, raw in self._bound_args.items():
-            if name.startswith("_"):
-                continue
-            value = unwrap_nodes(raw)
-            if name in procedural_names and isinstance(value, str):
-                helper_blocks.extend(procedural_signatures(value))
-            else:
-                variables.append(f" - {name}: {_truncate(repr(value))}")
-
-        if helper_blocks:
-            parts.append(
-                "\nThe following functions have already been executed and are available "
-                "in the python environment's namespace. You can call them directly:"
-            )
-            parts.extend(f"```python\n{block}\n```" for block in helper_blocks)
-        if variables:
-            parts.append(
-                "\nThe following variables are already available in the python environment (DO NOT redefine them):"
-            )
-            parts.extend(variables)
-
-        return "<environment>\n" + "\n".join(parts) + "\n</environment>"
+        return await self._run_cycle(ctx, prompt, bound_args)
 
     # ── Internal pipeline steps ──
 
-    async def _run_cycle(self, ctx: ThreadContext) -> T:
+    async def _run_cycle(self, ctx: ThreadContext, prompt: str, bound_args: dict[str, object]) -> T:
         """Run the shared agent execution loop for one cycle.
 
         ``ResultEvent`` is emitted by the runtime dispatcher around the
@@ -596,31 +517,30 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
 
         Args:
             ctx: Freshly built per-cycle context.
+            prompt: The rendered prompt for this cycle.
+            bound_args: Name→value dict of the cycle's call arguments,
+                produced by ``bind_call_args``. Used by the code-execution
+                plan (sandbox seeding / preamble) and by post-condition
+                validators that accept function parameters.
 
         Returns:
             The typed result produced by the agent.
 
         Strategy:
-            1. Call ``self._config.config_hook(ctx)`` if set and merge
-               the returned ``ThreadKwargs`` into a cycle-local config
-               (all fields replaced, ``config_hook`` key itself
-               ignored).
-            2. Call ``reconstruct_messages(await
-               ctx.coordinator.get_events(ctx.thread_id))`` to obtain
-               the up-to-date message history.
-            3. Call ``self._build_agent(messages, cycle_config, ...)``
-               to create a Strands ``Agent``.
-            4. ``await agent.invoke_async(messages=messages)``.
+            1. Resolve the cycle config (``config_hook``).
+            2. Build a ``CodeExecutionPlan`` from the resolved config
+               and bound args.
+            3. Compose the prompt turn (prompt + preamble) and enqueue
+               it on the inject buffer.
+            4. Build the Strands agent (with a fresh executor tool per
+               attempt).
             5. On interrupts, ``await ctx.on_interrupt(batch)`` and
                resume with decisions.
-            6. Call ``self._extract_result`` to extract the typed
-               result.
-            7. Emit ``TOKEN_USAGE`` via ``ctx.on_event``.
-            8. Run post-conditions via ``self._validate_result``; on
-               failure, emit the errors as a ``MESSAGE_USER`` turn and
-               retry from step 2 up to ``cycle_config.max_attempts``
-               times.
-            9. Return the typed and validated result.
+            6. Extract the typed result (plan claims first, else
+               structured output).
+            7. Emit ``TOKEN_USAGE``.
+            8. Run post-conditions; on failure retry up to
+               ``max_attempts``.
         """
         # Build cycle-local config by applying config_hook if set
         cycle_config = self._config
@@ -630,23 +550,33 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
             patch_dict.pop("config_hook", None)
             cycle_config = dataclasses.replace(self._config, **patch_dict)  # type: ignore[arg-type]
 
-        # When code execution is enabled, advertise the sandbox namespace
-        # (importable modules, recalled Procedural helper signatures + docstrings,
-        # and other bound variables) so the agent calls what already exists
-        # instead of re-deriving it. Fold it into the just-appended prompt so the
-        # agent sees a single user turn rather than a separate message. Resolved
-        # from cycle_config (not self._config) so a config_hook override of
-        # code_execution_mode is honored.
-        preamble = self._code_env_preamble(cycle_config)
-        if preamble and self._inject_buffer:
-            self._inject_buffer[-1] = f"{self._inject_buffer[-1]}\n\n{preamble}"
+        # Build the code-execution plan from the resolved cycle config. This
+        # centralizes mode validation, procedural detection, preamble
+        # rendering, fresh-executor-per-attempt, and result precedence.
+        plan = CodeExecutionPlan.build(
+            cycle_config=cycle_config,
+            output_model=self._output_spec.structured_output_model,
+            procedural_names=self._procedural_names,
+            bound_args=bound_args,
+            function_name=self._template.name,
+        )
+
+        # Compose the prompt turn and enqueue after any pending notify()
+        # entries. Layout: environment block first, then the task prompt, then
+        # the final-result instruction listing every available output channel
+        # (structured-output tool and/or the executor's final_answer). Plain-str
+        # output has neither channel, so the instruction is omitted.
+        turn_parts: list[str] = []
+        preamble = plan.preamble()
+        if preamble:
+            turn_parts.append(preamble)
+        turn_parts.append(prompt)
+        result_instruction = self._final_result_instruction(plan)
+        if result_instruction:
+            turn_parts.append(result_instruction)
+        self._inject_buffer.append("\n\n".join(turn_parts))
 
         # Inject the default runtime-facing tools (list_threads, send_message).
-        # Bound to this cycle's ctx so the LLM can discover peer threads and
-        # nudge them via notify. Appended after user tools so a
-        # user-supplied tool with the same name wins on resolution. Skipped
-        # entirely when ``coordinator_tools_enabled`` is False (single-purpose
-        # agents that should not talk to peers).
         if cycle_config.coordinator_tools_enabled:
             from .tools import coordinator_tools
 
@@ -657,33 +587,25 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
 
         post_conditions = cycle_config.post_conditions
         function_name = self._template.name
-        # The cycle's bound arguments (captured in execute) are offered to
-        # post-conditions: a validator may declare any of the function's
-        # parameters (e.g. ``max_length``) and receive its value. Without this,
-        # such a post-condition would be called missing that argument and fail
-        # every attempt.
-        bound_args: dict[str, object] = dict(self._bound_args)
 
-        for attempt in range(cycle_config.max_attempts):
-            # Build a fresh python_executor per attempt when code execution is
-            # enabled. The smolagents sandbox persists its namespace across
-            # calls, so a single executor reused across retries would leak the
-            # failed attempt's ad-hoc variables into the next attempt
-            # (non-deterministic retries / stale-state masking). A fresh
-            # executor re-defines the Procedural helpers from initial_code but
-            # starts with no leaked state.
-            attempt_config = self._with_python_executor(cycle_config)
+        # One initial try plus ``max_attempts`` retries.
+        for _attempt in range(cycle_config.max_attempts + 1):
+            # Fresh executor tool per attempt (no-op when plan is Disabled).
+            attempt_config = plan.config_with_tool(cycle_config)
             response = await self._invoke_with_summarization(ctx, attempt_config)
 
-            # Handle interrupts if the agent surface them
+            # Resume any interrupts the agent surfaced. Decisions are consumed
+            # without appending a user message, and the recorded approval events
+            # are non-renderable, so the event log and agent.messages stay
+            # aligned (I7).
             while response.interrupts:
                 decisions = await ctx.on_interrupt(list(response.interrupts))
                 response = await self._invoke_with_summarization(ctx, attempt_config, resume_messages=decisions)
 
             state: dict[str, object] = response.state or {}
-            result = self._extract_result(response, state)
 
-            # Emit token usage
+            # Emit token usage before result extraction so a no-result
+            # attempt still accounts for its spend.
             usage = response.metrics.accumulated_usage
             ctx.on_event(
                 TokenUsageEvent(
@@ -696,6 +618,27 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
                 )
             )
 
+            try:
+                result = self._extract_result(response, state, plan)
+            except _NoResultProduced:
+                # With code execution enabled the agent may finish without
+                # calling final_answer; that is recoverable, so retry with
+                # guidance naming the available output channels. Without code
+                # execution there is no channel left to retry, so fail.
+                if isinstance(plan, DisabledPlan):
+                    raise AIFunctionError(
+                        "Agent produced neither a structured output nor a "
+                        "python_executor final_answer result.",
+                        function_name=function_name,
+                    ) from None
+                guidance = (
+                    "[VALIDATION ERROR]\n"
+                    "No result was produced.\n\n"
+                    f"{self._final_result_instruction(plan)}"
+                )
+                self._inject_buffer.append(guidance)
+                continue
+
             if not post_conditions:
                 return result
 
@@ -705,67 +648,39 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
 
             # Enqueue the validation errors as a user turn so the next cycle's
             # hook emits the MESSAGE_USER event. Sole-emitter discipline (I7)
-            # keeps the event log and agent-observation order aligned even
-            # across retries.
+            # keeps the event log and agent-observation order aligned across
+            # retries.
             failures = "\n".join(f"- {e}" for e in errors)
             error_text = (
-                f"[{function_name}] Post-condition failures"
-                f" (attempt {attempt + 1}/{cycle_config.max_attempts}):\n{failures}"
+                f"[VALIDATION ERROR]\n"
+                f"Your previous response failed validation with the following errors:\n{failures}\n\n"
+                f"Please try again and ensure your output satisfies all requirements."
             )
             self._inject_buffer.append(error_text)
 
-        # Exhausted all attempts — raise with the last set of errors
+        # Exhausted the initial try plus max_attempts retries
         raise AIFunctionError(
-            f"Post-conditions not satisfied after {cycle_config.max_attempts} attempt(s)",
+            f"Result not satisfied after {cycle_config.max_attempts + 1} attempt(s) "
+            f"(1 initial + {cycle_config.max_attempts} retries)",
             function_name=function_name,
         )
 
-    def _with_python_executor(self, cycle_config: ThreadConfig) -> ThreadConfig:
-        """Return ``cycle_config`` with a fresh ``python_executor`` tool appended.
+    def _final_result_instruction(self, plan: CodeExecutionPlan | DisabledPlan) -> str:
+        """Compose the final-result instruction from the available output channels.
 
-        No-op unless ``code_execution_mode == LOCAL``. Called once per attempt so
-        each retry gets a clean sandbox: ``Procedural`` parameter code is
-        re-defined in the namespace (from ``initial_code``), but no ad-hoc state
-        from a prior attempt leaks in.
-
-        Raises:
-            AIFunctionError: ``code_execution_mode=LOCAL`` but the output is not
-                structured (the ``final_answer`` callback needs a typed model).
+        Lists the structured-output tool (when structured output is on) and/or
+        the executor's ``final_answer`` call (when code execution is on). Empty
+        when neither channel exists (plain-str output without code execution).
         """
-        if cycle_config.code_execution_mode != CodeExecutionMode.LOCAL:
-            return cycle_config
-
-        from ..tools.local_python_executor import LocalPythonExecutorTool
-
-        # The executor needs a typed model for the final_answer signature. It is
-        # present for any pydantic/wrapped return (including non-serializable
-        # ones); only plain-str output has none, and code execution cannot
-        # produce a bare str answer via final_answer.
-        output_model = self._output_spec.structured_output_model
-        if output_model is None:
-            raise AIFunctionError(
-                "code_execution_mode=LOCAL is not supported for a plain str return type "
-                "(the python_executor's final_answer needs a typed model).",
-                function_name=self._template.name,
-            )
-        # Split args: Procedural-typed code is DEFINED in the namespace (its
-        # functions become callable); everything else is injected as a plain
-        # variable. The sandbox forbids exec(), so procedural source must be run
-        # at setup rather than handed over as a string.
-        procedural_names = self._procedural_param_names()
-        initial_code = [str(v) for k, v in self._bound_args.items() if k in procedural_names and isinstance(v, str)]
-        initial_state = {k: v for k, v in self._bound_args.items() if k not in procedural_names}
-        executor = LocalPythonExecutorTool(
-            output_type=output_model,
-            initial_state=initial_state,
-            initial_code=initial_code,
-            additional_authorized_imports=list(cycle_config.code_executor_additional_imports),
-            executor_kwargs=dict(cycle_config.code_executor_kwargs),
-        )
-        return dataclasses.replace(
-            cycle_config,
-            tools=(*cycle_config.tools, executor.python_executor),
-        )
+        channels: list[str] = []
+        if self._output_spec.is_structured and self._output_spec.structured_output_model is not None:
+            channels.append(f"use the {self._output_spec.structured_output_model.__name__} tool")
+        executor_channel = plan.final_answer_channel()
+        if executor_channel:
+            channels.append(executor_channel)
+        if not channels:
+            return ""
+        return f"IMPORTANT: To provide your final result, {' or '.join(channels)}."
 
     async def _invoke_with_summarization(
         self,
@@ -773,18 +688,10 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         cycle_config: ThreadConfig,
         resume_messages: object = None,
     ) -> AgentResult:
-        """Build a Strands Agent from the current event log and invoke it.
+        """Build a Strands Agent from the fitted event log and invoke it.
 
-        Wraps ``agent.invoke_async`` with a bounded summarization loop. When
-        ``cycle_config.summarization_threshold`` is set, the reconstructed history is
-        compacted *proactively* at cycle entry if its estimated token count
-        exceeds the threshold — before the model call, avoiding the overflow
-        error entirely. Reactively, on ``ContextWindowOverflowException`` we run
-        the same summarization pipeline, emit a ``ContextSummarizedEvent``,
-        rebuild a fresh agent from the updated log, and retry.
-        ``MaxTokensReachedException`` is a hard failure — summarization does not
-        help if the model cannot produce its current output within the
-        max-tokens budget.
+        Fits the history via :class:`~.summarization.ContextFitter`, invokes the
+        agent, and on a context-window overflow compacts and retries.
 
         Args:
             ctx: Per-cycle runtime context.
@@ -797,87 +704,39 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
 
         Raises:
             SummarizationFailedError: Every summarization attempt in
-                this cycle failed to bring the history under the
+                this invocation failed to bring the history under the
                 context window.
             MaxTokensReachedException: Propagated unchanged;
                 unrecoverable.
         """
-        summarizations_so_far = 0
+        # Per-invocation fitter: the attempt counter must not outlive this
+        # call, or a long-lived counter would starve later cycles of their
+        # summarization budget.
+        fitter = ContextFitter(self._summarization_strategy, self._template.name)
         while True:
-            events = await ctx.coordinator.get_events(ctx.thread_id)
-            messages: Messages = reconstruct_messages(events)
-
-            # Proactive summarization: compact before the model call when the
-            # estimated history exceeds the configured threshold. Bounded by the
-            # same attempt cap as the reactive path so a strategy that fails to
-            # shrink the history cannot loop forever.
-            threshold = cycle_config.summarization_threshold
-            if (
-                threshold is not None
-                and summarizations_so_far < _MAX_SUMMARIZATION_ATTEMPTS
-                and sum(_estimate_message_tokens(m) for m in messages) > threshold
-            ):
-                summarizations_so_far += 1
-                await self._summarize_and_emit(ctx, cycle_config, events)
-                continue
-
-            bridge = _EventBridgeHook(ctx=ctx, inject_buffer=self._inject_buffer)
+            messages = await fitter.fit(ctx, cycle_config)
+            bridge = _EventBridgeHook(
+                ctx=ctx,
+                inject_buffer=self._inject_buffer,
+                thread_name=self._template.name,
+            )
             agent = self._build_agent(messages, cycle_config, [bridge], bridge.stream_callback)
-
             try:
                 if resume_messages is not None:
                     return await agent.invoke_async(messages=resume_messages)  # type: ignore[arg-type]
                 return await agent.invoke_async()
             except ContextWindowOverflowException as exc:
-                if summarizations_so_far >= _MAX_SUMMARIZATION_ATTEMPTS:
-                    raise SummarizationFailedError(
-                        function_name=self._template.name,
-                        reason=(
-                            f"Context window still overflowed after "
-                            f"{_MAX_SUMMARIZATION_ATTEMPTS} summarization attempts: {exc}"
-                        ),
-                    ) from exc
-                summarizations_so_far += 1
-                # Re-fetch events: the failed model call ran the event-bridge
-                # hook's pre-call phase, which drained the message queue and
-                # emitted MESSAGE_USER events. Those are the events we want
-                # to summarize — the pre-drain snapshot would miss them.
-                fresh_events = await ctx.coordinator.get_events(ctx.thread_id)
-                await self._summarize_and_emit(ctx, cycle_config, fresh_events)
-                # The next iteration re-reads events (now with the new
-                # ContextSummarizedEvent) and rebuilds messages — this is
-                # the cache-invalidation point for I9.
+                # Compacts (or raises SummarizationFailedError once the cap is
+                # exhausted); the next fit() re-reads the event log — now with
+                # the new ContextSummarizedEvent — and rebuilds messages. This
+                # is the cache-invalidation point for I9.
+                await fitter.compact_after_overflow(ctx, cycle_config, exc)
                 continue
             except MaxTokensReachedException:
                 # Hard failure: the model exhausted its output budget
                 # mid-cycle, meaning its own reply could not fit. Propagate
                 # unchanged; summarization would not help.
                 raise
-
-    async def _summarize_and_emit(
-        self,
-        ctx: ThreadContext,
-        cycle_config: ThreadConfig,
-        events: list[Event],
-    ) -> None:
-        """Run the summarization strategy over ``events`` and emit the boundary event.
-
-        Shared by the proactive (pre-call, threshold-driven) and reactive
-        (post-overflow) paths. Wraps strategy failures in
-        ``SummarizationFailedError`` and appends a ``ContextSummarizedEvent``
-        whose ``new_history`` replaces the summarized prefix on the next
-        reconstruction (the I9 cache-invalidation point).
-        """
-        try:
-            new_history = await self._summarization_strategy.summarize(events, ctx, cycle_config)
-        except SummarizationFailedError:
-            raise
-        except Exception as strategy_exc:
-            raise SummarizationFailedError(
-                function_name=self._template.name,
-                reason=f"summarization strategy raised: {strategy_exc!r}",
-            ) from strategy_exc
-        ctx.on_event(ContextSummarizedEvent(new_history=new_history))
 
     def _build_agent(
         self,
@@ -961,11 +820,13 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         # passed here, or Strands would fail generating a JSON schema for it.
         strands_output_model = spec.structured_output_model if spec.is_structured else None
 
+        system_prompt = cycle_config.system_prompt or _DEFAULT_SYSTEM_PROMPT
+
         if effective_callback is not None:
             return Agent(
                 model=cycle_config.model,
                 messages=list(messages),
-                system_prompt=cycle_config.system_prompt,
+                system_prompt=system_prompt,
                 tools=tools or None,
                 structured_output_model=strands_output_model,
                 hooks=hooks,
@@ -976,7 +837,7 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         return Agent(
             model=cycle_config.model,
             messages=list(messages),
-            system_prompt=cycle_config.system_prompt,
+            system_prompt=system_prompt,
             tools=tools or None,
             structured_output_model=strands_output_model,
             hooks=hooks,
@@ -1119,12 +980,21 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         template = tstr.generate_template(doc, context, globals=fn_globals, use_eval=True)  # pyright: ignore[reportUnknownMemberType]
         return tstr.render(template)
 
-    def _extract_result(self, response: AgentResult, state: dict[str, object]) -> T:
+    def _extract_result(
+        self,
+        response: AgentResult,
+        state: dict[str, object],
+        plan: CodeExecutionPlan | DisabledPlan,
+    ) -> T:
         """Extract the typed result from a Strands ``AgentResult``.
 
         Args:
             response: The Strands agent result.
             state: Per-cycle execution state.
+            plan: The code-execution plan for this cycle. Its
+                ``claim_result`` is tried first; when code execution is
+                enabled and the executor produced a result, it takes
+                precedence over structured output.
 
         Returns:
             The typed result as declared by ``output_type``.
@@ -1132,30 +1002,24 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         spec = self._output_spec
 
         # Plain str output (structured_output=False, not wrapped): the answer is
-        # the assistant's text. A non-structured *wrapped* type (e.g. an
-        # arbitrary sympy.Expr return) is NOT this case — its answer comes from
-        # the code executor's final_answer, handled below.
+        # the assistant's text.
         if not spec.is_structured and not spec.is_wrapped:
             return cast(T, str(response))
 
-        # The answer may come from structured output, or — when code execution
-        # is enabled — from a final_answer(...) call inside the python_executor,
-        # surfaced on AgentResult.state["python_executor_result"]. When code
-        # execution is enabled, prefer the executor result: it explicitly halted
-        # the loop with the agent's intended answer, so a stray structured tool
-        # call must not shadow it. Otherwise use structured output.
-        executor_result = cast("BaseModel | None", state.get("python_executor_result"))
-        if self._config.code_execution_mode == CodeExecutionMode.LOCAL and executor_result is not None:
-            structured: BaseModel | None = executor_result
+        # Let the code-execution plan claim the result first (it returns
+        # the executor's final_answer if present, else None). When claimed,
+        # it takes precedence — the agent explicitly committed to this
+        # answer via final_answer(...). Otherwise fall back to structured
+        # output and then to executor result as a last resort.
+        claimed = plan.claim_result(response, state)
+        if claimed is not None:
+            structured: BaseModel | None = claimed
         else:
             structured = response.structured_output
             if structured is None:
-                structured = executor_result
+                structured = cast("BaseModel | None", state.get("python_executor_result"))
         if structured is None:
-            raise AIFunctionError(
-                "Agent produced neither a structured output nor a python_executor final_answer result.",
-                function_name=self._template.name,
-            )
+            raise _NoResultProduced
         if spec.is_wrapped:
             return structured.answer  # pyright: ignore[reportAttributeAccessIssue]
         return cast(T, structured)

@@ -9,12 +9,15 @@ reference); lifecycle events flow out through the coordinator.
 
 import asyncio
 
+from _utils import display, rule
 from pydantic import BaseModel
 
 from ai_functions import ai_function
+from ai_functions.ai_thread import ThreadConfig
 from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 from ai_functions.types import CompletedEvent, Event, FailedEvent, StartedEvent
 
+config = ThreadConfig(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
 
 class ResearchPlan(BaseModel):
     subtasks: list[str]
@@ -23,29 +26,32 @@ class ResearchPlan(BaseModel):
 # These single-purpose agents don't message peers, so we disable the default
 # coordinator tools (``list_threads`` / ``send_message``; see the
 # ``team_two_workers_local.py`` / ``team_two_workers_remote.py`` examples).
-@ai_function[ResearchPlan](coordinator_tools_enabled=False)
-def planner(topic: str):
+@ai_function(config=config, coordinator_tools_enabled=False)
+def planner(topic: str) -> ResearchPlan:
     """Break down the research topic into 2-3 subtasks: {topic}"""
 
 
-@ai_function[str](coordinator_tools_enabled=False)
-def researcher(subtask: str):
-    """Research this subtask thoroughly: {subtask}"""
+@ai_function(config=config, coordinator_tools_enabled=False)
+def researcher(subtask: str) -> str:
+    """Write a paragraph about the following task: {subtask}"""
 
 
-@ai_function[str](coordinator_tools_enabled=False)
-def synthesizer(findings: str):
-    """Synthesize these findings into a summary:\n\n{findings}"""
+@ai_function(config=config, coordinator_tools_enabled=False)
+def synthesizer(findings: str) -> str:
+    """
+    Synthesize these findings into a summary:
+    {findings}
+    """
 
 
 def log_event(event: Event) -> None:
     match event:
         case StartedEvent(thread_id=thread_id, thread_name=thread_name):
-            print(f"  ▶ {thread_name or thread_id} started")
+            rule(f"▶ {thread_name or thread_id} started")
         case CompletedEvent(thread_id=thread_id, thread_name=thread_name):
-            print(f"  ✓ {thread_name or thread_id} completed")
+            rule(f"✓ {thread_name or thread_id} completed")
         case FailedEvent(thread_id=thread_id, thread_name=thread_name, error=error):
-            print(f"  ✗ {thread_name or thread_id}: {error}")
+            rule(f"✗ {thread_name or thread_id}: {error}")
         case _:
             pass
 
@@ -54,10 +60,8 @@ async def main() -> None:
     coord = InMemoryCoordinator()
     coord.on(log_event)
 
-    worker = LocalWorker(coord)
-    await worker.register()
+    worker = await LocalWorker(coord).register()
 
-    # Spawn and run the planner.
     planner_h = await worker.spawn_locally(planner, thread_name="planner")
     plan = await planner_h.run(topic="quantum computing applications")
 
@@ -71,15 +75,13 @@ async def main() -> None:
         for i in range(len(plan.subtasks))
     ]
 
-    # Run all researchers in parallel.
     findings = await asyncio.gather(
         *[h.run(subtask=task) for h, task in zip(researcher_handles, plan.subtasks, strict=True)]
     )
 
-    # Synthesize.
     synth_h = await worker.spawn_locally(synthesizer, thread_name="synthesizer")
     summary = await synth_h.run(findings="\n\n".join(findings))
-    print(f"\nSummary: {summary}")
+    display("Summary", str(summary))
 
     await worker.close()
 

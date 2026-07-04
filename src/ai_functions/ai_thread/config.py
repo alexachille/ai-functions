@@ -89,6 +89,7 @@ class ThreadKwargs(TypedDict, total=False):
     config_hook: Callable[[ThreadContext], ThreadKwargs] | None
     summarization_strategy: SummarizationStrategy | None
     summarization_threshold: int | None
+    summarization_enabled: bool
     coordinator_tools_enabled: bool
 
 
@@ -114,7 +115,12 @@ class ThreadConfig:
     post_conditions: tuple[PostCondition, ...] = ()
     """List of functions to call to validate the output."""
     max_attempts: int = 10
-    """Maximum number of times to retry producing an output that satisfies the post-conditions."""
+    """Maximum number of retries after the initial attempt.
+
+    A cycle makes at most ``max_attempts + 1`` agent runs: one initial try
+    plus up to ``max_attempts`` retries triggered by post-condition failures
+    or a missing result (code-execution mode). ``max_attempts=0`` disables
+    retrying entirely."""
     structured_output: bool = True
     """Whether to use structured output mode (agent has to call a tool to provide an answer).
     Can be False only if the output type is `str`.
@@ -188,9 +194,8 @@ class ThreadConfig:
     injection, multi-pass summarization, etc. See
     :class:`SummarizationStrategy` for the contract.
 
-    Every summarization knob that used to live on ``ThreadConfig``
-    (``summarize_by_forking``, preservation bounds) is now a parameter
-    of the strategy itself. Configure them by constructing your own
+    Summarization knobs (``summarize_by_forking``, preservation bounds) are
+    parameters of the strategy itself. Configure them by constructing your own
     :class:`DefaultSummarizationStrategy`.
     """
 
@@ -200,7 +205,26 @@ class ThreadConfig:
     ``None`` (default) is purely reactive: history is compacted only on a
     ``ContextWindowOverflowException``. When set, the runtime compacts at cycle
     entry before the model call. Keep it above the strategy's preserved tail
-    (``DefaultSummarizationStrategy.preserve_max_tokens``) so it converges."""
+    (``DefaultSummarizationStrategy.preserve_max_tokens``) so it converges.
+
+    Ignored when ``summarization_enabled`` is ``False``."""
+
+    summarization_enabled: bool = True
+    """Master switch for all context management on this thread.
+
+    ``True`` (default): the runtime compacts history via the configured
+    ``summarization_strategy`` — proactively when ``summarization_threshold``
+    is crossed, and reactively on a ``ContextWindowOverflowException``.
+
+    ``False``: no compaction ever runs. The proactive threshold check is
+    skipped and a ``ContextWindowOverflowException`` propagates unchanged
+    instead of triggering summarization — the thread fails loudly rather than
+    silently rewriting its own history. Two uses:
+
+    - Callers who would rather surface an overflow than have history compacted.
+    - The summarizer helper threads themselves: every summarizer template sets
+      this ``False`` so a summarization cycle can never recursively spawn
+      another summarizer (which would be unbounded)."""
 
     coordinator_tools_enabled: bool = True
     """Auto-inject the coordinator tools (``list_threads`` / ``send_message``).
