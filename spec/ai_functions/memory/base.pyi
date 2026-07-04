@@ -1,18 +1,27 @@
 """Abstract memory backend with parameter-recall tracking.
 
 A ``MemoryBackend`` exposes named, typed parameters over a Pydantic schema and
-is, at its core, plain storage. When a ``recall`` / ``query`` / ``search`` is
-given a ``coordinator`` and ``thread_id``, it **immediately** emits a
-``ParameterRecalledEvent`` into that thread's log so the computation graph can
-be reconstructed post-hoc for optimization; without them it is a pure fetch
-that emits nothing.
+is, at its core, plain storage. ``recall`` / ``query`` / ``search`` return a
+:class:`~ai_functions.types.graph.ParameterView` wrapping the value. When a
+thread is identifiable — explicit ``coordinator`` / ``thread_id`` arguments or
+the ambient :func:`~ai_functions.types.context.thread_scope` — the call
+immediately emits a ``ParameterRecalledEvent`` into that thread's log so the
+computation graph can be reconstructed post-hoc for optimization; otherwise it
+is a pure fetch whose event is emitted later by ``AIFunction.trace`` when the
+view is consumed (tracked by ``ParameterView.emitted``).
 
-Emission happens at call time and works from anywhere — including outside an
-``@ai_function`` body — because ``Coordinator.append_event`` only requires the
-event's ``thread_id`` to be set and creates the thread's log on demand. The
-recalled value is returned unchanged (a plain ``str`` / ``list`` / model), so
-it interpolates into prompts and f-strings normally; the tracking is a side
-effect on the log, never a decoration on the return value.
+Emission works from anywhere — including outside an ``@ai_function`` body —
+because ``Coordinator.append_event`` only requires the event's ``thread_id`` to
+be set and creates the thread's log on demand. ``ParameterView.__str__``
+returns ``str(value)``, so a view interpolates into prompts and f-strings
+normally; the runtime also unwraps views to their ``.value`` at the
+``ThreadHandle.run`` boundary.
+
+Backend fetches (``_recall`` / ``_query`` / ``_search``) may block — a query is
+a full model call, a network backend does real I/O — so the public methods run
+them in a worker thread with the ambient thread scope cleared, keeping the
+event loop responsive and library-internal model calls out of the caller's
+event log.
 
 The backend holds no reference to a coordinator or thread between calls. It is
 identified by a stable ``backend_id`` that :func:`build_graph` uses to match
@@ -30,10 +39,19 @@ from strands.tools import ToolProvider
 from strands.types.tools import AgentTool
 
 from ..protocols import Coordinator
+from ..types.graph import ParameterView
 from ..types.ids import ThreadId
 
-# Legacy alias kept for backward compatibility with JSONMemoryBackend.
+# Value shape stored by the simple built-in backends (JSON, AgentCore).
 ValueType = str | list[str]
+
+# Backend-specific metadata attached to a fetch. Returned by the storage
+# methods (``_recall`` / ``_query`` / ``_search``) alongside the value, merged
+# into the recall event's ``meta``, and carried by the reconstructed
+# ``ParameterNode`` back to ``consolidate``. The JSON backend's search puts
+# ``{"results": {entry_id: value}}`` here so consolidation can target exactly
+# the entries the forward pass retrieved.
+ParameterMeta = dict[str, Any]
 
 
 class MemoryBackend(ABC):
@@ -80,23 +98,38 @@ class MemoryBackend(ABC):
         ...
 
     @abstractmethod
-    def _recall(self, name: str) -> Any:
-        """Return parameter ``name``'s current value from storage."""
+    def _recall(self, name: str) -> tuple[Any, ParameterMeta]:
+        """Return ``(value, meta)`` for parameter ``name`` from storage."""
         ...
 
     @abstractmethod
-    def _query(self, name: str, query: str) -> str:
-        """Answer ``query`` given the content of parameter ``name``."""
+    def _query(self, name: str, query: str) -> tuple[str, ParameterMeta]:
+        """Answer ``query`` given the content of parameter ``name``, as ``(answer, meta)``."""
         ...
 
     @abstractmethod
-    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> Any:
-        """Return the top-``k`` matches from parameter ``name``'s value."""
+    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> tuple[Any, ParameterMeta]:
+        """Return ``(top_k_matches, meta)`` from parameter ``name``'s value."""
         ...
 
     @abstractmethod
-    def _consolidate(self, name: str, feedback: list[str], **kwargs: Any) -> None:
-        """Incorporate ``feedback`` into the stored value of parameter ``name``."""
+    def _consolidate(
+        self,
+        name: str,
+        feedback: list[str],
+        retrieved: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Incorporate ``feedback`` into the stored value of parameter ``name``.
+
+        Args:
+            name: Parameter name.
+            feedback: Feedback strings to merge into the stored value.
+            retrieved: For list parameters, the ``{entry_id: value}`` mapping of
+                the entries the forward pass actually retrieved (from the search
+                derivation meta); ``None`` means no retrieval context.
+            kwargs: Backend-specific options.
+        """
         ...
 
     @abstractmethod
@@ -140,31 +173,32 @@ class MemoryBackend(ABC):
         coordinator: Coordinator | None = None,
         thread_id: ThreadId | None = None,
         requires_grad: bool | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Recall a parameter's full value, emitting a recall event.
+    ) -> ParameterView[Any]:
+        """Recall a parameter's full value as a :class:`ParameterView`.
 
         Args:
             name: Parameter name (supports nested ``a/b/c`` paths).
-            coordinator: Coordinator to append the recall event to. When
-                ``None``, the read is a pure fetch and no event is emitted.
+            coordinator: Coordinator to append the recall event to. Defaults
+                to the ambient thread scope's coordinator when one is active.
             thread_id: Thread the recalled value is being fed into; stamped
-                onto the event. Required for emission alongside ``coordinator``.
+                onto the event. Defaults to the ambient scope's thread.
             requires_grad: Override gradient tracking for this read; defaults
                 to ``False`` for ``Frozen`` fields and ``True`` otherwise.
-            kwargs: Forwarded to the backend's ``_recall``.
 
         Returns:
-            The stored value, unchanged.
+            A ``ParameterView`` wrapping the stored value. Use ``.value`` (or
+            ``str()``) for the raw value; pass the view itself to ``trace`` /
+            ``__call__`` to preserve the graph edge.
 
         Ensures:
-            - When both ``coordinator`` and ``thread_id`` are given, one
-              ``ParameterRecalledEvent`` with ``derivation="full"`` is appended
-              to ``thread_id``'s log and confirmed durable (visible via
+            - When a thread is identifiable (explicit args or ambient scope),
+              one ``ParameterRecalledEvent`` with ``derivation="full"`` is
+              appended to that thread's log and confirmed durable (visible via
               ``get_events``) before this call returns, subject to a bounded
-              number of confirmation reads.
-            - When either is ``None``, no event is emitted (pure fetch).
-            - The returned value is identical to a direct storage read.
+              number of confirmation reads; the view's ``emitted`` is ``True``.
+            - Otherwise no event is emitted (``emitted=False``) and
+              ``AIFunction.trace`` emits it when the view is consumed.
+            - ``view.value`` is identical to a direct storage read.
         """
         ...
 
@@ -175,28 +209,26 @@ class MemoryBackend(ABC):
         coordinator: Coordinator | None = None,
         thread_id: ThreadId | None = None,
         requires_grad: bool | None = None,
-        **kwargs: Any,
-    ) -> str:
-        """Answer a question over a parameter's value, emitting a recall event.
+    ) -> ParameterView[str]:
+        """Answer a question over a parameter's value, as a :class:`ParameterView`.
 
         Args:
             name: Parameter name.
             query: Natural-language question answered over the value.
-            coordinator: Coordinator to append the recall event to; ``None``
-                makes this a pure fetch.
-            thread_id: Thread the answer is fed into; stamped onto the event.
+            coordinator: Coordinator to append the recall event to; defaults
+                to the ambient scope's coordinator.
+            thread_id: Thread the answer is fed into; defaults to the ambient
+                scope's thread.
             requires_grad: Override gradient tracking; default as in
                 :meth:`recall`.
-            kwargs: Forwarded to the backend's ``_query``.
 
         Returns:
-            The model's answer.
+            A ``ParameterView[str]`` wrapping the model's answer.
 
         Ensures:
-            - When both ``coordinator`` and ``thread_id`` are given, one
-              ``ParameterRecalledEvent`` with ``derivation="query"`` and the
-              query in its ``meta`` is appended and confirmed durable before
-              returning.
+            - When a thread is identifiable, one ``ParameterRecalledEvent``
+              with ``derivation="query"`` and the query in its ``meta`` is
+              appended and confirmed durable before returning.
         """
         ...
 
@@ -209,38 +241,67 @@ class MemoryBackend(ABC):
         thread_id: ThreadId | None = None,
         requires_grad: bool | None = None,
         **kwargs: Any,
-    ) -> Any:
-        """Return top-``k`` matches from a collection parameter, emitting a recall event.
+    ) -> ParameterView[Any]:
+        """Return top-``k`` matches from a collection parameter, as a :class:`ParameterView`.
 
         Args:
             name: Parameter name (typically a collection-valued field).
             query: Retrieval query.
             k: Maximum number of matches.
-            coordinator: Coordinator to append the recall event to; ``None``
-                makes this a pure fetch.
-            thread_id: Thread the matches are fed into; stamped onto the event.
+            coordinator: Coordinator to append the recall event to; defaults
+                to the ambient scope's coordinator.
+            thread_id: Thread the matches are fed into; defaults to the
+                ambient scope's thread.
             requires_grad: Override gradient tracking; default as in
                 :meth:`recall`.
             kwargs: Backend-specific search options, forwarded to ``_search``
                 and recorded in the event ``meta``.
 
         Returns:
-            The top-``k`` results.
+            A ``ParameterView`` wrapping the top-``k`` results.
 
         Ensures:
-            - When both ``coordinator`` and ``thread_id`` are given, one
-              ``ParameterRecalledEvent`` with ``derivation="search"`` carrying
-              ``query``, ``top_k``, and any extra options in its ``meta`` is
+            - When a thread is identifiable, one ``ParameterRecalledEvent``
+              with ``derivation="search"`` carrying ``query``, ``top_k``, any
+              extra options, and the backend's fetch meta (e.g. the JSON
+              backend's ``{"results": {entry_id: value}}``) in its ``meta`` is
               appended and confirmed durable before returning.
         """
         ...
 
-    def consolidate(self, name: str, feedback: list[str]) -> None:
+    async def emit_recall(
+        self,
+        view: ParameterView[Any],
+        coordinator: Coordinator,
+        thread_id: ThreadId,
+    ) -> None:
+        """Emit the recall event for a view consumed by a traced thread.
+
+        Called by ``AIFunction.trace`` for views whose recall happened outside
+        any thread scope (the thread did not exist yet). No-op when the view
+        was already emitted at recall time, so one logical recall never lands
+        in two logs.
+
+        Args:
+            view: The consumed ``ParameterView`` (produced by this backend).
+            coordinator: Coordinator holding the traced thread's log.
+            thread_id: The traced thread the view was fed into.
+        """
+        ...
+
+    def consolidate(self, name: str, feedback: list[str], retrieved: dict[str, str] | None = None) -> None:
         """Incorporate ``feedback`` into parameter ``name``.
+
+        Runs with the ambient thread scope cleared, so consolidation's
+        internal model calls never attribute to a running user thread.
 
         Args:
             name: Parameter name.
             feedback: Feedback strings to merge into the stored value.
+            retrieved: For list parameters, the ``{entry_id: value}`` mapping
+                the forward pass retrieved (merged from the search derivation
+                meta by the optimizer), so consolidation targets those entries;
+                ``None`` consolidates against the full value.
         """
         ...
 
@@ -272,9 +333,11 @@ class MemoryBackend(ABC):
         descriptions come from the schema, so an agent can read and write memory
         during a cycle.
 
-        The generated tools are pure fetches/writes: they thread no
-        coordinator/thread through, so they do **not** emit
-        ``ParameterRecalledEvent`` s and do not feed the optimization graph.
+        The generated tools take no coordinator/thread arguments, but recall
+        operations pick up the ambient thread scope the runtime opens for each
+        cycle — so a tool call inside a running thread still emits a
+        ``ParameterRecalledEvent`` and feeds the optimization graph. Tools
+        return the raw value (not a ``ParameterView``).
 
         Args:
             names: One or more parameter names (slash-separated for nested fields).
@@ -301,6 +364,11 @@ class DynamicToolProvider(ToolProvider):
 
     def __init__(self, tools: list[AgentTool]) -> None:
         """Hold the pre-built ``tools``."""
+        ...
+
+    @property
+    def tools(self) -> list[AgentTool]:
+        """The pre-built tools (subclasses extend providers by combining these)."""
         ...
 
     async def load_tools(self, **kwargs: object) -> Sequence[AgentTool]:

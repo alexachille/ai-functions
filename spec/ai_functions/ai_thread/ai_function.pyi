@@ -9,6 +9,7 @@ from strands.types.tools import AgentTool
 
 from ..protocols import Spawnable
 from ..handle import ThreadHandle
+from ..types.graph import Result
 from .ai_thread import AIThread
 from .config import (
     ThreadConfig,
@@ -149,6 +150,42 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
         """
         ...
 
+    async def trace(self, *args: P.args, **kwargs: P.kwargs) -> Result[T]:
+        """Run one cycle like ``__call__``, returning a :class:`Result` node.
+
+        The traced counterpart of ``__call__`` for optimization workflows: the
+        returned ``Result`` wraps the value plus the provenance needed to
+        reconstruct the computation graph afterwards (coordinator, thread id,
+        and the ``ParameterView`` / ``Result`` handles discovered in the
+        arguments, nested containers included)::
+
+            cat = await joke_writer.trace(topic="cats", joke_guidelines=await memory.recall("joke_guidelines"))
+            email = await email_writer.trace(jokes=cat, formatting_guidelines=await memory.recall("fmt"))
+            await optimizer.step(email, "titles please", backends=[memory])
+
+        Args:
+            args: Positional arguments forwarded to ``prompt_fn``; handles are
+                recorded as graph edges and unwrapped before the prompt is built.
+            kwargs: Keyword arguments, same handling as ``args``.
+
+        Returns:
+            A ``Result[T]`` wrapping the typed cycle result.
+
+        Ensures:
+            - ``ParameterView`` inputs whose recall event was not emitted at
+              recall time are emitted against the traced thread before the
+              cycle runs; views already emitted elsewhere are not re-emitted
+              (one logical recall, one event).
+            - The traced thread is torn down before returning; its event log
+              survives on the coordinator for ``build_graph_from_result``.
+
+        Note:
+            Pass handles directly (``jokes=cat``) to preserve graph edges;
+            interpolating into an f-string computes the same value but drops
+            the optimization edge.
+        """
+        ...
+
     # ── Template variants ──
 
     def replace(self, **kwargs: Unpack[ThreadMergedKwargs]) -> AIFunction[P, T]:
@@ -203,38 +240,100 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
 # ── Decorator ──
 
 
-@overload
-def ai_function[**P, T](
-    output: type[T],
-) -> Callable[[Callable[P, str | None]], AIFunction[P, T]]: ...
+@final
+class _TypedDecorator[T]:
+    """Decorator bound to an explicit output type via ``ai_function[T]``.
 
-
-@overload
-def ai_function[**P, T](
-    output: type[T],
-    *,
-    config: ThreadConfig | None = None,
-    **kwargs: Unpack[ThreadMergedKwargs],
-) -> Callable[[Callable[P, str | None]], AIFunction[P, T]]: ...
-
-
-def ai_function[**P, T](  # type: ignore[misc]
-    output: type[T],
-    *,
-    config: ThreadConfig | None = None,
-    **kwargs: Unpack[ThreadMergedKwargs],
-) -> Callable[[Callable[P, str | None]], AIFunction[P, T]]:
-    """Wrap a prompt function as an ``AIFunction`` with the given output type.
+    Produced by subscripting :data:`ai_function`. Applying it to a prompt
+    function yields an ``AIFunction`` whose output type is ``T``. It may be
+    applied directly (``@ai_function[T]``) or called first with
+    configuration (``@ai_function[T](model=...)``) to obtain a configured
+    decorator.
 
     Args:
-        output: The declared output type for the wrapped function.
-        config: Optional base ``ThreadConfig``; a fresh one is used if
-            ``None``.
-        kwargs: Overrides merged into ``config``; ``ThreadKwargs`` keys
-            update config fields directly, others merge into
-            ``agent_kwargs``.
-
-    Returns:
-        A decorator that turns the prompt function into an ``AIFunction``.
+        output_type: The declared output type ``T`` bound by the subscript.
+        config: Default per-decorator configuration.
     """
-    ...
+
+    def __init__(self, output_type: type[T], config: ThreadConfig) -> None: ...
+    @overload
+    def __call__[**P](self, prompt_fn: Callable[P, str | None], /) -> AIFunction[P, T]: ...
+    @overload
+    def __call__[**P](
+        self,
+        *,
+        config: ThreadConfig | None = None,
+        **kwargs: Unpack[ThreadMergedKwargs],
+    ) -> Callable[[Callable[P, str | None]], AIFunction[P, T]]: ...
+    def __call__[**P](  # type: ignore[misc]
+        self,
+        prompt_fn: Callable[P, str | None] | None = None,
+        /,
+        *,
+        config: ThreadConfig | None = None,
+        **kwargs: Unpack[ThreadMergedKwargs],
+    ) -> AIFunction[P, T] | Callable[[Callable[P, str | None]], AIFunction[P, T]]: ...
+
+
+@final
+class _AIFunctionFactory:
+    """The ``ai_function`` decorator object.
+
+    Supports two forms:
+
+    - ``@ai_function[OutputType]`` — the output type is given explicitly in
+      brackets and is always used, regardless of any return annotation on
+      the prompt function. This is the only form that type-checks cleanly.
+    - ``@ai_function`` — the output type is inferred from the prompt
+      function's return annotation (``def f(...) -> OutputType``).
+
+    Both forms may be called with configuration before being applied
+    (``@ai_function[T](model=...)`` or ``@ai_function(model=...)``).
+    """
+
+    def __getitem__[T](self, output_type: type[T]) -> _TypedDecorator[T]:
+        """Bind an explicit output type for ``@ai_function[T]``.
+
+        Args:
+            output_type: The declared output type for the wrapped function.
+
+        Returns:
+            A decorator that turns a prompt function into an ``AIFunction``
+            with output type ``output_type``.
+        """
+        ...
+
+    @overload
+    def __call__[**P, T](self, prompt_fn: Callable[P, T], /) -> AIFunction[P, T]: ...
+    @overload
+    def __call__[**P, T](
+        self,
+        *,
+        config: ThreadConfig | None = None,
+        **kwargs: Unpack[ThreadMergedKwargs],
+    ) -> Callable[[Callable[P, T]], AIFunction[P, T]]: ...
+    def __call__[**P, T](  # type: ignore[misc]
+        self,
+        prompt_fn: Callable[P, T] | None = None,
+        /,
+        *,
+        config: ThreadConfig | None = None,
+        **kwargs: Unpack[ThreadMergedKwargs],
+    ) -> AIFunction[P, T] | Callable[[Callable[P, T]], AIFunction[P, T]]: ...
+
+
+ai_function: _AIFunctionFactory
+"""Decorator that wraps a prompt function as an ``AIFunction``.
+
+Use ``@ai_function[OutputType]`` to declare the output type explicitly (the
+type in brackets is always used), or a bare ``@ai_function`` to infer the
+output type from the prompt function's return annotation. Either form
+accepts configuration when called: ``@ai_function[T](model=...)`` or
+``@ai_function(model=...)``. ``ThreadKwargs`` keys update the config fields
+directly; others merge into ``agent_kwargs``.
+
+Raises:
+    TypeError: If a bare ``@ai_function`` is applied to a prompt function
+        that has no usable return annotation. Either annotate the return
+        type or use the ``@ai_function[OutputType]`` form.
+"""

@@ -687,7 +687,7 @@ class Coordinator(Protocol):
         """
         ...
 
-    async def fork(self, thread_id: ThreadId) -> ThreadHandle[..., Any]:
+    async def fork(self, thread_id: ThreadId, *, parent_id: ThreadId | None = None) -> ThreadHandle[..., Any]:
         """Fork ``thread_id`` into a new thread seeded with its history.
 
         Thin sugar built on :meth:`spawn`:

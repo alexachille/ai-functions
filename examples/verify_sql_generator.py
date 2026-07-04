@@ -150,8 +150,7 @@ def validate_column_references(result: str, schema: str, dialect: str) -> None:
 # code_executor_kwargs sets a 5s timeout to prevent runaway code.
 
 
-@ai_function(
-    str,
+@ai_function[str](
     post_conditions=[validate_syntax, validate_table_references, validate_column_references],
     max_attempts=3,
 )

@@ -22,6 +22,8 @@ from strands.types.content import Message
 
 if TYPE_CHECKING:
     from ..memory.base import MemoryBackend
+    from ..protocols import Coordinator
+    from .ids import ThreadId
 
 
 @dataclass
@@ -83,3 +85,59 @@ class ThreadNode(Node):
     parent: ThreadNode | None = field(default=None, repr=False)
 
     events: list[Any] = field(default_factory=list, repr=False)
+
+@dataclass(kw_only=True, eq=False)
+class ParameterView[T]:
+    """A recalled parameter value plus the metadata needed to link it into a graph.
+
+    Returned by ``MemoryBackend.recall`` / ``query`` / ``search``. An opaque
+    wrapper — not a ``str``/``list`` subclass and not a graph node. ``__str__``
+    returns ``str(value)`` so a view interpolates into f-strings and prompt
+    templates; passing the view itself to ``AIFunction.trace`` / ``__call__``
+    preserves the dataflow edge. ``emitted`` records whether the recall event
+    already landed in some thread's log (``trace`` emits for un-emitted views
+    and skips the rest).
+    """
+
+    value: T
+    name: str
+    backend: MemoryBackend
+    derivation: Literal["full", "query", "search"] = "full"
+    requires_grad: bool = True
+    description: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+    emitted: bool = False
+
+    def __str__(self) -> str: ...
+
+@dataclass(kw_only=True, eq=False)
+class Result[T]:
+    """The output of one ``AIFunction.trace`` call plus its provenance.
+
+    ``inputs`` carries the sibling dataflow edges discovered by scanning the
+    trace call's arguments; the thread's events (read from ``coordinator``)
+    remain the source of truth for everything else.
+    """
+
+    value: T
+    coordinator: Coordinator
+    thread_id: ThreadId
+    inputs: list[ParameterView[Any] | Result[Any]] = field(default_factory=list)
+
+    def __str__(self) -> str: ...
+
+type Traceable[T] = T | ParameterView[T] | Result[T]
+
+def collect_nodes(value: Any) -> list[ParameterView[Any] | Result[Any]]:
+    """Recursively find the dataflow handles in ``value``.
+
+    Scans dicts, lists, tuples, and sets; returns handles in discovery order,
+    deduplicated by identity.
+    """
+
+def unwrap_nodes(value: Any) -> Any:
+    """Recursively replace ``ParameterView`` / ``Result`` handles with their ``.value``.
+
+    Rebuilds dicts, lists, tuples (including ``NamedTuple``), and sets;
+    returns every other value unchanged.
+    """

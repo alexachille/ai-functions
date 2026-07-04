@@ -217,7 +217,7 @@ def test_heal_preserves_order_of_tooluse_ids() -> None:
 # ── End-to-end: cancel mid-tool call produces valid reconstructed history ─
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def _simple(prompt: str) -> str:
     return prompt
 
@@ -239,7 +239,7 @@ async def test_cancel_mid_tool_call_leaves_healed_history() -> None:
         """Never completes — barrier blocks it indefinitely."""
         return a + b  # unreachable in this test, but needed for signature
 
-    @ai_function(str, structured_output=False, tools=[slow_add])
+    @ai_function[str](structured_output=False, tools=[slow_add])
     def _with_slow(prompt: str) -> str:
         return prompt
 
@@ -291,7 +291,7 @@ async def test_fork_during_tool_call_produces_healed_child_history() -> None:
         """Barrier-blocked tool."""
         return a + b
 
-    @ai_function(str, structured_output=False, tools=[slow_add])
+    @ai_function[str](structured_output=False, tools=[slow_add])
     def _with_slow(prompt: str) -> str:
         return prompt
 

@@ -1,8 +1,9 @@
-"""Shared utilities for the DS-1000 backpropagation demo (examples 30 and 31).
+"""Shared utilities for the DS-1000 backpropagation demo (``memory_backprop_scipy.py``).
 
-Each run recalls memory parameters onto a live coordinator, generates and
-executes a candidate solution, then reconstructs the run's graph node with
-``build_graph(events, [memory])`` for the optimizer to backpropagate through.
+Each run recalls memory parameters and ``trace``-executes the generator (the
+recalled ``ParameterView`` s passed as arguments wire the graph edges), executes
+the candidate solution, then rebuilds the run's graph node with
+``build_graph_from_result`` for the optimizer to backpropagate through.
 Provides the pure-Python execution/test harness (``execute_and_test`` and
 friends) plus ``run_problem`` / ``run_batch_parallel`` / ``build_feedback``.
 """
@@ -17,14 +18,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ai_functions import build_graph
+from ai_functions import build_graph_from_result
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from ai_functions import JSONMemoryBackend
     from ai_functions.ai_thread import AIFunction
-    from ai_functions.runtime import InMemoryCoordinator, LocalWorker
     from ai_functions.types.graph import ThreadNode
 
 
@@ -140,7 +140,7 @@ def execute_and_test(solution_code: str, code_context: str, timeout_sec: int = 3
         return ExecutionResult(passed=False, error=f"{type(e).__name__}: {e}\n{short_tb}", solution_code=solution_code)
 
 
-# ── Running generate_code over problems (our async + build_graph API) ─────────
+# ── Running generate_code over problems (trace + build_graph_from_result) ─────
 
 # Memory parameters recalled per run and traced back for backward/consolidate.
 PARAM_NAMES = ("coding_patterns", "common_pitfalls")
@@ -150,27 +150,23 @@ async def run_problem(
     problem: dict[str, Any],
     memory: JSONMemoryBackend,
     generate_fn: AIFunction[..., str],
-    coordinator: InMemoryCoordinator,
-    worker: LocalWorker,
 ) -> tuple[str, ExecutionResult, ThreadNode]:
     """Generate code for one problem, execute it, and return the reconstructed graph node.
 
-    Spawns a thread on the shared coordinator, recalls each memory parameter
-    into that thread's log (so ``build_graph`` can wire the parameters back to
-    the live backend), runs ``generate_fn``, executes the solution, and rebuilds
-    the thread node for the optimizer.
+    ``trace`` runs ``generate_fn`` and records the recalled ``ParameterView``
+    arguments as graph edges (no coordinator or thread wiring); the solution is
+    executed, and the thread node is rebuilt for the optimizer.
     """
-    handle = await worker.spawn_locally(generate_fn, thread_name=f"generate_code:{problem['id']}")
-    recalled = {name: await memory.recall(name, coordinator=coordinator, thread_id=handle.id) for name in PARAM_NAMES}
-    raw = await handle.run(
+    recalled = {name: await memory.recall(name) for name in PARAM_NAMES}
+    result = await generate_fn.trace(
         coding_patterns=recalled["coding_patterns"],
         common_pitfalls=recalled["common_pitfalls"],
         problem_prompt=problem["prompt"],
         library=problem["library"],
     )
-    solution = extract_solution_code(str(raw))
+    solution = extract_solution_code(str(result))
     exec_result = execute_and_test(solution, problem["code_context"])
-    node = build_graph(await coordinator.get_events(handle.id), [memory])
+    node = await build_graph_from_result(result, [memory])
     return solution, exec_result, node
 
 
@@ -178,11 +174,9 @@ async def run_batch_parallel(
     batch: list[dict[str, Any]],
     memory: JSONMemoryBackend,
     generate_fn: AIFunction[..., str],
-    coordinator: InMemoryCoordinator,
-    worker: LocalWorker,
 ) -> list[tuple[str, ExecutionResult, ThreadNode]]:
     """Run a batch of problems concurrently, returning results in original order."""
-    return await asyncio.gather(*(run_problem(problem, memory, generate_fn, coordinator, worker) for problem in batch))
+    return await asyncio.gather(*(run_problem(problem, memory, generate_fn) for problem in batch))
 
 
 def build_feedback(problem: dict[str, Any], solution_code: str, exec_result: ExecutionResult) -> str:

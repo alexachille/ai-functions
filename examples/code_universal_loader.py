@@ -23,8 +23,7 @@ def check_invoice_dataframe(df: DataFrame):
     )
 
 
-@ai_function(
-    DataFrame,
+@ai_function[DataFrame](
     post_conditions=[check_invoice_dataframe],
     code_execution_mode="local",
     code_executor_additional_imports=["pandas", "sqlite3"],
@@ -46,7 +45,7 @@ if __name__ == "__main__":
     import tempfile
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from _create_data import create_data
+    from _invoice_data import create_data
 
     # Save data in a few different formats (csv, json, sqlite3) and try to load them back
     with tempfile.TemporaryDirectory(delete=True) as temp_dir:

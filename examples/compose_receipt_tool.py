@@ -98,8 +98,7 @@ def validate_completeness(result: ReceiptData) -> None:
 # orchestrating agent sees when deciding which tool to call.
 
 
-@ai_function(
-    ReceiptData,
+@ai_function[ReceiptData](
     description="Parse a receipt or invoice text and extract structured expense data",
     post_conditions=[validate_math, validate_completeness],
     max_attempts=3,

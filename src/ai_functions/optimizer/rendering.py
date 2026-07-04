@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from strands.types.content import Message
@@ -23,7 +23,7 @@ def _yaml_safe_value(value: Any) -> Any:  # pyright: ignore[reportExplicitAny]
     return str(value)
 
 
-def render_inputs(nodes: list[Node]) -> str:
+def render_inputs(nodes: Sequence[Node]) -> str:
     result: dict[str, Any] = {}  # pyright: ignore[reportExplicitAny]
     for node in nodes:
         node_type = node.__class__.__name__.lower()

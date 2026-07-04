@@ -1,4 +1,4 @@
-"""DS-1000 Scipy problem data for the backprop demo (example 30).
+"""DS-1000 Scipy problem data for the backprop demo (``memory_backprop_scipy.py``).
 
 Each problem has an ``id``, ``library``, a ``prompt`` (the DS-1000 question with a
 ``BEGIN SOLUTION`` marker), and a ``code_context`` (the executable test harness

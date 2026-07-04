@@ -46,6 +46,7 @@ from ..types import (
     TokenUsageEvent,
     ToolCallEvent,
     ToolResultEvent,
+    unwrap_nodes,
 )
 from .config import CodeExecutionMode, ThreadConfig, ThreadKwargs
 from .errors import AIFunctionError
@@ -505,21 +506,85 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         """Return the names of ``prompt_fn`` params annotated as ``Procedural``.
 
         Detected via ``ProceduralMarker`` in the parameter's ``Annotated``
-        metadata. These hold Python source that the python_executor should
-        *define* (run at setup) rather than inject as a plain string variable.
+        metadata — either directly (``x: Procedural``) or on a union member
+        (``x: Traceable[Procedural]``, i.e. ``Procedural | ParameterView[...]
+        | Result[...]``). These hold Python source that the python_executor
+        should *define* (run at setup) rather than inject as a plain string
+        variable.
         """
         from ..memory.procedural import ProceduralMarker
+
+        def _is_procedural(hint: object) -> bool:
+            metadata = getattr(hint, "__metadata__", ())
+            if any(isinstance(m, ProceduralMarker) for m in metadata):
+                return True
+            return any(_is_procedural(arg) for arg in typing.get_args(hint))
 
         try:
             hints = typing.get_type_hints(self._template.prompt_fn, include_extras=True)
         except Exception:  # noqa: BLE001 — annotations may reference missing names
             return set()
-        names: set[str] = set()
-        for name, hint in hints.items():
-            metadata = getattr(hint, "__metadata__", ())
-            if any(isinstance(m, ProceduralMarker) for m in metadata):
-                names.add(name)
-        return names
+        return {name for name, hint in hints.items() if _is_procedural(hint)}
+
+    def _code_env_preamble(self, cycle_config: ThreadConfig) -> str:
+        """Build the code-execution preamble advertising the sandbox namespace.
+
+        Empty unless ``cycle_config.code_execution_mode`` is LOCAL. Otherwise it
+        tells the agent a Python environment is available, which modules may be
+        imported, and — from the cycle's bound arguments — which ``Procedural``
+        helpers are already defined (by signature *and docstring*, so the agent
+        knows when to call each) and which other variables are in scope. Without
+        this, a recalled ``Procedural`` helper is defined in the sandbox but
+        never surfaced to the model.
+
+        ``_``-prefixed arguments are skipped. Bound values may be dataflow
+        handles (``ParameterView`` / ``Result``); their ``.value`` is used, so
+        the advertisement matches what the executor actually put in scope.
+        """
+        if cycle_config.code_execution_mode != CodeExecutionMode.LOCAL:
+            return ""
+
+        from ..tools.local_python_executor import SAFE_BUILTINS, procedural_signatures
+
+        def _truncate(text: str, limit: int = 200) -> str:
+            return text if len(text) <= limit else text[:limit] + "..."
+
+        modules = SAFE_BUILTINS + list(cycle_config.code_executor_additional_imports)
+        parts = [
+            "You have access to a python execution environment.",
+            "Use it if needed, but prefer answering directly (or via a tool call) when the task "
+            "does not require running code; when you do use it, prefer helpers that already exist "
+            "over writing new logic.",
+            f"The following modules are available for import: {', '.join(modules)}.",
+            "Modules not listed above are not available for security reasons. "
+            "You cannot use the `os` module. You cannot use the `open(...)` builtin.",
+        ]
+
+        procedural_names = self._procedural_param_names()
+        helper_blocks: list[str] = []
+        variables: list[str] = []
+        for name, raw in self._bound_args.items():
+            if name.startswith("_"):
+                continue
+            value = unwrap_nodes(raw)
+            if name in procedural_names and isinstance(value, str):
+                helper_blocks.extend(procedural_signatures(value))
+            else:
+                variables.append(f" - {name}: {_truncate(repr(value))}")
+
+        if helper_blocks:
+            parts.append(
+                "\nThe following functions have already been executed and are available "
+                "in the python environment's namespace. You can call them directly:"
+            )
+            parts.extend(f"```python\n{block}\n```" for block in helper_blocks)
+        if variables:
+            parts.append(
+                "\nThe following variables are already available in the python environment (DO NOT redefine them):"
+            )
+            parts.extend(variables)
+
+        return "<environment>\n" + "\n".join(parts) + "\n</environment>"
 
     # ── Internal pipeline steps ──
 
@@ -564,6 +629,17 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
             patch_dict = dict(patch)
             patch_dict.pop("config_hook", None)
             cycle_config = dataclasses.replace(self._config, **patch_dict)  # type: ignore[arg-type]
+
+        # When code execution is enabled, advertise the sandbox namespace
+        # (importable modules, recalled Procedural helper signatures + docstrings,
+        # and other bound variables) so the agent calls what already exists
+        # instead of re-deriving it. Fold it into the just-appended prompt so the
+        # agent sees a single user turn rather than a separate message. Resolved
+        # from cycle_config (not self._config) so a config_hook override of
+        # code_execution_mode is honored.
+        preamble = self._code_env_preamble(cycle_config)
+        if preamble and self._inject_buffer:
+            self._inject_buffer[-1] = f"{self._inject_buffer[-1]}\n\n{preamble}"
 
         # Inject the default runtime-facing tools (list_threads, send_message).
         # Bound to this cycle's ctx so the LLM can discover peer threads and

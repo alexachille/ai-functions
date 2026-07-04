@@ -8,7 +8,7 @@ implementation — see ``ai_functions.ai_thread``.
 
 from __future__ import annotations
 
-from .context import ThreadContext
+from .context import ThreadContext, ThreadScope, current_thread_scope, no_thread_scope, thread_scope
 from .events import (
     ApprovalDecidedEvent,
     ApprovalRequestEvent,
@@ -31,12 +31,14 @@ from .events import (
     SessionCreatedEvent,
     SessionResetEvent,
     StartedEvent,
+    ThreadSpawnedEvent,
     TokenUsage,
     TokenUsageEvent,
     ToolCallEvent,
     ToolResultEvent,
     is_renderable_event,
 )
+from .graph import ParameterView, Result, Traceable, collect_nodes, unwrap_nodes
 from .ids import EventId, MessageId, ThreadId, WorkerId
 from .policy import Policy
 from .status import InputShape, ThreadInfo, ThreadStatus
@@ -61,8 +63,10 @@ __all__ = [
     "MessageId",
     "MessageUserEvent",
     "ParameterRecalledEvent",
+    "ParameterView",
     "Policy",
     "RenderableEvent",
+    "Result",
     "ResultEvent",
     "SessionCreatedEvent",
     "SessionResetEvent",
@@ -70,11 +74,19 @@ __all__ = [
     "ThreadContext",
     "ThreadId",
     "ThreadInfo",
+    "ThreadScope",
+    "ThreadSpawnedEvent",
     "ThreadStatus",
     "TokenUsage",
     "TokenUsageEvent",
     "ToolCallEvent",
     "ToolResultEvent",
+    "Traceable",
     "WorkerId",
+    "collect_nodes",
+    "current_thread_scope",
     "is_renderable_event",
+    "no_thread_scope",
+    "thread_scope",
+    "unwrap_nodes",
 ]

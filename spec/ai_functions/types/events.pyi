@@ -66,6 +66,8 @@ class EventKind(enum.StrEnum):
 
     PARAMETER_RECALLED = "parameter_recalled"
 
+    THREAD_SPAWNED = "thread_spawned"
+
 
 class TokenUsage(BaseModel):
     """Per-call token accounting reported by an executor."""
@@ -407,6 +409,24 @@ class ParameterRecalledEvent(BaseEvent):
     """Backend-specific data (e.g. query text, top_k, scores)."""
 
 
+class ThreadSpawnedEvent(BaseEvent):
+    """A child thread was spawned from this one, recording the parent→child edge.
+
+    Emitted into the **parent's** log by ``Coordinator.spawn`` whenever a
+    ``parent_id`` is set, so the edge outlives the child's teardown (which drops
+    the child's ``ThreadInfo`` but not its event log). Consumed only by
+    :func:`build_graph`, which recurses into ``child_thread_id``. Not a
+    :data:`RenderableEvent`.
+
+    Invariants:
+        - I9 — non-renderable; inert to message reconstruction.
+    """
+
+    kind: Literal[EventKind.THREAD_SPAWNED] = EventKind.THREAD_SPAWNED
+    child_thread_id: ThreadId
+    """Id of the spawned child thread; the key ``build_graph`` recurses on."""
+
+
 # ── User-defined extension ──
 
 
@@ -436,7 +456,7 @@ SystemEvent = Annotated[
     MessageAssistantCompleteEvent |
     ToolCallEvent | ToolResultEvent |
     ApprovalRequestEvent | ApprovalDecidedEvent | SessionCreatedEvent | SessionResetEvent | ContextSummarizedEvent |
-    TokenUsageEvent | ResultEvent | ParameterRecalledEvent,
+    TokenUsageEvent | ResultEvent | ParameterRecalledEvent | ThreadSpawnedEvent,
     Field(discriminator="kind")
 ]
 

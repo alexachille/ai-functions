@@ -2,7 +2,7 @@
 name = "ai-functions-examples"
 version = "0.1.0"
 dependencies = [
-    "strands-ai-functions",
+    "strands-ai-functions[agentcore,claude-code,kiro,network]",
     "pandas>=2.0",
     "numpy>=1.24",
     "scipy>=1.11",

@@ -27,7 +27,7 @@ from ai_functions.types.events import (
 )
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def _echo(prompt: str) -> str:
     """Minimal AI function used as a vehicle for driving ScriptedModel."""
     return prompt

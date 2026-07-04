@@ -58,6 +58,7 @@ from .wire_methods import (
     CopyEventsParams,
     DeregisterThreadParams,
     DeregisterWorkerParams,
+    ForkParams,
     GetEventsParams,
     GetThreadInfoParams,
     GetThreadStatusParams,
@@ -544,11 +545,18 @@ class CoordinatorClient(Coordinator):
             ThreadIdOnlyParams(thread_id=thread_id),
         )
 
-    async def fork(self, thread_id: ThreadId) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
+    async def fork(
+        self,
+        thread_id: ThreadId,
+        *,
+        parent_id: ThreadId | None = None,
+    ) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
         """Fork ``thread_id`` into a new thread seeded with its history.
 
         Args:
             thread_id: Thread to fork.
+            parent_id: Parent to attribute the fork to; defaults to the source's
+                own parent (the fork becomes a sibling, not a child).
 
         Returns:
             A handle to the new forked thread.
@@ -560,7 +568,7 @@ class CoordinatorClient(Coordinator):
         """
         raw = await self._call(
             "coordinator.fork",
-            ThreadIdOnlyParams(thread_id=thread_id),
+            ForkParams(thread_id=thread_id, parent_id=parent_id),
         )
         return ThreadHandle(ThreadId(cast("str", raw)), self)
 

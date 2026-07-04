@@ -28,7 +28,7 @@ from ai_functions.testing import RuntimeHarness, ScriptedModel, Turn, assert_mes
 from ai_functions.types import EventKind, ThreadContext
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def _fn(prompt: str) -> str:
     return prompt
 

@@ -52,7 +52,7 @@ class StockInfo:
     prices: pd.DataFrame
 
 
-@ai_function(str, config=Configs.FAST_MODEL, tools=[websearch_tool])
+@ai_function[str](config=Configs.FAST_MODEL, tools=[websearch_tool])
 async def research_news(stock: str):
     """
     Research and summarize the current news regarding the following stock symbol: {stock}
@@ -64,7 +64,7 @@ def check_nan(df: pd.DataFrame):
 
 
 # The sandboxed Python environment lets the agent use libraries and return rich data types.
-@ai_function(pd.DataFrame, config=Configs.DATA_ANALYSIS, post_conditions=[check_nan])
+@ai_function[pd.DataFrame](config=Configs.DATA_ANALYSIS, post_conditions=[check_nan])
 async def research_price(stock: str):
     """
     Use the `yfinance` Python package to retrieve the historical prices of {stock} in the last 30 days.
@@ -73,7 +73,7 @@ async def research_price(stock: str):
 
 
 # Function inputs are available inside the Python environment for further processing.
-@ai_function(str, config=Configs.DATA_ANALYSIS)
+@ai_function[str](config=Configs.DATA_ANALYSIS)
 def write_report(stock_info: list[StockInfo]):
     """
     Write a html report comparing the trend of the following stocks: {",".join(s.symbol for s in stock_info)}.

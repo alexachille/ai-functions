@@ -20,7 +20,7 @@ def _add(a: int, b: int) -> int:
     return a + b
 
 
-@ai_function(str, structured_output=False, tools=[_add])
+@ai_function[str](structured_output=False, tools=[_add])
 def _with_tools(prompt: str) -> str:
     return prompt
 
@@ -44,7 +44,7 @@ def _make_counted_validator(fail_count: int) -> PostCondition:
 async def test_post_condition_retries_until_pass() -> None:
     """A validator that fails twice then passes yields two error MESSAGE_USER events."""
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _fn(prompt: str) -> str:
         return prompt
 
@@ -75,7 +75,7 @@ async def test_post_condition_exhausts_max_attempts() -> None:
     """N persistent failures raise after ``max_attempts`` retries."""
     from ai_functions.ai_thread import AIFunctionError
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _fn(prompt: str) -> str:
         return prompt
 
@@ -103,7 +103,7 @@ async def test_post_condition_exhausts_max_attempts() -> None:
 async def test_cancel_mid_cycle_rejects_pending_future() -> None:
     """The in-flight cycle's future rejects with ``CancelledError``."""
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _fn(prompt: str) -> str:
         return prompt
 
@@ -126,7 +126,7 @@ async def test_cancel_does_not_tear_down_thread() -> None:
     boundary), so that Turn stays in the script and is consumed by the second run.
     """
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _fn(prompt: str) -> str:
         return prompt
 
@@ -154,7 +154,7 @@ async def test_notify_while_idle_does_not_start_cycle() -> None:
     appears BEFORE the run's prompt in the event log.
     """
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _fn(prompt: str) -> str:
         return prompt
 

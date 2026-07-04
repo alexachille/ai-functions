@@ -102,7 +102,7 @@ def test_multiple_named_threads(tmp_path: Path) -> None:
 async def test_save_load_resume_through_coordinator(tmp_path: Path) -> None:
     """A persisted log re-seeds a spawn under its original id, restoring history."""
 
-    @ai_function(str)
+    @ai_function[str]
     def echo(task: str) -> str:
         """{task}"""
 

@@ -1,16 +1,26 @@
 """Abstract memory backend with parameter-recall tracking.
 
 A ``MemoryBackend`` exposes named, typed parameters over a Pydantic schema and
-is, at its core, plain storage. When a ``recall`` / ``query`` / ``search`` is
-given a ``coordinator`` and ``thread_id``, it immediately emits a
-``ParameterRecalledEvent`` into that thread's log so the computation graph can
-be reconstructed post-hoc for optimization; without them it is a pure fetch
-that emits nothing.
+is, at its core, plain storage. ``recall`` / ``query`` / ``search`` return a
+:class:`~ai_functions.types.graph.ParameterView` wrapping the value. When a
+``coordinator`` and ``thread_id`` are available (explicitly or via the ambient
+:func:`thread_scope`), the call immediately emits a ``ParameterRecalledEvent``
+into that thread's log so the computation graph can be reconstructed post-hoc
+for optimization; without them it is a pure fetch whose event is emitted later
+by ``AIFunction.trace`` when the view is consumed (see ``ParameterView.emitted``).
 
 Emission works from anywhere — including outside an ``@ai_function`` body —
 because ``Coordinator.append_event`` only requires the event's ``thread_id`` to
-be set and creates the thread's log on demand. The recalled value is returned
-unchanged, so it interpolates into prompts and f-strings normally.
+be set and creates the thread's log on demand. ``ParameterView.__str__``
+returns ``str(value)``, so a view interpolates into prompts and f-strings
+normally; the runtime also unwraps views to their ``.value`` at the
+``ThreadHandle.run`` boundary.
+
+Backend fetches (``_recall`` / ``_query`` / ``_search``) may block — a query is
+a full model call, a network backend does real I/O — so the public methods run
+them in a worker thread (``asyncio.to_thread``) with the ambient thread scope
+cleared, keeping the event loop responsive and library-internal model calls
+out of the caller's event log.
 """
 
 from __future__ import annotations
@@ -19,14 +29,16 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Self, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Self, cast, get_args, get_origin
 
 from pydantic import BaseModel, TypeAdapter
 from pydantic.fields import FieldInfo
 from strands.tools import ToolProvider
 from strands.tools.decorator import tool as _strands_tool  # pyright: ignore[reportUnknownVariableType]
 
+from ..types.context import current_thread_scope, no_thread_scope
 from ..types.events import EventKind, ParameterRecalledEvent
+from ..types.graph import ParameterView
 from .frozen import FrozenMarker
 from .procedural import ProceduralMarker
 
@@ -38,8 +50,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Legacy alias kept for backward compatibility with JSONMemoryBackend.
+# Value shape stored by the simple built-in backends (JSON, AgentCore).
 ValueType = str | list[str]
+
+# Backend-specific metadata attached to a fetch. Returned by the storage
+# methods (``_recall`` / ``_query`` / ``_search``) alongside the value, merged
+# into the recall event's ``meta``, and carried by the reconstructed
+# ``ParameterNode`` back to ``consolidate``. The JSON backend's search puts
+# ``{"results": {entry_id: value}}`` here so consolidation can target exactly
+# the entries the forward pass retrieved.
+ParameterMeta = dict[str, Any]
 
 
 def _model_from_annotation(annotation: Any) -> type[BaseModel] | None:  # pyright: ignore[reportExplicitAny]
@@ -123,6 +143,26 @@ class MemoryBackend(ABC):
         """Return whether parameter ``name`` is a list-valued field."""
         return get_origin(self._resolve_field(name).annotation) is list
 
+    def _leaf_parameter_names(self) -> list[str]:
+        """Return every leaf parameter path in the schema, slash-separated.
+
+        Nested Pydantic models are recursed into (``profile/tone``); non-model
+        fields are leaves. This is the set of names a backend stores under.
+        """
+
+        def _walk(model: type[BaseModel], prefix: str) -> list[str]:
+            names: list[str] = []
+            for field_name, field_info in model.model_fields.items():
+                path = f"{prefix}{field_name}"
+                nested = _model_from_annotation(field_info.annotation)
+                if nested is not None:
+                    names.extend(_walk(nested, f"{path}/"))
+                else:
+                    names.append(path)
+            return names
+
+        return _walk(self.schema, "")
+
     # -- Abstract storage contract (subclass implements) -----------------------
 
     @abstractmethod
@@ -134,20 +174,36 @@ class MemoryBackend(ABC):
         """Save the value of a parameter, replacing whatever is stored."""
 
     @abstractmethod
-    def _recall(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
-        """Return a parameter's current value from storage."""
+    def _recall(self, name: str) -> tuple[Any, ParameterMeta]:  # pyright: ignore[reportExplicitAny]
+        """Return ``(value, meta)`` for a parameter from storage."""
 
     @abstractmethod
-    def _query(self, name: str, query: str) -> str:
-        """Answer a question given the content of parameter name."""
+    def _query(self, name: str, query: str) -> tuple[str, ParameterMeta]:
+        """Answer a question given the content of parameter name, as ``(answer, meta)``."""
 
     @abstractmethod
-    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> Any:  # pyright: ignore[reportExplicitAny]
-        """Return top-k matches from the parameter's stored value."""
+    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> tuple[Any, ParameterMeta]:  # pyright: ignore[reportExplicitAny]
+        """Return ``(top_k_matches, meta)`` from the parameter's stored value."""
 
     @abstractmethod
-    def _consolidate(self, name: str, feedback: list[str], **kwargs: Any) -> None:  # pyright: ignore[reportExplicitAny]
-        """Incorporate feedback into the stored value of parameter name."""
+    def _consolidate(
+        self,
+        name: str,
+        feedback: list[str],
+        retrieved: dict[str, str] | None = None,
+        **kwargs: Any,  # pyright: ignore[reportExplicitAny]
+    ) -> None:
+        """Incorporate feedback into the stored value of parameter name.
+
+        Args:
+            name: Parameter name.
+            feedback: Feedback strings to merge into the stored value.
+            retrieved: For list parameters, the ``{entry_id: value}`` mapping of
+                the entries the forward pass actually retrieved (from the search
+                derivation meta), so consolidation can target them; ``None``
+                means no retrieval context — consolidate against the full value.
+            kwargs: Backend-specific options.
+        """
 
     @abstractmethod
     def _delete(self, name: str) -> None:
@@ -194,10 +250,15 @@ class MemoryBackend(ABC):
         requires_grad: bool,
         description: str = "",
         meta: dict[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
-    ) -> None:
+    ) -> bool:
         """Append a ``ParameterRecalledEvent`` and confirm it is durable.
 
-        No-op when ``coordinator`` or ``thread_id`` is ``None`` (pure fetch).
+        Falls back to the ambient :func:`thread_scope` for whichever of
+        ``coordinator`` / ``thread_id`` is ``None``; if both are still ``None``
+        the call is a pure fetch and this is a no-op returning ``False``.
+        Returns ``True`` when an event was appended (confirmed durable or
+        degraded to best-effort with a warning), so callers can record whether
+        the recall is already represented in some thread's log.
 
         ``Coordinator.append_event`` is synchronous, but a network-backed
         coordinator defers the actual write to the event loop and returns
@@ -210,7 +271,12 @@ class MemoryBackend(ABC):
         that event) rather than hanging or failing silently.
         """
         if coordinator is None or thread_id is None:
-            return
+            scope = current_thread_scope()
+            if scope is not None:
+                coordinator = coordinator or scope.coordinator
+                thread_id = thread_id or scope.thread_id
+        if coordinator is None or thread_id is None:
+            return False
         event = ParameterRecalledEvent(
             thread_id=thread_id,
             name=name,
@@ -227,7 +293,7 @@ class MemoryBackend(ABC):
         for _ in range(_CONFIRM_MAX_READS):
             stored = await coordinator.get_events(thread_id, kinds=[EventKind.PARAMETER_RECALLED])
             if any(e.id == event.id for e in stored):
-                return
+                return True
             await asyncio.sleep(delay)
             delay = min(delay + _CONFIRM_BACKOFF_STEP, _CONFIRM_BACKOFF_MAX)
 
@@ -241,8 +307,42 @@ class MemoryBackend(ABC):
             thread_id,
             _CONFIRM_MAX_READS,
         )
+        return True
 
     # -- Public API ------------------------------------------------------------
+
+    async def _build_view(
+        self,
+        name: str,
+        value: Any,  # pyright: ignore[reportExplicitAny]
+        derivation: str,
+        coordinator: Coordinator | None,
+        thread_id: ThreadId | None,
+        requires_grad: bool,
+        meta: dict[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
+    ) -> ParameterView[Any]:  # pyright: ignore[reportExplicitAny]
+        """Wrap a fetched value in a ``ParameterView`` and emit its recall event."""
+        description = self._get_description(name)
+        emitted = await self._emit_parameter_event(
+            coordinator,
+            thread_id,
+            name,
+            value,
+            derivation,
+            requires_grad,
+            description=description,
+            meta=meta,
+        )
+        return ParameterView(
+            value=value,
+            name=name,
+            backend=self,
+            derivation=derivation,  # pyright: ignore[reportArgumentType]
+            requires_grad=requires_grad,
+            description=description,
+            meta=dict(meta) if meta else {},
+            emitted=emitted,
+        )
 
     async def recall(
         self,
@@ -250,22 +350,19 @@ class MemoryBackend(ABC):
         coordinator: Coordinator | None = None,
         thread_id: ThreadId | None = None,
         requires_grad: bool | None = None,
-        **kwargs: Any,  # pyright: ignore[reportExplicitAny]
-    ) -> Any:  # pyright: ignore[reportExplicitAny]
-        """Recall a parameter's full value, emitting a recall event."""
+    ) -> ParameterView[Any]:  # pyright: ignore[reportExplicitAny]
+        """Recall a parameter's full value as a :class:`ParameterView`.
+
+        Emits a recall event immediately when a thread is identifiable
+        (explicit args or ambient scope); otherwise the view is emitted later
+        by ``AIFunction.trace`` when consumed. Use ``.value`` (or ``str()``)
+        for the raw value.
+        """
         if requires_grad is None:
             requires_grad = not self._is_frozen(name)
-        value = self._recall(name, **kwargs)
-        await self._emit_parameter_event(
-            coordinator,
-            thread_id,
-            name,
-            value,
-            "full",
-            requires_grad,
-            description=self._get_description(name),
-        )
-        return value
+        with no_thread_scope():
+            value, fetch_meta = await asyncio.to_thread(self._recall, name)  # pyright: ignore[reportAny]
+        return await self._build_view(name, value, "full", coordinator, thread_id, requires_grad, meta=fetch_meta or None)
 
     async def query(
         self,
@@ -274,23 +371,16 @@ class MemoryBackend(ABC):
         coordinator: Coordinator | None = None,
         thread_id: ThreadId | None = None,
         requires_grad: bool | None = None,
-        **kwargs: Any,  # pyright: ignore[reportExplicitAny]
-    ) -> str:
-        """Answer a question over a parameter's value, emitting a recall event."""
+    ) -> ParameterView[str]:
+        """Answer a question over a parameter's value, as a :class:`ParameterView`."""
         if requires_grad is None:
             requires_grad = not self._is_frozen(name)
-        value = self._query(name, query, **kwargs)
-        await self._emit_parameter_event(
-            coordinator,
-            thread_id,
-            name,
-            value,
-            "query",
-            requires_grad,
-            description=self._get_description(name),
-            meta={"query": query},
+        with no_thread_scope():
+            value, fetch_meta = await asyncio.to_thread(self._query, name, query)
+        view = await self._build_view(
+            name, value, "query", coordinator, thread_id, requires_grad, meta={"query": query, **fetch_meta}
         )
-        return value
+        return cast("ParameterView[str]", view)
 
     async def search(
         self,
@@ -301,29 +391,62 @@ class MemoryBackend(ABC):
         thread_id: ThreadId | None = None,
         requires_grad: bool | None = None,
         **kwargs: Any,  # pyright: ignore[reportExplicitAny]
-    ) -> Any:  # pyright: ignore[reportExplicitAny]
-        """Return top-k matches from a collection parameter, emitting a recall event."""
+    ) -> ParameterView[Any]:  # pyright: ignore[reportExplicitAny]
+        """Return top-k matches from a collection parameter, as a :class:`ParameterView`."""
         if requires_grad is None:
             requires_grad = not self._is_frozen(name)
-        value = self._search(name, query, k, **kwargs)
+        with no_thread_scope():
+            value, fetch_meta = await asyncio.to_thread(lambda: self._search(name, query, k, **kwargs))  # pyright: ignore[reportAny]
         meta: dict[str, Any] = {"query": query, "top_k": k}  # pyright: ignore[reportExplicitAny]
         if kwargs:
             meta.update(kwargs)
-        await self._emit_parameter_event(
+        meta.update(fetch_meta)
+        return await self._build_view(name, value, "search", coordinator, thread_id, requires_grad, meta=meta)
+
+    async def emit_recall(
+        self,
+        view: ParameterView[Any],  # pyright: ignore[reportExplicitAny]
+        coordinator: Coordinator,
+        thread_id: ThreadId,
+    ) -> None:
+        """Emit the recall event for a view consumed by a traced thread.
+
+        Called by ``AIFunction.trace`` for views whose recall happened outside
+        any thread scope (the thread did not exist yet). No-op when the view
+        was already emitted at recall time, so one logical recall never lands
+        in two logs. Serialization and the I8 durability confirmation are the
+        same as an at-recall emission.
+        """
+        if view.emitted:
+            return
+        view.emitted = await self._emit_parameter_event(
             coordinator,
             thread_id,
-            name,
-            value,
-            "search",
-            requires_grad,
-            description=self._get_description(name),
-            meta=meta,
+            view.name,
+            view.value,
+            view.derivation,
+            view.requires_grad,
+            description=view.description,
+            meta=view.meta or None,
         )
-        return value
 
-    def consolidate(self, name: str, feedback: list[str]) -> None:
-        """Incorporate feedback into a parameter."""
-        self._consolidate(name, feedback)
+    def consolidate(self, name: str, feedback: list[str], retrieved: dict[str, str] | None = None) -> None:
+        """Incorporate feedback into a parameter.
+
+        Runs with the ambient thread scope cleared: consolidation's internal
+        model calls must not attribute to whatever thread happens to be
+        running (see :func:`~ai_functions.types.context.no_thread_scope`).
+
+        Args:
+            name: Parameter name.
+            feedback: Feedback strings to merge into the stored value.
+            retrieved: For list parameters, the ``{entry_id: value}`` mapping
+                the forward pass retrieved (merged from the search derivation
+                meta by the optimizer), so consolidation targets those entries;
+                ``None`` consolidates against the full value.
+        """
+        with no_thread_scope():
+            self._consolidate(name, feedback, retrieved=retrieved)
 
     def save(self, name: str, value: Any) -> None:  # pyright: ignore[reportExplicitAny]
         """Store a parameter's value directly, without consolidation."""
@@ -344,9 +467,10 @@ class MemoryBackend(ABC):
         is generated only for list parameters; ``save_<name>`` / ``delete_<name>``
         only for scalar parameters.
 
-        The generated tools are pure fetches/writes: they do not emit
-        ``ParameterRecalledEvent`` s (no coordinator/thread is threaded through),
-        so they drive in-cycle memory use, not the optimization graph.
+        The generated tools take no coordinator/thread arguments, but recall
+        operations pick up the ambient :func:`thread_scope` the runtime opens
+        for each cycle — so a tool call inside a running thread still emits a
+        ``ParameterRecalledEvent`` and feeds the optimization graph.
 
         Args:
             names: One or more parameter names (slash-separated for nested fields).
@@ -399,7 +523,9 @@ class MemoryBackend(ABC):
     def _make_recall_tool(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
         async def _recall() -> Any:  # pyright: ignore[reportExplicitAny]
             """Retrieve the full content of this memory parameter."""
-            return await self.recall(name)
+            # Tools hand the raw value to the agent; the recall event was
+            # already emitted (via the ambient scope) by the public method.
+            return (await self.recall(name)).value  # pyright: ignore[reportAny]
 
         return _recall
 
@@ -410,7 +536,7 @@ class MemoryBackend(ABC):
             Args:
                 query: The natural-language question to answer.
             """
-            return await self.query(name, query)
+            return (await self.query(name, query)).value
 
         return _query
 
@@ -422,7 +548,7 @@ class MemoryBackend(ABC):
                 query: Keywords or phrase to match against entries.
                 k: Maximum number of results to return.
             """
-            return await self.search(name, query, k)
+            return cast("list[str]", (await self.search(name, query, k)).value)
 
         return _search
 
@@ -468,6 +594,11 @@ class DynamicToolProvider(ToolProvider):
     def __init__(self, tools: list[AgentTool]) -> None:
         self._tools = tools
         self._consumers: set[object] = set()
+
+    @property
+    def tools(self) -> list[AgentTool]:
+        """The pre-built tools (subclasses extend providers by combining these)."""
+        return list(self._tools)
 
     async def load_tools(self, **kwargs: object) -> Sequence[AgentTool]:
         """Return the pre-built tools."""

@@ -22,6 +22,7 @@ which does not surface in this Strands version.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import io
 import os
@@ -61,6 +62,40 @@ def _generate_signature_from_model(model: type[BaseModel], func_name: str = "fin
                 )
             )
     return f"{func_name}{inspect.Signature(params)}"
+
+
+def procedural_signatures(code: str) -> list[str]:
+    """Advertise the callable helpers in ``code``, one signature block each.
+
+    For every top-level ``def`` / ``async def`` (skipping ``_``-prefixed
+    internal helpers), returns the ``def`` line — with its parameter list and
+    return annotation — followed by the function's docstring if present, or a
+    ``...`` body otherwise. The docstring is included because it is how the
+    agent learns *when* to call a helper, not just its name and parameters.
+
+    Only top-level definitions are advertised: those are the names actually
+    callable in the sandbox namespace after the code runs. Returns an empty
+    list if ``code`` cannot be parsed, so the caller cleanly omits the
+    advertisement rather than emitting a malformed blob.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    blocks: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if node.name.startswith("_"):
+            continue
+        prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+        sig = f"{prefix}{node.name}({ast.unparse(node.args)})"
+        if node.returns is not None:
+            sig += f" -> {ast.unparse(node.returns)}"
+        docstring = ast.get_docstring(node)
+        body = textwrap.indent(f'"""{docstring}"""', "    ") if docstring else "    ..."
+        blocks.append(f"{sig}:\n{body}")
+    return blocks
 
 
 class PythonExecuteResult(BaseModel):

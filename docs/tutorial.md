@@ -1,36 +1,58 @@
-# AI Functions Tutorial
+# Strands AI Functions
 
-> ⚠️ **v2 — work in progress.** This tutorial documents v2 of AI Functions.
-> The branch is unstable and has no PyPI release.
-> For the published version, see
-> [strands-labs/ai-functions](https://github.com/strands-labs/ai-functions)
-> or `pip install strands-ai-functions`.
+Strands AI Functions is a Python library for building reliable AI-powered applications through a new abstraction: functions that behave like standard Python functions, but are evaluated by reasoning AI agents.
 
-## Getting Started
+AI Functions extend the expressivity of standard programming by offering developers a computational model that can solve tasks not easily expressible as traditional code. They can both leverage generative capabilities (e.g., writing summaries or retrieving information) and dynamically generate and execute code to process inputs and return native Python objects. For example, an AI Function can load a user-uploaded file in an arbitrary format and convert it to a normalized `DataFrame` for use in the rest of the workflow.
 
-The minimum supported Python version is 3.13.
-We recommend using `uv` (see [installation instructions](https://docs.astral.sh/uv/getting-started/installation/)) to run the provided examples.
+Direct integration of AI agents in standard workflows is often avoided due to their non-deterministic nature and lack of assurance that instructions will be followed, which can cause cascading errors throughout the workflow. AI Functions address this through extensive use of *post-conditions*. Unlike traditional prompt-based approaches, which try to ensure correctness by relying on prompt engineering alone, AI Functions enforce correctness through runtime post-condition checking: users specify explicit conditions that the output of any given step needs to satisfy, and the library automatically initiates self-correcting loops to ensure these properties hold, avoiding cascading errors in complex workflows.
 
-To install AI Functions from source on this branch:
+Because AI Functions *are* functions, developers can construct agentic workflows and agent graphs — including parallel and asynchronous ones — by writing and composing functions, and can build shareable libraries of robust, reusable agentic flows exactly the way they build software libraries today. When a workflow needs more than one-shot calls, the same functions scale up: they can be spawned as stateful **AI Threads** that keep their conversation history, form teams that message each other, run distributed across processes and machines, and even improve over time through natural-language **memory optimization**. This tutorial follows that progression, from a single function call to a distributed team of agents.
+
+## Contents
+
+- [Getting started](#getting-started)
+- [AI Functions basics](#ai-functions-basics)
+- [Post-conditions](#post-conditions)
+- [Python integration](#python-integration)
+- [Providing instructions](#providing-instructions)
+- [Configuration](#configuration)
+- [Parallel workflows](#parallel-workflows)
+- [AI Threads: adding state](#ai-threads-adding-state)
+- [Teams of agents: the coordinator and workers](#teams-of-agents-the-coordinator-and-workers)
+- [Events and observability](#events-and-observability)
+- [Memory and optimization](#memory-and-optimization)
+- [Distributed operation](#distributed-operation)
+- [Running agents across processes](#running-agents-across-processes)
+- [Going further](#going-further)
+
+## Getting started
+
+The minimum supported Python version is 3.13. We recommend Python >= 3.14 for native [t-string](https://peps.python.org/pep-0750/) template literal support (used in [Providing instructions](#providing-instructions)), and `uv` (see [installation instructions](https://docs.astral.sh/uv/getting-started/installation/)) to run the provided examples.
+
+To install AI Functions:
+
 ```bash
 # using pip
-pip install "git+https://github.com/strands-labs/ai-functions.git@wip/v2"
+pip install strands-ai-functions
 # using uv
-uv add "git+https://github.com/strands-labs/ai-functions.git@wip/v2"
+uv add strands-ai-functions
 ```
 
-This repo provides several examples. To run the examples, first configure the credentials for one of the supported model providers (see [Configuring Credentials](https://strandsagents.com/latest/documentation/docs/user-guide/quickstart/python/#configuring-credentials)).
-Then, clone the repo and run the examples using `uv` from within their folder:
+This repo provides several examples. To run them, first configure the credentials for one of the supported model providers (see [Configuring Credentials](https://strandsagents.com/latest/documentation/docs/user-guide/quickstart/python/#configuring-credentials)). Then clone the repo and run the examples using `uv` from within their folder:
+
 ```bash
 # clone the repo
-git clone -b wip/v2 https://github.com/strands-labs/ai-functions.git
+git clone https://github.com/strands-labs/ai-functions.git
 cd ai-functions/examples
+# recommended: set env variable to enable rich tool visualization in the terminal
+export STRANDS_TOOL_CONSOLE_MODE="enabled"
 # run the examples using uv
 # (change the model settings inside the example if not using Bedrock as the model provider)
 uv run [name_of_the_example].py
 ```
 
-AI Functions uses the same default model provider as Strands (Amazon Bedrock). You can change the model provider used in the examples by changing the `model` argument (see [Model Providers](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/model-providers/)):
+AI Functions uses the same default model provider as Strands (Amazon Bedrock). You can change the model provider by changing the `model` argument (see [Model Providers](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/model-providers/)):
+
 ```python
 from ai_functions import ai_function
 from strands.models.bedrock import BedrockModel
@@ -46,65 +68,83 @@ model = OpenAIModel(
     model_id="gpt-4o"
 )
 
-@ai_function(str, model=model)
-def my_function() -> None:
+@ai_function[str](model=model)
+def my_function():
     """[...]"""
 ```
 
-## Quick Start
+## AI Functions basics
 
-Before we go through everything in detail, let's look at two short examples that together give a sense of what the library is for. The first shows what a single robust AI call looks like. The second shows two AI Threads collaborating as a small team. Everything that follows is variations and scale on these two patterns.
-
-### An AI function with post-conditions
-
-An `AIFunction` behaves like a standard function, but its code is written in natural language rather than Python, and it is executed by an LLM rather than a CPU. To define one, we use the `@ai_function` decorator, specify its output type, and describe what the function should do inside its docstring (we'll cover alternative methods later).
+An AI Function behaves like a standard function, but its code is written in natural language rather than Python, and it is executed by an LLM rather than a CPU. To define one, we use the `@ai_function` decorator, specify its return type in brackets, and describe what the function should do inside its docstring (we will cover alternative methods later):
 
 ```python
-import asyncio
+from ai_functions import ai_function
 
+@ai_function[str]
+def translate_text(text: str, lang: str):
+    """
+    Translate the text below to the following language: {lang}.
+    ---
+    {text}
+    """
+
+text = "It was the best of times, it was the worst of times"
+for lang in ["fr", "ja", "it", "zh"]:
+    print(translate_text.run_sync(text, lang=lang))
+```
+
+When an AI Function is called, the library automatically creates an agent, generates a prompt from the docstring template and the provided arguments, runs the agent, then parses and validates the result before returning it. From the outside, it behaves like any other Python function.
+
+### Sync and async
+
+AI Functions are async-native: the canonical way to invoke one is to `await` it, which is what allows them to run in parallel and to compose into the multi-agent workflows shown later in this tutorial.
+
+```python
+result = await translate_text(text, lang="fr")
+```
+
+For plain scripts and quick experiments, every AI Function also provides `run_sync`, which blocks until the result is available:
+
+```python
+result = translate_text.run_sync(text, lang="fr")
+```
+
+Use whichever fits the context: `run_sync` at the top level of simple scripts, `await` inside async code (and in Jupyter notebooks, where top-level `await` is supported out of the box). The early examples in this tutorial use `run_sync` for brevity; starting from [Parallel workflows](#parallel-workflows), where concurrency is the point, they switch to `await`.
+
+### Return types
+
+AI Functions can return arbitrary data types, including primitive types (`str`, `int`, `float`), Pydantic models, and even native Python objects (see [Python integration](#python-integration)). The library takes care of the necessary conversions and validation under the hood: Pydantic models are passed to the agent as a JSON schema and parsed back on return; primitive types are requested through a synthetic wrapper so the agent still answers via structured output.
+
+The output type is declared in brackets on the decorator (`@ai_function[MeetingSummary]`). It may also be inferred from the function's return annotation by using a bare `@ai_function`:
+
+```python
+@ai_function
+def summarize_meeting(transcripts: str) -> MeetingSummary:
+    """
+    Write a summary of the following meeting in less than 50 words.
+    <transcripts>
+    {transcripts}
+    </transcripts>
+    """
+```
+
+The two forms are equivalent. When a type is given in brackets it is always used, regardless of any return annotation; a bare `@ai_function` requires a return annotation to infer the output type from, and raises `TypeError` if none is present. The bracketed form is the one that type-checks cleanly, since a return annotation on the prompt function otherwise describes the value the function body returns.
+
+The following example builds a simple meeting-summarization workflow using structured output:
+
+```python
 from pydantic import BaseModel
 
 from ai_functions import ai_function
-from ai_functions.ai_thread import PostConditionResult
 
 
-# We start by defining the structured output type for our meeting-summarization
-# function. An AI function can return any data type: primitive (str, int, ...),
-# json-serializable (pydantic models), or general Python objects (numpy arrays,
-# dataframes, ...). The library takes care of the necessary conversions and
-# validation under the hood.
 class MeetingSummary(BaseModel):
     attendees: list[str]
     summary: str
     action_items: list[str]
 
 
-# Post-conditions can be any Python function validating the output...
-def check_length(response: MeetingSummary) -> None:
-    """Post-condition: summary must be less than 50 words."""
-    length = len(response.summary.split())
-    assert length < 50, f"Summary must be less than 50 words long, but is {length}."
-
-
-# ... or they can be AI functions, since AI functions *are* just functions.
-@ai_function(PostConditionResult)
-def check_style(response: MeetingSummary):
-    """
-    Check if the summary below satisfies the following criteria:
-    - It must use bullet points
-    - It must provide the reader with the necessary context
-
-    <summary>
-    {response.summary}
-    </summary>
-    """
-
-
-# Finally we define the main AI function, specifying the desired behavior both
-# through the prompt (generated automatically from the docstring using the
-# provided arguments) and the provided post-conditions. The library will ensure
-# the result passes all the requirements before returning it.
-@ai_function(MeetingSummary, post_conditions=[check_length, check_style], max_attempts=5)
+@ai_function[MeetingSummary]
 def summarize_meeting(transcripts: str):
     """
     Write a summary of the following meeting in less than 50 words.
@@ -114,172 +154,44 @@ def summarize_meeting(transcripts: str):
     """
 
 
-# `summarize_meeting` can now be called just like any other async function.
-async def main() -> None:
-    transcripts = "..."
-    # `meeting_summary` will be an instance of `MeetingSummary`.
-    meeting_summary = await summarize_meeting(transcripts)
-    print(meeting_summary)
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    transcripts = "[add your meeting transcripts here]"
+    meeting_summary = summarize_meeting.run_sync(transcripts)
+
+    print("=== Meeting Summary ===")
+    print("Attendees: " + ", ".join(meeting_summary.attendees))
+    print("Summary:\n" + meeting_summary.summary)
+    print("Action Items:")
+    for action_item in meeting_summary.action_items:
+        print(action_item)
 ```
 
-AI Functions are stateless by design: each call runs on a fresh thread and no history is kept between them. Some use cases need more — a chatbot accumulating turns, a team of agents that talk to each other, a long-running coordinator that fans out work. These call for AI Threads: live, stateful objects that stay alive across several calls and can interact with each other.
-
-### A stateful conversation
-
-The simplest way to keep state across calls is to spawn a single thread from an AI Function and reuse it. The handle returned by `spawn()` refers to a live thread on which every `run` accumulates history:
-
-```python
-import asyncio
-
-from ai_functions import ai_function
-
-
-@ai_function(str)
-def assistant(message: str):
-    """{message}"""
-
-
-async def main() -> None:
-    handle = await assistant.spawn()
-
-    r1 = await handle.run(message="What is the capital of France?")
-    print(f"Turn 1: {r1}")
-
-    # The agent sees the full conversation history from turn 1.
-    r2 = await handle.run(message="What about Germany?")
-    print(f"Turn 2: {r2}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-The function itself is unchanged from an ordinary AI Function; what is different is that the handle keeps its event log between calls, so the agent sees the full conversation on each subsequent `run`.
-
-### A team of AI Threads
-
-Several threads can also run side by side on the same coordinator and talk to each other. In the example below, we build a small two-agent team: a `researcher` thread specialized in looking up information, and a `writer` thread whose job is to produce short reports and that can delegate fact-finding to the researcher.
-
-```python
-import asyncio
-
-from ai_functions import ai_function
-from ai_functions.runtime import InMemoryCoordinator, LocalWorker
-from strands_tools import exa
-
-
-# `researcher` knows how to look things up on the web.
-@ai_function(str, tools=[exa])
-def researcher(topic: str):
-    """
-    Research the following topic on the web and return a concise factual
-    summary, citing the sources you used:
-
-    {topic}
-    """
-
-
-# `writer` is a short-form writer. The system prompt tells it about its
-# teammate; the `send_message` tool is injected automatically by the
-# coordinator and lets it ask the researcher follow-up questions.
-@ai_function(str)
-def writer(brief: str):
-    """ 
-    Write a short report based on the following brief: {brief}
-    
-    Work with a teammate named `researcher` (who has access to web search).
-    Send them messages on what to search, or follow-up messages to request
-    missing information. 
-    """
-
-
-async def main() -> None:
-    # The coordinator is the registry and router; the worker is the
-    # execution engine that actually runs the threads.
-    coord = InMemoryCoordinator()
-    worker = await LocalWorker(coord).register()
-
-    # Spawn one thread of each kind, on the same coordinator.
-    _ = await coord.spawn(researcher, thread_name="researcher")
-    writer_handle = await coord.spawn(writer, thread_name="writer")
-
-    # Kick off the writer. It will reach out to the researcher on its own,
-    # via the `send_message` tool, whenever it needs a fact.
-    report = await writer_handle.run(
-        brief="recent progress on room-temperature superconductors",
-    )
-    print(report)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-The following sections introduce, one at a time, the concepts used in the example above.
-
-## What this example illustrates
-
-Three objects appear in the example above, and each of them will be covered in detail in later sections:
-
-- **`InMemoryCoordinator`** — the registry and router. It keeps track of which threads exist, stores their event logs, and routes cross-thread operations. The `send_message` tool used by the writer is implemented in terms of a coordinator operation; so is `list_threads`.
-- **`LocalWorker`** — the execution engine. It owns the asyncio dispatcher task that drives each thread's cycles. A coordinator can have several workers registered with it, including remote ones; here both threads are hosted on the same local worker.
-- **`send_message` and `list_threads`** — tools that an `AIThread` gets automatically, so that an AI Thread can discover its peers and talk to them without any manual wiring. They are the LLM-facing form of operations that are also available to application code through the coordinator.
-
-The first example did not mention any of these. When an `AIFunction` is called directly (`await summarize_meeting(...)`), the library creates a private coordinator and worker, runs one cycle, and tears them down. This is convenient for one-shot calls, but as soon as more than one thread is involved the coordinator and the worker become explicit, as in the second example.
-
-## AI Functions
-
-An AI Function is the most common way to define a thread. This section covers the decorator in more depth: how the prompt is built, what return types are supported, how post-conditions work, and how the underlying agent is configured.
-
-### Return types
-
-AI Functions can return arbitrary data types, including primitive types (`str`, `int`, `float`), pydantic models, and native Python objects. The output type is the first positional argument of the decorator:
-
-```python
-from ai_functions import ai_function
-
-@ai_function(float)
-def calculator(expression: str):
-    """Evaluate the mathematical expression: {expression}"""
-```
-
-The library takes care of the necessary conversions and validation under the hood. Pydantic models are passed to the agent as a JSON schema and parsed back on return; primitive types are requested via a synthetic pydantic wrapper so the agent still answers through structured output. The `Quick Start` example uses a `MeetingSummary` pydantic model; the pattern is the same for every non-string return type.
-
-### Calling an AI Function
-
-The simplest way to invoke an AI Function is to `await` it directly:
-
-```python
-result = await calculator(expression="(3 + 5) * 2")
-```
-
-Each such call is a one-shot: a private coordinator and worker are created, the function runs one cycle on a fresh thread, and everything is torn down before the result is returned. No history is kept between calls — AI Functions are stateless. When the same conversation needs to be reused across several calls, the function can be spawned as an AI Thread instead; this is covered in [AI Threads](#ai-threads).
-
-`run_sync` can be used in a synchronous context:
-
-```python
-result = calculator.run_sync(expression="7 * 6")
-```
-
-### Post-conditions
+## Post-conditions
 
 A core notion of AI Functions is that programmers should not "prompt-and-pray" for the result returned by the agent to be correct. Rather, they should *verify* that the result satisfies the conditions required by their pipeline.
 
-To this end, AI Functions expose *post-conditions* as a fundamental component in defining AI Functions. Post-conditions are functions (both standard Python functions or other AI Functions) that validate the result and provide feedback to the agent. This automatically instantiates a self-correcting feedback loop ensuring the correctness of the final return value of the function.
+To this end, AI Functions expose *post-conditions* as a fundamental component. Post-conditions are functions — standard Python functions or other AI Functions — that validate the result and provide feedback to the agent. This automatically instantiates a self-correcting feedback loop ensuring the correctness of the final return value.
 
-The `Quick Start` example already showed both styles. A post-condition is any Python callable that returns `None` / `PostConditionResult(passed=True)` on success and either raises, returns `PostConditionResult(passed=False, message=...)`, or `assert`s on failure:
+The following example extends the meeting summary above with user-defined post-conditions:
 
 ```python
+from pydantic import BaseModel
+
+from ai_functions import ai_function
 from ai_functions.ai_thread import PostConditionResult
+
+
+class MeetingSummary(BaseModel):
+    attendees: list[str]
+    summary: str
+    action_items: list[str]
+
 
 # Post-conditions can be standard Python functions that raise an error if validation fails
 def check_length(response: MeetingSummary):
     length = len(response.summary.split())
     assert length <= 50, f"Summary should be less than 50 words, but is {length} words long"
+
 
 # Equivalently, the function can return a PostConditionResult object
 def check_length(response: MeetingSummary) -> PostConditionResult:
@@ -288,8 +200,9 @@ def check_length(response: MeetingSummary) -> PostConditionResult:
         return PostConditionResult(passed=False, message=f"Summary should be less than 50 words, but is {length} words long")
     return PostConditionResult(passed=True)
 
+
 # A post-condition can also be an AI Function, since AI Functions *are* just functions
-@ai_function(PostConditionResult)
+@ai_function[PostConditionResult]
 def check_style(response: MeetingSummary):
     """
     Check if the summary below satisfies the following criteria:
@@ -299,17 +212,29 @@ def check_style(response: MeetingSummary):
     {response.summary}
     </summary>
     """
+
+
+# Now we add the functions above as post-conditions validating the model output
+@ai_function[MeetingSummary](post_conditions=[check_length, check_style])
+def summarize_meeting(transcripts: str):
+    """
+    Write a summary of the following meeting in less than 50 words.
+    <transcripts>
+    {transcripts}
+    </transcripts>
+    """
 ```
 
-All post-conditions are checked in parallel. The agent receives a single message reporting all errors, and can address all of them at the same time, thus reducing the number of iterations necessary to converge to a correct output. The number of retries is bounded by `max_attempts` on the decorator (default 10).
+All post-conditions are checked in parallel. The agent receives a single message reporting all errors and can address all of them at the same time, reducing the number of iterations necessary to converge to a correct output. The number of retries is bounded by `max_attempts` on the decorator (default 10).
 
-Post-conditions are not limited to checking the answer of the agent. They can more generally enforce invariants about the state of the system after the agent's execution, and they can also consume one of the original input arguments by naming it in their signature. The example below shows how to implement a coding agent that verifies correctness of the implementation before moving on to new tasks.
+Post-conditions are not limited to checking the answer of the agent. They can more generally enforce invariants about the state of the system after the agent's execution, and they can consume one of the original input arguments by naming it in their signature. The example below implements a coding agent that verifies the correctness of its implementation before moving on to new tasks:
 
 ```python
 import io
-import pytest
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Literal, Any
+from typing import Any, Literal
+
+import pytest
 from pydantic import BaseModel
 
 from ai_functions import ai_function
@@ -332,7 +257,7 @@ def run_tests(_answer: Any, feature: FeatureRequest):
         raise RuntimeError(pytest_output)
 
 
-@ai_function(Literal["done"], post_conditions=[run_tests])
+@ai_function[Literal["done"]](post_conditions=[run_tests])
 def implement_feature(feature: FeatureRequest):
     """
     Implement the following feature in the current code base:
@@ -342,18 +267,85 @@ def implement_feature(feature: FeatureRequest):
 
     Once done the code base should pass the following tests: {feature.test_files}
     """
+
+
+def implement_all_features(features: list[FeatureRequest]):
+    for feature in features:
+        implement_feature.run_sync(feature)
 ```
 
-Note that we are telling the agent what tests to pass both in the prompt and as a post-condition which may feel redundant. However, agents are generally much more effective in responding to validation messages than they are at following the prompts. Moreover, this provides a strong guarantee to the user that if the pipeline terminates all required tests are indeed passing without any need of manual inspection.
+Note that we are telling the agent what tests to pass both in the prompt and as a post-condition, which may feel redundant. However, agents are generally much more effective in responding to validation messages than they are at following prompts. Moreover, this provides a strong guarantee to the user: if the pipeline terminates, all required tests are passing, without any need for manual inspection.
 
-### Providing instructions
+## Python integration
+
+AI agents are usually limited to working with serializable input-output types (strings, JSON objects, ...) rather than with native objects of the programming language. AI Functions, on the other hand, aim to provide a natural extension of the programming language itself, enabling new kinds of programming patterns and abstractions. In particular, agents can optionally be provided with a Python environment, allowing them to dynamically generate code to process arbitrary input data and return native Python objects.
+
+Consider, for example, a webapp that allows the user to upload an invoice in an arbitrary format (PDF, CSV, JSON, ...). The following snippet implements a "universal data loader": given the path to a file, the agent inspects its content, decides the appropriate processing pipeline, and returns a `DataFrame` in the desired format — validated by a post-condition. A second AI Function then applies a transformation that cannot be expressed in pure Python. See `examples/code_universal_loader.py` for a complete runnable implementation.
+
+```python
+from pandas import DataFrame, api
+
+from ai_functions import ai_function
+
+
+def check_invoice_dataframe(df: DataFrame):
+    """Post-condition: validate DataFrame structure."""
+    assert {"product_name", "quantity", "price", "purchase_date"}.issubset(df.columns)
+    assert api.types.is_integer_dtype(df["quantity"]), "quantity must be an integer"
+    assert api.types.is_float_dtype(df["price"]), "price must be a float"
+    assert api.types.is_datetime64_any_dtype(df["purchase_date"]), "purchase_date must be a datetime64"
+    assert not df.duplicated(subset=["product_name", "price", "purchase_date"]).any(), \
+        "The combination of product_name, price, and purchase_date must be unique"
+
+
+# code execution has to be explicitly enabled
+@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["pandas.*", "sqlite3", "json"], post_conditions=[check_invoice_dataframe])
+def import_invoice(path: str):
+    """
+    The file `{path}` contains purchase logs. Extract them in a DataFrame with columns:
+    - product_name (str)
+    - quantity (int)
+    - price (float)
+    - purchase_date (datetime)
+    """
+
+
+@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["pandas.*"], post_conditions=[check_invoice_dataframe])
+def fuzzy_merge_products(invoice: DataFrame):
+    """
+    Find product names that denote different versions of the same product, normalize them
+    by removing version suffixes and unifying spelling variants, update the product names
+    with the normalized names, and return a DataFrame with the same structure
+    (same number of rows and columns).
+    """
+
+
+# Load a JSON (the agent has to inspect the JSON to understand how to map it to a DataFrame)
+df = import_invoice.run_sync("data/invoice.json")
+print("Invoice total:", df["price"].sum())
+
+# Load a SQLite database (the agent will dynamically check the schema and generate
+# the necessary queries to read it and convert it to the desired format)
+df = import_invoice.run_sync("data/invoice.sqlite3")
+print(df)
+
+# Merge revisions of the same product
+df = fuzzy_merge_products.run_sync(df)
+```
+
+Currently AI Functions support only `"local"` execution, which creates a local Python environment (similar to a Jupyter notebook) for the agent to use. Execution in a safe remote sandboxed interpreter is a planned extension.
+
+> [!CAUTION]
+> The local execution environment attempts to restrict execution to explicitly allowed libraries and methods. However, executing Python code in a non-sandboxed environment is inherently unsafe. Please make sure you understand the risk, and consider running the code inside `docker` or another sandbox.
+
+## Providing instructions
 
 The instructions/prompt of an AI Function can be provided in two ways. The simplest is to specify the prompt as a docstring, as we have done until now:
 
 ```python
 from ai_functions import ai_function
 
-@ai_function(str)
+@ai_function[str]
 def translate(text: str, lang: str):
     """
     Translate the text below to the following language: `{lang}`.
@@ -361,14 +353,14 @@ def translate(text: str, lang: str):
     """
 ```
 
-The AI Function will interpret the docstring as a template and replace the placeholders using the provided arguments. This method however has limitations in some corner cases, for example if the docstring references a non-local variable. It also makes it difficult to construct prompts whose structure depends on the inputs.
+The AI Function interprets the docstring as a template and replaces the placeholders using the provided arguments. This method however has limitations in some corner cases, for example if the docstring references a non-local variable. It also makes it difficult to construct prompts whose structure depends on the inputs.
 
-Alternatively, we can construct the prompt inside the function and return it. In addition, the body of the function can also be used to perform input validation.
+Alternatively, we can construct the prompt inside the function and return it. The body of the function can then also be used to perform input validation:
 
 ```python
 from ai_functions import ai_function
 
-@ai_function(str)
+@ai_function[str]
 def translate(text: str, lang: str):
     assert text, "`text` cannot be empty"
     assert lang, "`lang` cannot be empty"
@@ -379,25 +371,31 @@ def translate(text: str, lang: str):
     """
 ```
 
-The preferred way is to return a `Template` (t-string, available since Python >= 3.14) like in the example above. This allows the AI Function to apply custom formatting logic to preserve the correct indentation when replacing multi-line values in the template. On older Python versions, a standard string can be returned, but the user has to take care of ensuring the string will have correct indentation to avoid confusing the agent with improper formatting.
+The preferred way is to return a `Template` (t-string, available since Python >= 3.14) like in the example above. This allows the AI Function to apply custom formatting logic to preserve the correct indentation when replacing multi-line values in the template. On Python 3.13, a standard string can be returned instead, but the user has to take care of ensuring the string has correct indentation, to avoid confusing the agent with improper formatting.
 
-Internally, the AI Function always executes the function with the provided arguments. If the function returns a string or a `Template`, it is used as the prompt to the agent. Otherwise, the library falls back to interpreting the docstring as a template.
+Internally, the AI Function always executes the function body with the provided arguments. If the body returns a string or a `Template`, that value is used as the prompt to the agent. Otherwise, the library falls back to interpreting the docstring as a template.
 
-### AI Function configuration
+## Configuration
 
-AI Functions use a Strands Agent in the backend. Any valid option of `strands.Agent` (such as `model`, `tools`, `system_prompt`) can be passed in the decorator. Alongside those, the decorator also accepts the thread-level fields `post_conditions`, `max_attempts`, `structured_output`, `thread_name`, `config_hook`, and `summarization_strategy` (see the API reference for the full list).
+AI Functions use a Strands Agent in the backend. Any valid option of `strands.Agent` (such as `model`, `tools`, `system_prompt`) can be passed in the decorator:
 
 ```python
-from ai_functions import ai_function
-from strands_tools import file_read, file_write
 from typing import Literal
 
-@ai_function(Literal["done"], tools=[file_read, file_write])
+from strands_tools import file_read, file_write
+
+from ai_functions import ai_function
+
+
+@ai_function[Literal["done"]](tools=[file_read, file_write])
 def summarize_file(path: str, output_path: str):
     """Read the file {path} and write a summary in {output_path}."""
 
-await summarize_file("report.md", output_path="summary.md")
+
+summarize_file.run_sync("report.md", output_path="summary.md")
 ```
+
+Alongside the agent options, the decorator also accepts thread-level fields such as `post_conditions`, `max_attempts`, `structured_output`, `thread_name`, `config_hook`, and `summarization_strategy` (see the API reference for the full list).
 
 To simplify maintaining and sharing configuration between different AI Functions, the same settings can be collected into a `ThreadConfig` object and reused:
 
@@ -406,6 +404,7 @@ from ai_functions import ai_function
 from ai_functions.ai_thread import ThreadConfig
 from strands_tools import http_request as web_search  # any tool will do here
 
+
 class Configs:
     FAST_MODEL = ThreadConfig(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
     RESEARCH = ThreadConfig(
@@ -413,46 +412,117 @@ class Configs:
         tools=(web_search,),
     )
 
+
 # reuse a config
-@ai_function(str, config=Configs.RESEARCH)
+@ai_function[str](config=Configs.RESEARCH)
 def research(topic: str):
     """Research the following topic and return a summary: {topic}"""
 
+
 # keyword arguments can be used to override config arguments for this specific function
-@ai_function(str, config=Configs.FAST_MODEL, tools=[web_search])
+@ai_function[str](config=Configs.FAST_MODEL, tools=[web_search])
 def quick_lookup(topic: str):
     """Look up the following topic and return a one-line summary: {topic}"""
 ```
 
-Configuration is covered in more detail in [Configuration](#configuration).
+When both `config=...` and explicit kwargs are given, the kwargs merge on top of the config: thread-level fields replace the corresponding field on the config, and the remaining kwargs (such as `system_prompt`, `hooks`, `state`) are forwarded to the underlying `strands.Agent`. This keeps the common case short while allowing arbitrary `strands.Agent` options to pass through unchanged.
 
-## AI Threads
-
-An AI Thread is the stateful counterpart of an AI Function. Calling an AI Function is a one-shot: each call runs on a fresh thread and no history is kept between them. When the same conversation history should be reused across several calls, the function can be `spawn`ed instead. The result is a `ThreadHandle`, a thin reference to a live thread on which every subsequent turn accumulates history.
+A bound AI Function can also be derived without redefining it: `fn.replace(**kwargs)` returns a new `AIFunction` whose config has been updated with the given kwargs. This is useful for building a family of variants (fast vs. thorough, local vs. remote model, different toolsets) without duplicating the prompt function:
 
 ```python
+fast_research = research.replace(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
+```
+
+Finally, `ThreadConfig.config_hook` is an optional callable invoked at the start of every cycle with the current `ThreadContext`; it returns overrides that are merged into the config for that cycle only. Typical uses are injecting cycle-specific tools or overriding the model based on runtime metadata. When a conversation grows past the model's context window, the history is automatically compacted; the compaction policy is pluggable through `ThreadConfig.summarization_strategy`.
+
+## Parallel workflows
+
+Because AI Functions are async-native, parallel workflows come for free with standard `asyncio` composition. In the example below, we write a report on the current trends of a given stock: first we run two research functions in parallel, then use their results to write the report (see `examples/compose_stock_report.py` for a more complete runnable version).
+
+```python
+import asyncio
+
+from pandas import DataFrame
+from strands_tools import exa as websearch_tool
+
 from ai_functions import ai_function
 
-@ai_function(str)
+
+@ai_function[str](tools=[websearch_tool])
+def research_news(stock: str):
+    """
+    Research and summarize the current news regarding the following stock: {stock}
+    """
+
+
+@ai_function[DataFrame](code_execution_mode="local", code_executor_additional_imports=["yfinance.*", "pandas.*"])
+def research_price(stock: str, past_days: int):
+    """
+    Use the `yfinance` Python package to retrieve the historical prices of {stock} in the last {past_days} days.
+    Return a dataframe with columns [date, price (float, price at market close)]
+    """
+
+
+@ai_function[str]
+def write_report(stock: str, news: str, prices: DataFrame):
+    """
+    Write and return a HTML report on the trend of the stock {stock} in the last 30 days.
+    Use the provided `prices` DataFrame and the following summary of recent news:
+    {news}
+    """
+
+
+async def stock_research_workflow(stock: str) -> str:
+    # Run the two agents in parallel
+    news, prices = await asyncio.gather(
+        research_news(stock),
+        research_price(stock, past_days=30),
+    )
+    # Use their results to write a report
+    return await write_report(stock, news, prices)
+
+
+if __name__ == "__main__":
+    print(asyncio.run(stock_research_workflow("AMZN")))
+```
+
+Note that nothing agent-specific is happening in `stock_research_workflow`: it is ordinary `asyncio` code, and every pattern that works with coroutines (gather, task groups, timeouts, semaphores for rate limiting) works with AI Functions unchanged.
+
+## AI Threads: adding state
+
+AI Functions are stateless: each call is a one-shot that runs on a fresh thread, and no history is kept between calls. Some use cases need more — a chatbot accumulating turns, an assistant that remembers the context it was given. For these, an AI Function can be `spawn`ed as an **AI Thread**: a live, stateful object that stays alive across several calls.
+
+`spawn()` returns a `ThreadHandle`, a thin reference to a live thread on which every subsequent `run` accumulates history:
+
+```python
+import asyncio
+
+from ai_functions import ai_function
+
+
+@ai_function[str]
 def assistant(message: str):
     """{message}"""
 
 
-async def main():
-    # spawn() creates a handle bound to its own private worker — no coordinator needed
+async def main() -> None:
     handle = await assistant.spawn()
 
     r1 = await handle.run(message="What is the capital of France?")
     print(f"Turn 1: {r1}")
 
-    # The agent sees the full conversation history from turn 1
+    # The agent sees the full conversation history from turn 1.
     r2 = await handle.run(message="What about Germany?")
     print(f"Turn 2: {r2}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-`handle.run(*args, **kwargs)` forwards arguments to the same prompt function used in the one-shot case, but the prior turns are present in the thread's event log and are reconstructed as message history on each subsequent cycle.
+The function itself is unchanged from an ordinary AI Function; what is different is that the handle keeps its event log between calls, so the agent sees the full conversation on each subsequent `run`.
 
-`run` enqueues work on the thread's FIFO queue and returns a future that resolves when the cycle completes. Multiple concurrent `run` calls on the same handle do not run in parallel: each call enqueues one `PromptRequest` behind any already pending, and the thread's dispatcher consumes them one at a time. This is true whether the calls come from the same task or from several tasks concurrently.
+`run` enqueues work on the thread's FIFO queue and returns a future that resolves when the cycle completes. Multiple concurrent `run` calls on the same handle do not run in parallel: each call enqueues one unit of work behind any already pending, and the thread consumes them one at a time.
 
 ### Forking
 
@@ -476,7 +546,7 @@ positive, negative = await asyncio.gather(
 )
 ```
 
-Both forks start from the same context turn, but their event logs then evolve independently — `positive` never sees what `pessimistic` asked, and vice versa. For threads whose only state is the event log (e.g. `AIThread`), forking is essentially free; threads that own external state (a subprocess, a remote session) are free to refuse — `fork` raises `NotImplementedError` for thread types that cannot support it.
+Both forks start from the same context turn, but their histories then evolve independently — `positive` never sees what `pessimistic` asked, and vice versa.
 
 ### Injecting messages
 
@@ -488,13 +558,11 @@ await handle.notify(
 )
 ```
 
-Note that `run` and `notify` are two independent primitives. `run(*args, **kwargs)` is the default path — it enqueues a unit of work on the thread's queue and returns a future for its typed result. `notify(text)` is a best-effort side channel: a text payload is handed to the thread with no guarantee about whether, when, or how it surfaces. The thread decides. In particular, `notify` does **not** start a cycle — an idle thread stays idle until the next `run`.
-
-Different thread types handle injected messages differently. An `AIThread` buffers the text and surfaces it as a system-style hint at the next model-call boundary of its next cycle — useful for attaching out-of-band context the LLM should consider without triggering a turn. Other thread types may ignore injections entirely. The contract is simply "here is some context for the thread"; the thread is free to use it as it sees fit.
+`run` and `notify` are two independent primitives. `run(*args, **kwargs)` is the default path — it enqueues a unit of work and returns a future for its typed result. `notify(text)` is a best-effort side channel: a text payload is handed to the thread with no guarantee about whether, when, or how it surfaces. In particular, `notify` does **not** start a cycle — an idle thread stays idle until the next `run`. An `AIThread` buffers the text and surfaces it as a system-style hint on its next turn, which is useful for attaching out-of-band context the LLM should consider.
 
 ### Lifecycle
 
-A handle exposes the thread's lifecycle as explicit methods. All of them are idempotent and safe to call from multiple tasks.
+A handle exposes the thread's lifecycle as explicit methods. All of them are idempotent and safe to call from multiple tasks:
 
 ```python
 # Current runtime-maintained status: NOT_STARTED, RUNNING, IDLE,
@@ -509,9 +577,7 @@ await handle.resume()
 # and continues to accept new work.
 await handle.cancel()
 
-# Schedule graceful termination behind currently-queued work. Items queued
-# ahead of the termination marker run to completion; items queued after it
-# are rejected.
+# Schedule graceful termination behind currently-queued work.
 await handle.terminate()
 
 # Tear the thread down immediately, cancelling any in-flight cycle and
@@ -519,11 +585,12 @@ await handle.terminate()
 await handle.terminate_now()
 ```
 
-## Coordinator and workers
+## Teams of agents: the coordinator and workers
 
-Calling an AI Function directly, or spawning a single handle with `fn.spawn()`, both rely on a private coordinator and worker created for the duration of the call. As soon as several threads need to coexist — whether because they run in parallel, talk to each other, or share rate-limit state — the coordinator and worker become explicit.
+Calling an AI Function directly, or spawning a single handle with `fn.spawn()`, both rely on a private coordinator and worker created behind the scenes for the duration of the call. As soon as several threads need to coexist — because they run in parallel, talk to each other, or share rate-limit state — these two objects become explicit:
 
-An `InMemoryCoordinator` is the authoritative broker: it keeps the registry of threads and workers, stores the event log, and routes every cross-thread operation. A `LocalWorker` is the execution engine that actually hosts threads and drives their cycles on an asyncio dispatcher task. A worker must register itself with a coordinator before it can host any thread.
+- An **`InMemoryCoordinator`** is the registry and router: it keeps track of which threads and workers exist, stores their event logs, and routes every cross-thread operation.
+- A **`LocalWorker`** is the execution engine: it hosts threads and drives their cycles on an asyncio dispatcher task. A worker must register itself with a coordinator before it can host any thread; a coordinator can have several workers registered, including remote ones (see [Distributed operation](#distributed-operation)).
 
 ```python
 from ai_functions.runtime import InMemoryCoordinator, LocalWorker
@@ -532,25 +599,19 @@ coord = InMemoryCoordinator()
 worker = await LocalWorker(coord).register()
 ```
 
-Once a worker is registered, threads are spawned through the coordinator:
+Once a worker is registered, threads are spawned through the coordinator. `coord.spawn(target, *, thread_name=None, parent_id=None, metadata=None, ...)` returns a `ThreadHandle`, exactly like `fn.spawn()`:
 
 ```python
 handle = await coord.spawn(my_function, thread_name="my_thread")
 ```
 
-`coord.spawn(target, *, thread_name=None, parent_id=None, metadata=None, ...)` takes any `Spawnable` and returns a `ThreadHandle`. The coordinator chooses a worker (the first registered one, by default), asks it to host the new thread, and returns the handle. `thread_name` is used for telemetry and for peer discovery via `list_threads` / `send_message`; `parent_id` attaches the new thread to a parent for hierarchical token rollup; `metadata` is opaque application data stored on `ThreadInfo`.
+`thread_name` is used for telemetry and for peer discovery; `parent_id` attaches the new thread to a parent for hierarchical token-usage rollup; `metadata` is opaque application data.
 
-Two protocols describe the thread contract:
-
-- A `Spawnable` is a factory for a thread: its only required method is `to_thread()`, which returns a live `Thread` instance. `AIFunction` is a `Spawnable`.
-- A `Thread` is the live, runnable instance the worker drives. It implements `execute(ctx, *args, **kwargs)` (run one cycle), `notify`, `fork`, `teardown`, and the result serialization helpers.
-
-The coordinator and the worker only ever see these two protocols. Users who need a thread type that is not `AIFunction` can write their own by implementing the two protocols; see [Custom Spawnables](#custom-spawnables).
-
-The following example runs a small research workflow with one planner, three researchers in parallel, and one synthesizer, all on the same coordinator.
+The following example runs a small research workflow with one planner, three researchers in parallel, and one synthesizer, all on the same coordinator:
 
 ```python
 import asyncio
+
 from pydantic import BaseModel
 
 from ai_functions import ai_function
@@ -561,17 +622,17 @@ class ResearchPlan(BaseModel):
     subtasks: list[str]
 
 
-@ai_function(ResearchPlan)
+@ai_function[ResearchPlan]
 def planner(topic: str):
     """Break down the research topic into 2-3 subtasks: {topic}"""
 
 
-@ai_function(str)
+@ai_function[str]
 def researcher(subtask: str):
     """Research this subtask thoroughly: {subtask}"""
 
 
-@ai_function(str)
+@ai_function[str]
 def synthesizer(findings: str):
     """Synthesize these findings into a summary:\n\n{findings}"""
 
@@ -610,44 +671,76 @@ async def main() -> None:
 
 `worker.close()` gracefully terminates every thread the worker hosts and deregisters the worker from the coordinator.
 
-> 💡 **AI Functions are one kind of thread, not the only one.**
-> `coord.spawn` accepts any `Spawnable`. The built-in `AIFunction` is the common case; users can define their own thread types by implementing the `Thread` and `Spawnable` protocols — see [Custom Spawnables](#custom-spawnables).
+In this example, all routing decisions were made by our Python code. But threads on the same coordinator can also find each other and communicate *on their own*, which is what turns a set of threads into a team.
 
-## Cross-thread messaging
-
-Threads hosted on the same coordinator can talk to each other. Two mechanisms are provided:
-
-- **`notify`** — code-facing best-effort side channel.
-- **`send_message` and `list_threads`** — LLM-facing tools injected by default into every `AIThread`.
-
-Both are built on the same coordinator operations.
-
-### Code-facing: `notify`
-
-From application code, a message can be routed to any registered thread through its handle:
-
-```python
-await handle.notify(
-    "[system hint] To run git commands, prefer `git -C <path>` over `cd`."
-)
-```
-
-As described in [AI Threads](#ai-threads), `notify` is a distinct primitive from `run`. It does not start a cycle and returns no result; the target thread decides whether and when to surface the message. The typical use is attaching out-of-band context that the LLM should consider on its next turn.
-
-### LLM-facing: `send_message` and `list_threads`
+### Cross-thread messaging
 
 Every `AIThread` is given two extra tools by default:
 
-- `list_threads()` returns a JSON-friendly snapshot of every thread registered with the coordinator, including an `is_self` flag marking the calling thread.
-- `send_message(thread_id, message, mode="wait")` is the LLM-facing form of `handle.run(message)`. It invokes the peer's typed entry point via the coordinator, which means the message is enqueued on the peer's work queue: if the peer is currently running, the message waits behind any already-pending work, and the peer will process it once its dispatcher is free. The peer must accept a single `str` prompt.
+- `list_threads()` returns a snapshot of every thread registered with the coordinator, including an `is_self` flag marking the calling thread.
+- `send_message(thread_id, message, mode="wait")` routes a message to a peer through the coordinator. The message is enqueued on the peer's work queue: if the peer is currently busy, the message waits behind any pending work.
+
+This is all it takes to build a two-agent team — a `researcher` that can search the web, and a `writer` that delegates fact-finding to it:
+
+```python
+import asyncio
+
+from strands_tools import exa
+
+from ai_functions import ai_function
+from ai_functions.runtime import InMemoryCoordinator, LocalWorker
+
+
+# `researcher` knows how to look things up on the web.
+@ai_function[str](tools=[exa])
+def researcher(topic: str):
+    """
+    Research the following topic on the web and return a concise factual
+    summary, citing the sources you used:
+
+    {topic}
+    """
+
+
+# `writer` is a short-form writer. The prompt tells it about its teammate;
+# the `send_message` tool is injected automatically by the coordinator and
+# lets it ask the researcher follow-up questions.
+@ai_function[str]
+def writer(brief: str):
+    """
+    Write a short report based on the following brief: {brief}
+
+    Work with a teammate named `researcher` (who has access to web search).
+    Send them messages on what to search, or follow-up messages to request
+    missing information.
+    """
+
+
+async def main() -> None:
+    coord = InMemoryCoordinator()
+    worker = await LocalWorker(coord).register()
+
+    # Spawn one thread of each kind, on the same coordinator.
+    _ = await coord.spawn(researcher, thread_name="researcher")
+    writer_handle = await coord.spawn(writer, thread_name="writer")
+
+    # Kick off the writer. It will reach out to the researcher on its own,
+    # via the `send_message` tool, whenever it needs a fact.
+    report = await writer_handle.run(
+        brief="recent progress on room-temperature superconductors",
+    )
+    print(report)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 `send_message` supports three modes:
 
 - `"wait"` (default): await the peer's cycle and return its reply as the tool's result. This blocks the sender's current cycle on the peer's cycle.
 - `"fire_and_forget"`: schedule the peer's cycle as a background task and return immediately. The peer's reply is discarded.
-- `"continue_then_receive"`: schedule the peer's cycle, return immediately, and when the peer completes, enqueue a fresh cycle on the sender with the peer's reply formatted as the user turn. This is the "dispatch-and-resume" pattern — the sender's current cycle ends promptly, freeing its dispatcher, and a follow-up cycle is kicked off automatically when the reply arrives.
-
-The diagram below shows the three modes side by side. In every case the message `B` receives is enqueued on its work queue; the difference is in what happens on the sender's side.
+- `"continue_then_receive"`: schedule the peer's cycle, return immediately, and when the peer completes, enqueue a fresh cycle on the sender with the peer's reply formatted as the user turn. This is the "dispatch-and-resume" pattern — the sender's current cycle ends promptly, and a follow-up cycle is kicked off automatically when the reply arrives.
 
 ```mermaid
 sequenceDiagram
@@ -688,18 +781,19 @@ sequenceDiagram
     end
 ```
 
-The `Quick Start` example already used `send_message` implicitly: the `writer` asked the `researcher` for information through it. For a complete runnable example that exercises all three modes, see `examples/05_two_workers_local.py`.
+Application code has an equivalent, code-facing side channel: `handle.notify(text)`, described in [AI Threads](#ai-threads-adding-state), routes out-of-band context to any registered thread without starting a cycle.
+
+For a complete runnable example exercising all three `send_message` modes, see `examples/team_two_workers_local.py`.
 
 ## Events and observability
 
-Every cross-thread operation goes through the coordinator as an event. Thread lifecycle transitions, user and assistant turns, tool calls, token usage, and cycle results are all emitted as `Event` objects, durably stored in the coordinator's log, and fanned out to any subscriber registered via `coordinator.on(...)`.
+Every cross-thread operation goes through the coordinator as an event. Thread lifecycle transitions, user and assistant turns, tool calls, token usage, and cycle results are all emitted as `Event` objects, durably stored in the coordinator's log, and fanned out to any subscriber.
 
-### Subscribing to events
-
-`coordinator.on(callback, *, thread_id=None, kinds=None)` registers a live subscriber for future events. The callback is invoked for every matching event appended after registration, until the returned `Subscription` is unsubscribed. `Subscription` is also usable as a context manager, which is the most common form:
+`coordinator.on(callback, *, thread_id=None, kinds=None)` registers a live subscriber for future events. The returned `Subscription` is also usable as a context manager:
 
 ```python
-from ai_functions.types import Event, CompletedEvent, FailedEvent, StartedEvent
+from ai_functions.types import CompletedEvent, Event, FailedEvent, StartedEvent
+
 
 def log_event(event: Event) -> None:
     match event:
@@ -712,6 +806,7 @@ def log_event(event: Event) -> None:
         case _:
             pass
 
+
 # Subscribe for the lifetime of the program.
 coord.on(log_event)
 
@@ -722,15 +817,9 @@ with coord.on(log_event, thread_id=handle.id):
 
 To inspect the stored log after the fact (for replay, for a UI that attaches late, for analysis), `coordinator.get_events(thread_id, ...)` returns the events for a thread in chronological order, with optional filters on `since_id`, `kinds`, and `limit`.
 
-### Event kinds
+Built-in events cover thread lifecycle (`STARTED`, `COMPLETED`, `FAILED`, `CANCELLED`, `RESULT`), conversation content (`MESSAGE_USER`, `MESSAGE_ASSISTANT_*`), tool activity (`TOOL_CALL`, `TOOL_RESULT`), tool approvals, session management, and token usage (`TOKEN_USAGE`). The full list and the fields carried by each kind are documented in the API reference under `ai_functions.types`.
 
-Built-in events cover thread lifecycle (`STARTED`, `COMPLETED`, `FAILED`, `CANCELLED`, `RESULT`), conversation content (`MESSAGE_USER`, `MESSAGE_ASSISTANT_START`, `MESSAGE_ASSISTANT_TOKEN`, `MESSAGE_ASSISTANT_THINKING`, `MESSAGE_ASSISTANT_COMPLETE`), tool activity (`TOOL_CALL`, `TOOL_RESULT`), tool approvals (`APPROVAL_REQUEST`, `APPROVAL_DECIDED`), session management (`SESSION_CREATED`, `SESSION_RESET`, `CONTEXT_SUMMARIZED`), and token usage (`TOKEN_USAGE`). The full list and the fields carried by each kind are documented in the API reference under `ai_functions.types`.
-
-Although the conversation events borrow Strands' content shapes (`ContentBlock`, `ToolResultContent`, and so on), the event log is a library-wide observability surface and is not tied to any single thread type. Custom thread implementations are expected to translate their own activity into the same event vocabulary so that observability (logs, UIs, metrics) works uniformly across thread types.
-
-### Custom events
-
-User code that emits its own event kinds can do so through `CustomEvent`:
+User code can emit its own event kinds through `CustomEvent`; any `kind` string outside the built-in enum is delivered to subscribers the same way built-in events are, making the event log a single place to aggregate observability data from both library internals and application code:
 
 ```python
 from ai_functions.types import CustomEvent
@@ -742,44 +831,280 @@ coord.append_event(CustomEvent(
 ))
 ```
 
-Any `kind` string outside the `EventKind` enum is routed to `CustomEvent`, and is delivered to subscribers the same way built-in events are. This makes the event log a single place to aggregate observability data from both library internals and application code.
+## Memory and optimization
+
+Just as PyTorch or JAX let you optimize parameters via backpropagation through a computation graph, AI Functions let you optimize agentic workflows via natural-language feedback propagation. You define named parameters — prompt fragments, learned facts, or reusable Python code — in a *memory schema*, store them in a memory backend, and pass them to your functions as ordinary arguments. After a run, you attach feedback to the output; the library traces that feedback back through the graph of agentic calls that produced it and updates each contributing parameter, so the next run recalls the improved values. Feedback also propagates across child threads: if a thread spawns a child during its execution, the feedback reaches the child and the child's memory.
+
+The feedback acts as the gradient and the parameters are the values being optimized, except both are expressed in natural language instead of numbers. *Procedural* parameters apply the same idea to code: the optimizer can store the Python an agent wrote to solve a task, so a later run reuses a working implementation instead of regenerating one from scratch — a form of JIT compilation for agentic logic.
+
+The system has three main pieces:
+
+1. A **memory backend** stores named parameters (strings, lists, or code) and exposes them through `recall` (full value), `search` (top-k matching entries), and `query` (question-answering over the content). Reads return a `ParameterView` — the value plus the metadata that links it into the graph — and are recorded into the consuming thread's event log.
+2. A **computation graph** records which parameters and results contributed to a given output. It is reconstructed after a run from the event logs, plus the dataflow edges `trace` discovers in the call arguments.
+3. An **optimizer** walks the computation graph backward from the feedback, determines which parameters are responsible and how they need to change, and consolidates the updates into the memory backend.
+
+### Quick example
+
+`trace()` runs a function exactly like a call, but returns a `Result` that remembers its provenance; `optimizer.step` then rebuilds the graph, backpropagates the feedback, and consolidates the updates — no coordinator or graph wiring:
+
+```python
+import asyncio
+
+from pydantic import BaseModel, Field
+
+from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function
+
+
+@ai_function[str]
+def write_summary(text: str, tone_guidelines: str):
+    """
+    Summarize the following text:
+    {text}
+
+    Follow these tone guidelines:
+    {tone_guidelines}
+    """
+
+
+# Memory parameters are described with a Pydantic schema: types, defaults, and
+# descriptions guide the optimizer in understanding what each parameter means.
+class WritingMemory(BaseModel):
+    tone_guidelines: str = Field(
+        "No specific guidelines yet.",
+        description="Guidelines for the tone of the writing",
+    )
+
+
+async def main() -> None:
+    # Both backends and optimizers are pluggable: subclass MemoryBackend or
+    # TextGradOptimizer to provide your own. The library ships with a file-based
+    # JSONMemoryBackend and a TextGrad-inspired optimizer.
+    memory = JSONMemoryBackend(WritingMemory, actor_id="user-1", path="memory.json")
+    optimizer = TextGradOptimizer()
+
+    # trace() runs the function and records which recalled parameters it
+    # consumed — passing the ParameterView as an argument wires the edge.
+    summary = await write_summary.trace(
+        text="some long document...",
+        tone_guidelines=await memory.recall("tone_guidelines"),
+    )
+    print(summary)
+
+    # Rebuild the graph, propagate the feedback backward, and consolidate the
+    # updates into memory. On the next run, the improved value is recalled.
+    await optimizer.step(
+        summary,
+        "The summary should be more concise and use bullet points.",
+        backends=[memory],
+    )
+    print(memory)
+
+    # Close the memory to flush the new values and release resources.
+    memory.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+See `examples/memory_optimization.py` for a full memory-optimization workflow on a multi-agent graph.
+
+For a worked end-to-end learning loop on DS-1000 code-generation problems, see `examples/memory_backprop_scipy.py`. It runs a three-step ablation: direct test with empty memory, train on 8 problems in parallel (gradients accumulated via `optimizer.backward`), then re-test with the trained memory. The shared `examples/_ds1000_utils.py` wraps the DS-1000 executor so execution failures flow into the optimizer feedback as rich context.
+
+### Memory backends
+
+A memory backend manages the storage, retrieval, and consolidation of parameters. The `MemoryBackend` base class handles all graph wiring — subclass it and implement the storage methods to build your own. The library ships with two implementations: `JSONMemoryBackend` (file-based) and `AgentCoreMemoryBackend` (backed by Amazon Bedrock AgentCore memory).
+
+Every backend manages a set of named parameters whose types, defaults, and metadata are defined through a Pydantic schema:
+
+```python
+from pydantic import BaseModel, Field
+
+from ai_functions.memory import Frozen, Procedural
+
+
+class MemorySchema(BaseModel):
+    # A regular string parameter — optimizable by default.
+    user_preferences: str = Field(
+        "No preferences known.",
+        description="Known facts and preferences about the user",
+    )
+
+    # A list parameter — each entry is a separate piece of knowledge.
+    learned_rules: list[str] = Field(
+        default_factory=list,
+        description="Rules learned from past interactions",
+    )
+
+    # A procedural parameter — stores reusable Python code.
+    helper_functions: Procedural
+
+    # A frozen parameter — recalled but not updated by the optimizer.
+    system_prompt: Frozen[str] = Field(
+        "You are a helpful assistant.",
+        description="Base system prompt (not optimized)",
+    )
+```
+
+The `description` on each field guides the optimizer in understanding what kind of content belongs in that parameter. `Procedural` parameters store Python functions that are loaded into the agent's code-execution environment; the optimizer can generate and refine that code from feedback. `Frozen` parameters are skipped during optimization (useful when the backend is used only for storage).
+
+Parameters can be retrieved in three ways. Each method is `async` and returns a `ParameterView` — an opaque wrapper carrying the value plus the metadata (name, backend, derivation) that links it into the computation graph:
+
+```python
+# Full recall — the entire parameter value.
+guidelines = await memory.recall("tone_guidelines")
+
+# Query — asks the backend to answer a question given the parameter content.
+answer = await memory.query("learned_rules", query="What do we know about date formatting?")
+
+# Search — the top-k matching entries (for list parameters).
+matches = await memory.search("learned_rules", query="formatting", k=3)
+```
+
+A view interpolates into f-strings and prompts like the plain value (`str(view)` is `str(view.value)`), and the runtime unwraps it automatically when it is passed to a function; use `.value` for the raw value. Passing the view itself as an argument — rather than an f-string of it — is what preserves the graph edge. Inside a running thread (e.g. a memory tool call), the read is recorded into that thread's event log immediately; outside one, `trace()` records it when the view is consumed.
+
+Each read also carries *derivation metadata* (`view.meta`, recorded into the recall event): the query, and — for `search` on the JSON backend — the stable `entry_id` of every returned entry. The optimizer feeds that context back into `consolidate`, so feedback on a run that searched a list updates exactly the entries the run retrieved: the JSON backend consolidates lists with an agentic memory manager that adds, updates, and deletes entries by id instead of rewriting the whole list.
+
+To keep handle-passing type-checked, annotate the receiving parameter with the `Traceable[T]` alias (`T | ParameterView[T] | Result[T]`):
+
+```python
+@ai_function[str]
+def write_summary(text: str, tone_guidelines: Traceable[str]):
+    """Summarize {text} following {tone_guidelines}."""
+```
+
+### Reconstructing the computation graph
+
+To propagate feedback back to parameters, the optimizer needs to know which parameters and function calls contributed to a given output. Most of that information lives in the event logs (every parameter read, every spawned child); the missing part — one function's output passed into another in plain Python — is discovered by `trace()`, which scans its arguments for `ParameterView` / `Result` handles:
+
+```python
+research = await researcher.trace(topic=topic, sources=await memory.recall("sources"))
+report = await report_writer.trace(research=research, style=await memory.recall("style"))
+
+# step() rebuilds the graph from the report's provenance (research becomes a
+# child node), walks it backward, and determines whether the issue originated
+# in the research or report-writing step before updating the parameters.
+await optimizer.step(report, "The report lacks specific citations.", backends=[memory])
+```
+
+For inspection, or when you manage threads by hand, the lower-level pieces remain available: `build_graph_from_result(result, backends)` returns the same graph `step` uses, and `build_graph(coord, thread_id, backends)` reconstructs one thread (recursing into children it spawned) from an explicit coordinator, with sibling edges wired by hand.
+
+### The optimizer
+
+Optimizers are pluggable: custom ones implement `backward` (propagate feedback through the graph) and `consolidate` (apply the accumulated feedback to memory). The shipped `TextGradOptimizer` takes a local approach loosely inspired by [TextGrad](https://arxiv.org/abs/2406.07496): it walks the graph backward node by node, using an LLM to distribute feedback from each result to its inputs until it reaches the leaf parameters. A global optimizer that reflects on the entire trace at once can be defined in the same way.
+
+```python
+optimizer = TextGradOptimizer(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+# One call: rebuild the graph from a traced result, backward, consolidate.
+graph = await optimizer.step(result, "The output should include more detail.", backends=[memory])
+
+# Or step by step, over a graph you built yourself:
+# 1. Backward: propagate feedback through the graph.
+optimizer.backward(node, "The output should include more detail.")
+
+# 2. Consolidate: apply accumulated feedback to each parameter's backend.
+optimizer.consolidate(node)
+
+# 3. (Optional) Zero grad: clear feedback for the next iteration.
+optimizer.zero_grad(node)
+```
+
+The steps are also exposed separately so you can inspect the propagated feedback before committing it, or accumulate feedback from multiple runs before consolidating. `backward` and `consolidate` operate on the same graph object — gradients accumulate on nodes built once, which is why `step` returns the graph it built.
+
+### Memory as a tool provider
+
+A memory backend can expose its parameters as tools that an agent calls dynamically during execution, letting the agent decide when and what to retrieve:
+
+```python
+from pydantic import BaseModel, Field
+
+from ai_functions import ai_function
+from ai_functions.memory import JSONMemoryBackend
+
+
+class TravelMemory(BaseModel):
+    preferences: str = Field(
+        default="Prefers warm destinations. Likes hiking and local food.",
+        description="Travel preferences and style of the user",
+    )
+    visited: list[str] = Field(
+        default=[
+            "Tokyo, Japan - loved the street food and temples",
+            "Barcelona, Spain - enjoyed the architecture and beaches",
+        ],
+        description="Places the user has visited with brief notes",
+    )
+
+
+memory = JSONMemoryBackend(TravelMemory, "traveler-1", path="travel.json")
+tools = memory.tool_provider("preferences", "visited")
+
+
+@ai_function[str](tools=[tools])
+def travel_assistant(request: str):
+    """You are a travel planning assistant with access to the user's travel memory.
+    Use the available tools to look up their preferences and past trips.
+
+    User request: {request}
+    """
+```
+
+`tool_provider` generates schema-scoped tools (`recall_<name>`, `query_<name>`, `search_<name>` for lists, and `save_<name>` / `delete_<name>` for scalars). You can restrict which operations are available — for example, `memory.tool_provider(..., operations={"recall", "search", "query"})` provides read-only access. See `examples/memory_tools.py` for a complete example.
 
 ## Distributed operation
 
-The previous sections assumed a single process: one coordinator, one or more workers, all running in the same Python interpreter. In practice, deployments often need to split these across machines — an AI platform running in the cloud, a client connecting to it from a developer laptop, a fleet of workers serving a shared pool of jobs.
+Everything so far assumed a single process: one coordinator and one or more workers in the same Python interpreter. Deployments often need to split these across machines — an AI platform running in the cloud, a client connecting to it from a developer laptop, a fleet of workers serving a shared pool of jobs.
 
-Before describing how the library supports this, it is worth spending a moment on the design.
+To do this, the in-process `InMemoryCoordinator` is replaced with a `CoordinatorClient` connected to a remote `CoordinatorEndpoint`. **The rest of the API is unchanged**: `spawn`, `run`, `send_message`, and event subscriptions behave identically whether the coordinator is local or remote.
 
-### The naive design and why it does not work
+The example below stands up an endpoint and connects two clients to it, each hosting one worker and one thread. Everything runs in a single process here, but every call still crosses the loopback WebSocket, so it exercises the same path a real deployment would use:
 
-The most natural first attempt is to make *everything* remote: one coordinator in the cloud, workers connect to it, client code issues operations over a network client that implements the `Coordinator` interface. Threads run wherever the platform decides; code on the client side never worries about placement.
+```python
+import asyncio
 
-This falls apart for several reasons:
+from ai_functions import ai_function
+from ai_functions.network import CoordinatorClient, CoordinatorEndpoint
+from ai_functions.runtime import LocalWorker
 
-- **Spawnables may not be serializable at all.** A user-defined `Spawnable` is a Python class instance. It may close over open database connections, file handles, in-memory caches, or other runtime objects that have no wire representation.
-- **Even when a spawnable is serializable, local captures may be meaningless on another machine.** A tool that reads from an in-process dictionary or mutates a module-level variable defined by the user has side effects on the user's process. Shipping the function to a remote worker would silently break the semantics: the function would still run, but it would read and write state on the wrong machine.
-- **A spawnable may legitimately need to live in the caller's process.** An orchestrator that queries a local database, reads a GPU-backed model, or coordinates other local resources must run in the process where those resources exist.
 
-A viable distributed design therefore has to satisfy three constraints at once:
+@ai_function[str](structured_output=False)
+def chat(message: str):
+    """{message}"""
 
-1. A worker hosting a thread with local captures must run in that same process, even if the coordinator is remote.
-2. Users must still be able to dispatch work to remote workers — the classic "worker pool" pattern where the AI workload runs on a server-side machine.
-3. Threads must not have to know which worker hosts a peer. Messaging, spawning children, and every other cross-thread operation must look the same locally and remotely.
 
-### The design: a symmetric tunnel
+async def main() -> None:
+    # The endpoint fronts an InMemoryCoordinator over a WebSocket.
+    endpoint = CoordinatorEndpoint()
+    await endpoint.start(host="127.0.0.1", port=9901)
 
-The library addresses these constraints with a single mechanism: a `CoordinatorEndpoint` ↔ `CoordinatorClient` tunnel.
+    # Two clients, each hosting one worker.
+    client_a = await CoordinatorClient.connect(endpoint.url)
+    worker_a = await LocalWorker(client_a, worker_id="worker-A").register()
 
-- `CoordinatorEndpoint` is a WebSocket server that fronts any `Coordinator` passed to its constructor (typically an `InMemoryCoordinator`). It accepts connections from clients, exposes every `Coordinator` method as an inbound RPC, and broadcasts events to every connected client.
-- `CoordinatorClient` is a `Coordinator` that connects to a remote coordinator through a `CoordinatorEndpoint` and forwards every request to it over the shared WebSocket. From the caller's perspective, a `CoordinatorClient` is just a `Coordinator`.
+    client_b = await CoordinatorClient.connect(endpoint.url)
+    worker_b = await LocalWorker(client_b, worker_id="worker-B").register()
 
-The tunnel is symmetric: when a client registers a `LocalWorker` on its side, the endpoint builds a shim that makes the worker's adapter methods look local to the endpoint's inner coordinator. The worker side of the shim turns every `WorkerAdapter` call into an outbound `worker.*` RPC on the shared channel. Each participant sees a local counterpart, and the wire is transparent:
+    # Spawn one thread on each worker. Both threads are visible from either
+    # client and from the endpoint, even though in a real deployment they
+    # would live in different processes.
+    alice = await client_a.spawn(chat, thread_name="alice")
+    bob = await client_b.spawn(chat, thread_name="bob")
 
-- A `LocalWorker` connected to a `CoordinatorClient` hosts threads in the client's process, but sees a `Coordinator` it can register with. That covers constraint (1).
-- The endpoint can route spawn requests to any of its connected workers, including workers that live entirely on the server side. That covers constraint (2).
-- Because every worker adapter on both sides implements the same protocol, the coordinator's routing table works the same whether the hosting worker is local or remote. That covers constraint (3).
+    relayed = await alice.run(
+        "Use send_message to ask bob 'What is the capital of Japan?' "
+        "with mode='wait'. Then report bob's reply verbatim.",
+    )
+    print(f"alice: {relayed.strip()}")
 
-The diagram below illustrates the two common deployments.
+    await worker_a.close()
+    await worker_b.close()
+    await client_a.close()
+    await client_b.close()
+    await endpoint.stop()
+```
+
+The only difference from the in-process version is the coordinator: `CoordinatorClient.connect(url)` in place of `InMemoryCoordinator()`. `alice` reaches `bob` through the same `send_message` tool it would use in a shared process, even though in a real deployment the two threads would run on different machines.
 
 **In-process deployment**
 
@@ -805,213 +1130,14 @@ flowchart LR
         Endpoint -->|fronts| Inner
         ServerWorker -->|register_worker| Inner
     end
-    Client <-->|"WebSocket: coordinator.* + worker.* RPC,<br/>event broadcasts"| Endpoint
+    Client <-->|"WebSocket: RPC + event broadcasts"| Endpoint
 ```
 
-### Spawning across the wire
-
-`Coordinator.spawn(target, ...)` on a `CoordinatorClient` sends the target and its arguments over the wire. Because the receiving worker may not share the caller's code base at all, plain `pickle` is not enough: it would assume the target class is importable by name on the other side. The library uses `cloudpickle` instead, which ships the closure itself alongside the type reference. The receiving worker still needs a compatible Python runtime, but does not need an identical package structure.
-
-For spawnables that cannot — or should not — survive serialization, `LocalWorker.spawn_locally(target, ...)` is the escape hatch. The target is passed by reference, never serialized; the thread is hosted on the local worker, and its handle is backed by whatever coordinator the worker is registered with (`InMemoryCoordinator`, `CoordinatorClient`, anything else implementing the protocol). This is exactly the path `AIFunction.__call__` and `AIFunction.spawn()` take internally — they always use `spawn_locally` so that the spawnable is never pickled for the simplest case.
-
-### A worked example
-
-The example below stands up a `CoordinatorEndpoint` and connects two clients to it. Each client hosts one `LocalWorker` and one thread. Everything runs in a single process here — the wire still carries every RPC through the loopback WebSocket, exercising the full symmetric channel machinery.
-
-```python
-import asyncio
-
-from ai_functions import ai_function
-from ai_functions.runtime import LocalWorker
-from ai_functions.network import CoordinatorClient, CoordinatorEndpoint
-
-
-@ai_function(str, structured_output=False)
-def chat(message: str):
-    """{message}"""
-
-
-async def main() -> None:
-    # The endpoint fronts an InMemoryCoordinator over a WebSocket.
-    endpoint = CoordinatorEndpoint()
-    await endpoint.start(host="127.0.0.1", port=9901)
-
-    # Two clients, each hosting one worker.
-    client_a = await CoordinatorClient.connect(endpoint.url)
-    worker_a = await LocalWorker(client_a, worker_id="worker-A").register()
-
-    client_b = await CoordinatorClient.connect(endpoint.url)
-    worker_b = await LocalWorker(client_b, worker_id="worker-B").register()
-
-    # Spawn one thread on each worker. Both threads are visible from either
-    # client and from the endpoint, even though they live in different
-    # processes in a real deployment.
-    alice = await client_a.spawn(chat, thread_name="alice")
-    bob = await client_b.spawn(chat, thread_name="bob")
-
-    relayed = await alice.run(
-        "Use send_message to ask bob 'What is the capital of Japan?' "
-        "with mode='wait'. Then report bob's reply verbatim.",
-    )
-    print(f"alice: {relayed.strip()}")
-
-    await worker_a.close()
-    await worker_b.close()
-    await client_a.close()
-    await client_b.close()
-    await endpoint.stop()
-```
-
-From the application's perspective, the only visible change relative to the in-process version is that `InMemoryCoordinator` has been replaced by `CoordinatorClient.connect(url)`. Everything else — `coord.spawn`, `handle.run`, `send_message`, event subscriptions — uses the same API.
-
-## Custom Spawnables
-
-Every thread in the library implements two protocols:
-
-- `Thread[**P, T]` — the live, runnable instance contract: `name`, `execute(ctx, *args, **kwargs)`, `notify`, `serialize_result`, `deserialize_result`, `fork`, `teardown`.
-- `Spawnable[**P, T]` — a factory for a thread: `to_thread()` returning a live `Thread` instance, plus an `input_shape` property used for peer discovery.
-
-`AIFunction` is the built-in implementation. Any class that satisfies these protocols can be hosted by a worker — there is nothing special about AI-backed threads. Writing a custom spawnable is the way to define orchestration logic that is not well-expressed as a single prompt, or that needs access to unserialized local state.
-
-### Orchestration in plain Python
-
-The following example defines a report-writing workflow as a custom spawnable. The workflow itself runs no LLM; it uses `ctx.coordinator` to spawn AI children for the steps that do.
-
-```python
-import asyncio
-from typing import Self
-
-from pydantic import BaseModel
-
-from ai_functions import ai_function
-from ai_functions.types import ThreadContext
-
-
-class AnalysisReport(BaseModel):
-    topic: str
-    sections: list[str]
-    word_count: int
-
-
-@ai_function(list[str])
-def outline_generator(topic: str):
-    """Generate 3 section titles for a report about: {topic}"""
-
-
-@ai_function(str)
-def section_writer(title: str, topic: str):
-    """Write a short section titled '{title}' for a report about: {topic}"""
-
-
-class ReportWorkflow:
-    """Plain Python orchestration — no LLM in this layer.
-
-    The outline generation and the section writing use AI. The coordinator
-    manages everything as threads with proper parent-child relationships and
-    token rollup.
-    """
-
-    name: str = "report_workflow"
-
-    def to_thread(self) -> Self:
-        # Already a live thread instance; the worker calls this at spawn.
-        return self
-
-    @property
-    def input_shape(self):
-        from ai_functions.types import InputShape
-        return InputShape.STRUCTURED
-
-    async def execute(self, ctx: ThreadContext, topic: str) -> AnalysisReport:
-        outline_handle = await ctx.coordinator.spawn(
-            outline_generator, parent_id=ctx.thread_id, thread_name="outline",
-        )
-        sections = await outline_handle.run(topic=topic)
-        await outline_handle.terminate_now()
-
-        writer_handles = [
-            await ctx.coordinator.spawn(
-                section_writer, parent_id=ctx.thread_id, thread_name=f"writer-{i}",
-            )
-            for i in range(len(sections))
-        ]
-        written = await asyncio.gather(*[
-            h.run(title=title, topic=topic)
-            for h, title in zip(writer_handles, sections, strict=True)
-        ])
-        await asyncio.gather(*[h.terminate_now() for h in writer_handles])
-
-        full_text = "\n\n".join(written)
-        return AnalysisReport(
-            topic=topic, sections=sections, word_count=len(full_text.split()),
-        )
-
-    async def notify(self, text: str) -> None:
-        del text  # workflow ignores injections
-
-    async def fork(self):
-        raise NotImplementedError
-
-    async def teardown(self) -> None:
-        pass
-
-    def serialize_result(self, result: AnalysisReport) -> str:
-        return result.model_dump_json()
-
-    def deserialize_result(self, payload: str) -> AnalysisReport:
-        return AnalysisReport.model_validate_json(payload)
-```
-
-The `ReportWorkflow` is itself a `Spawnable` (it implements `to_thread`) and a `Thread` (it implements the runtime surface). Spawning it produces a thread whose `execute` uses the coordinator to spawn AI children, gather their results, and return a typed value. Token usage from the children rolls up to the workflow's own thread thanks to `parent_id`.
-
-## Configuration
-
-AI Function behavior is controlled by a `ThreadConfig` dataclass. Every field of `ThreadConfig` can be set directly as a keyword argument on `@ai_function`, or collected into a reusable config and passed via `config=...`:
-
-```python
-from ai_functions import ai_function
-from ai_functions.ai_thread import ThreadConfig
-from strands_tools import http_request as web_search
-
-BASE = ThreadConfig(
-    model="global.anthropic.claude-sonnet-4-20250514-v1:0",
-    max_attempts=5,
-)
-
-@ai_function(str, config=BASE, tools=[web_search])
-def research(topic: str):
-    """Research the following topic and return a summary: {topic}"""
-```
-
-When both `config=...` and explicit kwargs are given, the kwargs merge on top of the config: fields listed in `ThreadKwargs` (such as `model`, `tools`, `post_conditions`, `max_attempts`, `structured_output`, `thread_name`, `config_hook`, `summarization_strategy`) replace the corresponding field on the config; the remaining kwargs (such as `system_prompt`, `hooks`, `state`, `callback_handler`) are forwarded to the underlying `strands.Agent` through `agent_kwargs`. This keeps the common case short while allowing arbitrary `strands.Agent` options to pass through unchanged.
-
-### Template variants with `replace`
-
-A bound `AIFunction` can be derived without redefining the function. `template.replace(**kwargs)` returns a new `AIFunction` whose config has been updated with the given kwargs:
-
-```python
-fast_research = research.replace(model="global.anthropic.claude-haiku-4-5-20251001-v1:0")
-```
-
-This is useful for building a family of variants (fast vs. thorough, local vs. remote model, different toolsets) without duplicating the prompt function.
-
-### Per-cycle overrides
-
-`ThreadConfig.config_hook` is an optional callable invoked at the start of every cycle with the current `ThreadContext`. It returns a `ThreadKwargs` dict that is merged into the config for that cycle only. Typical uses are injecting cycle-specific tools, overriding the model or system prompt based on runtime metadata, or attaching Strands hooks dynamically. The base `AIFunction` already installs a default `config_hook` that appends the `coordinator_tools` (the `list_threads` and `send_message` tools) to `cycle_config.tools`; user hooks stack on top of that.
-
-### Summarization
-
-When a thread's accumulated event log exceeds the model's context window, the library compacts the history by emitting a `ContextSummarizedEvent` whose payload is a shorter synthetic sequence of events; subsequent cycles render that payload in place of the events it replaces. The policy for how the compaction is performed is pluggable via `SummarizationStrategy`. `DefaultSummarizationStrategy` covers the common case; custom strategies can be supplied through `ThreadConfig.summarization_strategy` to change which events are preserved verbatim and which are folded into the synthetic summary.
+Note that a worker runs in the same process as the threads it hosts, and this is sometimes a requirement rather than a convenience: a thread may close over a database connection, a file handle, or an in-memory model that only exists on the caller's machine. The client-side worker lets such a thread run where its resources are while remaining reachable — as a full peer — through the shared coordinator. For details on how spawn targets are serialized across the wire (and how to avoid serialization entirely with `LocalWorker.spawn_locally`), see the [architecture documentation](architecture.md).
 
 ## Running agents across processes
 
-The `ai-functions` command-line tool and `ai_functions.serve` together let a
-user assemble a toolkit — or a team — of agents, each defined in its own
-script. A single machine-wide coordinator runs in the background; every agent
-script, started independently, connects to that coordinator on startup,
-registers itself, and becomes discoverable by every other agent. Peers find
-each other through the coordinator and talk via the same cross-thread messaging
-mechanism described earlier.
+The `ai-functions` command-line tool and `ai_functions.serve` together let a user assemble a toolkit — or a team — of agents, each defined in its own script. A single machine-wide coordinator runs in the background; every agent script, started independently, connects to that coordinator on startup, registers itself, and becomes discoverable by every other agent.
 
 Start the coordinator once:
 
@@ -1021,9 +1147,7 @@ ai-functions coordinator listening at ws://127.0.0.1:52115/rpc
 runtime file: …/ai_functions/coordinator.json
 ```
 
-Write each agent as a standalone script. `ai_functions.serve` registers the
-spawnable with the running coordinator and keeps the process alive until
-interrupted:
+Write each agent as a standalone script. `ai_functions.serve` registers the spawnable with the running coordinator and keeps the process alive until interrupted:
 
 ```python
 # alice.py
@@ -1031,7 +1155,7 @@ import ai_functions
 from ai_functions import ai_function
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def alice(message: str):
     """You are Alice. Bob knows geography; ask him when appropriate. {message}"""
 
@@ -1046,7 +1170,7 @@ import ai_functions
 from ai_functions import ai_function
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def bob(message: str):
     """You are Bob. Answer geography questions concisely. {message}"""
 
@@ -1062,10 +1186,9 @@ $ python alice.py
 $ python bob.py
 ```
 
-A script that does not call `serve` itself can still be hosted directly from
-the command line. `ai-functions run` loads a script, finds its `main`
-spawnable, hosts it on the running coordinator, and prints the new thread id
-and how to drive it:
+Alice and Bob are now hosted in separate processes, both registered with the same coordinator. Alice's `send_message` tool can locate Bob via `list_threads` and route a message to him; Bob's reply flows back through the same coordinator.
+
+A script that does not call `serve` itself can still be hosted directly from the command line: `ai-functions run` loads a script, finds its `main` spawnable, hosts it on the running coordinator, and prints the new thread id and how to drive it:
 
 ```bash
 $ ai-functions run alice.py
@@ -1075,15 +1198,7 @@ hosting 'main' as thread-a3f2…
   (Ctrl-C to stop)
 ```
 
-Alice and Bob are now hosted in separate processes, both registered with the
-same coordinator. Alice's `send_message` tool (installed by default on every
-`AIFunction`) can locate Bob by calling `list_threads` and route a message to
-him; Bob's reply flows back through the same coordinator.
-
-### CLI commands
-
-With agents running, the `ai-functions` command-line tool drives them from the
-terminal:
+With agents running, the `ai-functions` CLI drives them from the terminal:
 
 ```bash
 $ ai-functions ps
@@ -1107,110 +1222,13 @@ $ ai-functions kill thread-a3f2        # graceful terminate
 $ ai-functions kill thread-77c1 --now  # hard stop
 ```
 
-`submit` starts one cycle with the given prompt and blocks until it resolves,
-printing the typed result; `--json` enriches that with token usage and timing.
-`notify` is the side channel from [Cross-thread messaging](#cross-thread-messaging):
-it hands the thread a message without starting a cycle. `attach` opens a TUI
-with two views — a clean conversation view and a raw event view — so a long log
-stays readable.
+`submit` starts one cycle with the given prompt and blocks until it resolves; `--json` enriches the output with token usage and timing. `notify` is the side channel from [AI Threads](#ai-threads-adding-state): it hands the thread a message without starting a cycle. `attach` opens a TUI with two views — a clean conversation view and a raw event view — so a long log stays readable.
 
-## Under the hood
+## Going further
 
-This section is for readers who want to follow an operation through the library's internals. It traces four representative data flows — a local `run`, a remote `run`, a `send_message` between workers, and an event fan-out — end to end. No new APIs are introduced; every name below is defined in the preceding sections or in the API reference.
+This tutorial covered the user-facing surface of the library. Two more advanced topics are documented separately:
 
-### `await handle.run(...)` — local case
+- **Custom spawnables** — every thread in the library implements two small protocols, `Spawnable` (a factory producing a live thread) and `Thread` (the runtime surface the worker drives). `AIFunction` is the built-in implementation, but any class satisfying the protocols can be hosted by a worker. In particular, a custom spawnable can be a **plain-Python workflow that runs as a thread**: its `execute` contains no LLM call at all, but uses `ctx.coordinator` to spawn AI subagents, run them (in parallel with `asyncio.gather`, sequentially, or in any control flow Python can express), and return a typed result. Because the workflow is itself a thread, it gets everything threads get for free — a handle, lifecycle control, an event log, hierarchical token rollup from its children via `parent_id`, and reachability as a peer through `send_message`. This is the way to define orchestration logic that is not well expressed as a single prompt, or that needs access to unserialized local state. See the [architecture documentation](architecture.md#custom-spawnables) for the protocol details and a worked report-writing workflow.
+- **Under the hood** — a guided walk through the library's internals, tracing a local `run`, a remote `run`, a cross-worker `send_message`, and an event fan-out end to end. See the [architecture documentation](architecture.md#under-the-hood).
 
-A `ThreadHandle` holds a `thread_id` and a reference to the coordinator that owns it. `handle.run(*args, **kwargs)` delegates to `coordinator.submit(thread_id, *args, **kwargs)`, which looks up the hosting worker in its routing table and enqueues a `PromptRequest` on that worker's per-thread work queue. The call returns an `asyncio.Future` immediately; the cycle runs later on the worker's dispatcher task.
-
-The dispatcher task is an asyncio coroutine started when the thread is spawned. It awaits work from the queue, builds a fresh `ThreadContext` per cycle, emits a `StartedEvent`, and calls `thread.execute(ctx, *args, **kwargs)`. For an `AIThread`, `execute` renders the prompt (either from the docstring template or from the body's return value), appends it to the inject buffer, calls `_run_cycle(ctx)`, and returns the typed result.
-
-`_run_cycle` reconstructs the message history by calling `reconstruct_messages(await ctx.coordinator.get_events(ctx.thread_id))`, builds a Strands agent with the resolved cycle config, and invokes `agent.invoke_async(messages=messages)`. An event-bridge hook installed on the agent drains the inject buffer at the first `BeforeModelCallEvent`, emitting one `MESSAGE_USER` event per entry; assistant turns, tool calls, and tool results are emitted as the agent produces them. After the cycle completes, `_run_cycle` extracts the typed result, emits a `TOKEN_USAGE` event, runs all post-conditions in parallel, and either returns the result or retries (feeding failure messages back as additional `MESSAGE_USER` events) up to `max_attempts` times.
-
-Control returns to the dispatcher, which emits a `ResultEvent` carrying the serialized result followed by a `CompletedEvent`, and resolves the `PromptRequest`'s future with the typed value. The user's `await handle.run(...)` completes.
-
-```mermaid
-sequenceDiagram
-    participant User as User code
-    participant Handle as ThreadHandle
-    participant Coord as Coordinator
-    participant Worker as WorkerAdapter
-    participant Disp as Dispatcher task
-    participant Thread as Thread.execute
-    participant Agent as Strands agent
-
-    User->>Handle: run(*args)
-    Handle->>Coord: submit(tid, *args)
-    Coord->>Worker: submit(tid, args, kwargs)
-    Worker->>Disp: enqueue PromptRequest
-    Disp->>Coord: append_event(StartedEvent)
-    Disp->>Thread: execute(ctx, *args)
-    Thread->>Agent: invoke_async(messages)
-    Agent->>Coord: append_event(MESSAGE_* / TOOL_*)
-    Agent->>Thread: result
-    Thread->>Disp: typed result
-    Disp->>Coord: append_event(TOKEN_USAGE, RESULT, COMPLETED)
-    Disp-->>Handle: future resolves
-    Handle-->>User: return
-```
-
-### `await handle.run(...)` — remote case
-
-The API is identical to the local case; the path differs at the coordinator boundary. The handle's coordinator is a `CoordinatorClient` rather than an `InMemoryCoordinator`. `submit` cloudpickles `(args, kwargs)` into a `CallFrame` and sends it over the `WireChannel` to the `CoordinatorEndpoint` on the other side.
-
-On the endpoint, the frame is dispatched to the inner `InMemoryCoordinator`'s `submit`. The inner coordinator looks up the hosting worker: if the thread is hosted by a `LocalWorker` on the server side, the call enqueues a `PromptRequest` locally exactly as in the local case. If the thread is hosted by a worker that lives on a *different* connected client, the adapter stored for it is a `_RemoteWorkerAdapter` shim built when that client registered its worker; the shim turns the `submit` call into an outbound `worker.<wid>.submit` RPC on the shim's own `WireChannel` back to that client. The client-side worker's dispatcher runs the cycle; events produced during the cycle are appended to the client's coordinator (a `CoordinatorClient`), which translates each `append_event` into an outbound RPC to the endpoint, where the inner coordinator durably stores them and broadcasts them to every connected channel.
-
-When the cycle completes, the worker resolves the `PromptRequest`'s future; the shim turns the resolution into a `ResultFrame` back to the endpoint. The endpoint relays the result to the originating client as a `ResultFrame`; `CoordinatorClient.submit`'s awaitable resolves with the decoded value. The user's `await handle.run(...)` completes, with no visible difference from the local case.
-
-```mermaid
-sequenceDiagram
-    participant User as User code
-    participant Client as CoordinatorClient
-    participant Wire as WireChannel
-    participant Endpoint as CoordinatorEndpoint
-    participant Inner as InMemoryCoordinator
-    participant Shim as _RemoteWorkerAdapter
-    participant HW as Host client (worker side)
-
-    User->>Client: handle.run(*args)
-    Client->>Wire: CallFrame(coordinator.submit)
-    Wire->>Endpoint: frame
-    Endpoint->>Inner: submit(tid, args)
-    Inner->>Shim: submit(tid, args)
-    Shim->>HW: CallFrame(worker.<wid>.submit)
-    HW->>HW: dispatcher runs cycle
-    HW-->>Shim: ResultFrame
-    Shim-->>Inner: future resolves
-    Inner-->>Endpoint: relay result
-    Endpoint-->>Wire: ResultFrame
-    Wire-->>Client: frame
-    Client-->>User: return
-```
-
-### `send_message` between two threads on different workers
-
-When an `AIThread` cycle invokes `send_message(peer_id, "...", mode="wait")`, the tool closure reaches `ctx.coordinator` (captured at cycle start) and calls `ctx.coordinator.submit(peer_id, message)`. The coordinator looks up the peer's hosting worker in its routing table and enqueues a `PromptRequest` on that worker's queue. The tool awaits the returned future.
-
-If the peer lives on the same worker as the sender, the call never leaves the process. If the peer lives on a different worker — whether local, on a `LocalWorker` registered with the same coordinator, or remote, on a `CoordinatorClient`-fronted worker — the coordinator routes to the peer's adapter, which may be a local `LocalWorker` or a `_RemoteWorkerAdapter` shim. Either way, the peer's dispatcher runs the cycle, resolves the future, and the tool receives the typed result. For `mode="wait"`, the sender's cycle remains blocked on the future; for `mode="fire_and_forget"`, the tool discards the future and returns immediately; for `mode="continue_then_receive"`, the tool schedules a callback on the future that issues a fresh `coordinator.submit(sender_id, peer_reply)` when the peer completes, queuing a follow-up cycle on the sender.
-
-### An event reaches a UI subscriber
-
-An `append_event(event)` call goes through the coordinator's canonical path: the event is first durably stored in the per-thread log, then fanned out to every matching subscriber registered via `on(...)`. Subscribers are invoked synchronously one after another; a failure in one callback is logged and swallowed so the rest still receive the event (I11). If the event's `kind` is `TOKEN_USAGE`, the coordinator also updates its own per-thread pause signals so that rate-limited threads stop consuming work until the window refreshes.
-
-When the coordinator is an endpoint's inner coordinator, the fan-out additionally serializes each event as an `EventFrame` on every connected `WireChannel`. On the client side, the `CoordinatorClient` receives the `EventFrame` and dispatches it to its own local subscribers. The net effect is that any code that called `coord.on(callback)` receives matching events, regardless of whether the event was produced in the same process, by a worker on another client, or by a server-side `LocalWorker`.
-
-```mermaid
-sequenceDiagram
-    participant Producer as Event producer<br/>(dispatcher or hook)
-    participant Coord as InMemoryCoordinator
-    participant Wire as WireChannel (per client)
-    participant Client as CoordinatorClient
-    participant Sub as UI subscriber
-
-    Producer->>Coord: append_event(event)
-    Coord->>Coord: store in per-thread log
-    Coord->>Coord: update pause signals (TOKEN_USAGE)
-    Coord->>Sub: local callback
-    Coord->>Wire: EventFrame (fan-out)
-    Wire->>Client: frame
-    Client->>Sub: remote callback
-```
+The complete API surface is documented in the [API reference](https://strandsagents.com/latest/documentation/).

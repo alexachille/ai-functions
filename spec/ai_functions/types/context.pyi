@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -47,3 +49,29 @@ class ThreadContext:
 
     metadata: dict[str, object] = field(default_factory=lambda: dict[str, object]())
     """Application metadata (priority, etc.)."""
+
+
+@dataclass(frozen=True)
+class ThreadScope:
+    """The ambient ``(coordinator, thread_id)`` of the running thread."""
+
+    coordinator: Coordinator
+    thread_id: ThreadId
+
+
+@contextmanager
+def thread_scope(coordinator: Coordinator, thread_id: ThreadId) -> Iterator[ThreadScope]:
+    """Bind the ambient thread to ``(coordinator, thread_id)`` for the duration of a block."""
+
+
+def current_thread_scope() -> ThreadScope | None:
+    """Return the ambient :class:`ThreadScope`, or ``None`` outside any scope."""
+
+@contextmanager
+def no_thread_scope() -> Iterator[None]:
+    """Clear the ambient thread scope for the duration of a block.
+
+    Library-internal AI-function calls (memory query/consolidate helpers, the
+    optimizer's backward function) run inside this so they never attribute to
+    the user's running thread or pollute its event log.
+    """

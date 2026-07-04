@@ -29,7 +29,7 @@ from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 from ai_functions.types import WorkerId
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def chat(message: str):
     """{message}"""
 

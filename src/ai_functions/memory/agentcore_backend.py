@@ -6,6 +6,17 @@ long-term memory automatically, so ``_consolidate`` simply appends feedback as
 turns rather than running an explicit merge AI function (as ``JSONMemoryBackend``
 does).
 
+Error semantics: a *not-found* response from the service reads as "no records
+yet" (the parameter falls back to its schema default). Any other failure —
+auth, throttling, outage — propagates to the caller: silently reading an
+unreachable memory as empty would masquerade data loss as a default value.
+
+List storage: list values are written one item per message, so items
+round-trip individually. On read, each message text is additionally split on
+blank lines for compatibility with the legacy format (which joined all items
+into a single message); blank lines *inside* an item are collapsed on write so
+that split is unambiguous.
+
 ``bedrock-agentcore`` is an optional dependency: importing this module is cheap,
 but constructing :class:`AgentCoreMemoryBackend` raises ``ImportError`` if the
 package is not installed (``pip install strands-ai-functions[agentcore]``).
@@ -14,13 +25,15 @@ package is not installed (``pip install strands-ai-functions[agentcore]``).
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+from pydantic_core import PydanticUndefined
 from strands.models import Model
 
-from .base import MemoryBackend, ValueType
+from .base import MemoryBackend, ParameterMeta, ValueType
 from .json_backend import _query_value
 
 logger = logging.getLogger(__name__)
@@ -46,6 +59,47 @@ def _require_agentcore() -> Any:  # pyright: ignore[reportExplicitAny]
             "Install it with: pip install strands-ai-functions[agentcore]"
         ) from exc
     return acm
+
+
+def _reraise_unless_not_found(exc: Exception, op: str, actor_id: str) -> None:
+    """Re-raise ``exc`` unless it is a *not-found* error.
+
+    Not-found means the actor/session/namespace has no records yet — a
+    legitimate empty read for a parameter that was never written. Anything
+    else (auth, throttling, outage) is a real failure and must not be
+    mistaken for an empty memory.
+    """
+    code = ""
+    response = getattr(exc, "response", None)  # botocore ClientError shape
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", ""))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+    marker = f"{type(exc).__name__}:{code}"
+    if "NotFound" in marker or "404" in code:
+        logger.debug("%s for '%s': no records yet (%s)", op, actor_id, marker)
+        return
+    raise exc
+
+
+def _normalize_list_item(item: object) -> str:
+    """Collapse blank lines inside a list item and strip it.
+
+    A blank line is the item separator in the legacy format that ``_recall``
+    still accepts, so an item must not contain one; collapsing (rather than
+    failing) keeps saves total while making the separator unambiguous.
+    """
+    return re.sub(r"\n\s*\n+", "\n", str(item)).strip()
+
+
+def _rank_by_query(texts: list[str], query: str) -> list[str]:
+    """Order ``texts`` by BM25 relevance to ``query`` (most relevant first)."""
+    if len(texts) < 2:
+        return texts
+    from rank_bm25 import BM25Okapi
+
+    bm25 = BM25Okapi([t.lower().split() for t in texts])
+    scores = bm25.get_scores(query.lower().split())  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    ranked = sorted(zip(texts, scores, strict=True), key=lambda pair: pair[1], reverse=True)  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType, reportUnknownLambdaType]
+    return [text for text, _ in ranked]  # pyright: ignore[reportUnknownVariableType]
 
 
 def _extract_event_texts(events: list[Any]) -> list[str]:  # pyright: ignore[reportExplicitAny]
@@ -175,8 +229,8 @@ class AgentCoreMemoryBackend(MemoryBackend):
         self._query_value_fn = _query_value.replace(model=model)
 
     def _validate_no_procedural_fields(self) -> None:
-        """Raise if the schema contains any Procedural field (unsupported here)."""
-        for field_name in self.schema.model_fields:
+        """Raise if the schema contains any Procedural field, however nested."""
+        for field_name in self._leaf_parameter_names():
             if self._is_procedural(field_name):
                 raise ValueError(
                     f"AgentCoreMemoryBackend does not support Procedural fields. "
@@ -200,78 +254,135 @@ class AgentCoreMemoryBackend(MemoryBackend):
     def _retrieve_raw(
         self, actor_id: str, query: str | None = None, top_k: int = MAX_MEMORY_RECORDS
     ) -> tuple[list[Any], list[Any]]:  # pyright: ignore[reportExplicitAny]
-        """Fetch raw STM events and LTM records for an actor, balanced to ``top_k``."""
+        """Fetch raw STM events and LTM records for an actor, balanced to ``top_k``.
+
+        A not-found response from either store reads as empty (the parameter
+        has no records yet); any other failure propagates — see the module
+        docstring for the error semantics.
+        """
         session = self._get_session(actor_id)
         ns = f"/{actor_id}/"
         half_k = top_k // 2
 
+        stm_events: list[Any] = []  # pyright: ignore[reportExplicitAny]
         try:
             stm_events = session.list_events(include_payload=True, max_results=top_k)[::-1]
-        except Exception as e:  # noqa: BLE001 - external service; degrade gracefully
-            logger.warning("retrieve STM error for '%s': %s: %s", actor_id, type(e).__name__, e)
-            stm_events = []
+        except Exception as e:  # noqa: BLE001 — not-found reads as empty; the rest re-raises
+            _reraise_unless_not_found(e, "list STM events", actor_id)
 
         ltm_quota = top_k - min(len(stm_events), half_k)
+        ltm_records: list[Any] = []  # pyright: ignore[reportExplicitAny]
         try:
             ltm_records = (
                 session.search_long_term_memories(query=query, namespace_prefix=ns, top_k=ltm_quota)
                 if query is not None
                 else self.manager.list_long_term_memory_records(namespace_prefix=ns, max_results=ltm_quota)
             )
-        except Exception as e:  # noqa: BLE001 - external service; degrade gracefully
-            logger.warning("retrieve LTM error for '%s': %s: %s", actor_id, type(e).__name__, e)
-            ltm_records = []
+        except Exception as e:  # noqa: BLE001 — not-found reads as empty; the rest re-raises
+            _reraise_unless_not_found(e, "read LTM records", actor_id)
 
         stm_take = min(len(stm_events), half_k)
         ltm_take = min(len(ltm_records), top_k - stm_take)
         return stm_events[:stm_take], ltm_records[:ltm_take]
 
     def _save(self, name: str, value: ValueType) -> None:
-        """Replace the stored value of a parameter."""
+        """Replace the stored value of a parameter.
+
+        Replacement is delete-then-write. The delete is strict — a failure
+        raises rather than silently leaving the old records to be concatenated
+        with the new value on recall — but is not awaited (AgentCore deletion
+        is eventually consistent; use :meth:`delete` for a blocking reset).
+
+        List values are stored one item per message so items round-trip
+        individually; blank lines inside an item are collapsed (they are the
+        item separator in the legacy format ``_recall`` still accepts).
+        """
         acm = _require_agentcore()
         actor = self._parameter_actor(name)
-        self._delete_records(name, wait=False)
+        self._delete_records(name, wait=False, strict=True)
 
-        text = "\n\n".join(value) if isinstance(value, list) else str(value)
+        if isinstance(value, list):
+            items = [text for v in value if (text := _normalize_list_item(v))] or [""]
+        else:
+            items = [str(value)]
         session = self._get_session(actor)
         session.add_turns(
-            messages=[acm.constants.ConversationalMessage(text, acm.constants.MessageRole.USER)],
+            messages=[acm.constants.ConversationalMessage(item, acm.constants.MessageRole.USER) for item in items],
             metadata={"type": {"stringValue": "parameter"}, "name": {"stringValue": name}},
             event_timestamp=datetime.now(UTC),
         )
 
-    def _recall(self, name: str) -> ValueType:
-        """Return a parameter's value, concatenated from STM events and LTM records."""
+    def _default_value(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
+        """Return the schema default for ``name`` (nested paths supported).
+
+        Reads the field definition directly instead of instantiating the
+        schema, so schemas with required fields work.
+
+        Raises:
+            ValueError: The parameter has no records and no schema default.
+        """
+        default = self._resolve_field(name).get_default(call_default_factory=True)
+        if default is PydanticUndefined:
+            raise ValueError(
+                f"Parameter '{name}' has no stored records and no schema default "
+                f"(the field is required). Save a value before recalling it."
+            )
+        return default  # pyright: ignore[reportAny]
+
+    def _recall(self, name: str) -> tuple[ValueType, ParameterMeta]:
+        """Return ``(value, meta)`` from STM events and LTM records.
+
+        Supports nested ``a/b`` paths; the empty-memory default comes from the
+        field definition, not a schema instance. The meta reports how many
+        short-term and long-term records contributed to the value.
+        """
         actor = self._parameter_actor(name)
         events, records = self._retrieve_raw(actor, query=None, top_k=MAX_MEMORY_RECORDS)
         all_texts = _extract_event_texts(events) + _extract_record_texts(records)
+        meta: ParameterMeta = {"stm_count": len(events), "ltm_count": len(records)}
 
-        instance = self.schema()
-        default_value = getattr(instance, name)
         if not all_texts:
-            return default_value
+            return self._default_value(name), meta  # pyright: ignore[reportAny]
+        if self._is_list_field(name):
+            # One item per message for new writes; a legacy message may hold
+            # several items joined by blank lines — split those too.
+            return [part.strip() for text in all_texts for part in text.split("\n\n") if part.strip()], meta
+        return "\n\n".join(all_texts), meta
 
-        concatenated = "\n\n".join(all_texts)
-        if isinstance(default_value, list):
-            return [item.strip() for item in concatenated.split("\n\n") if item.strip()]
-        return concatenated
+    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> tuple[list[str], ParameterMeta]:  # pyright: ignore[reportExplicitAny]
+        """Return ``(top_k_texts, meta)`` most relevant to ``query`` for a parameter.
 
-    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> list[str]:  # pyright: ignore[reportExplicitAny]
-        """Return the top-k texts most relevant to ``query`` for a parameter."""
+        LTM search is semantic (service-side). STM events arrive newest-first
+        regardless of the query, so the retrieved window is re-ranked against
+        the query with BM25 before merging. AgentCore records have no stable
+        entry ids, so the meta carries counts only (no ``results`` mapping).
+        """
         actor = self._parameter_actor(name)
         events, records = self._retrieve_raw(actor, query=query, top_k=k)
-        return _extract_event_texts(events) + _extract_record_texts(records)
+        stm_texts = _rank_by_query(_extract_event_texts(events), query)
+        texts = (stm_texts + _extract_record_texts(records))[:k]
+        return texts, {"stm_count": len(events), "ltm_count": len(records)}
 
-    def _query(self, name: str, query: str) -> str:
-        """Answer ``query`` over the most relevant content for a parameter."""
-        relevant_texts = self._search(name, query, k=10)
+    def _query(self, name: str, query: str) -> tuple[str, ParameterMeta]:
+        """Answer ``query`` over the most relevant content, as ``(answer, meta)``."""
+        relevant_texts, meta = self._search(name, query, k=10)
         if not relevant_texts:
-            return ""
+            return "", meta
         content = "\n\n".join(relevant_texts)
-        return self._query_value_fn.run_sync(value=content, query=query)
+        return self._query_value_fn.run_sync(value=content, query=query), meta
 
-    def _consolidate(self, name: str, feedback: list[str], **kwargs: Any) -> None:  # pyright: ignore[reportExplicitAny]
+    def _consolidate(
+        self,
+        name: str,
+        feedback: list[str],
+        retrieved: dict[str, str] | None = None,
+        **kwargs: Any,  # pyright: ignore[reportExplicitAny]
+    ) -> None:
         """Append feedback as conversation turns for AgentCore to consolidate.
+
+        ``retrieved`` is accepted for contract compatibility but unused:
+        AgentCore's semantic strategy decides itself which memories the
+        feedback turns update.
 
         Unlike :class:`JSONMemoryBackend` (which runs an explicit merge AI
         function), AgentCore's semantic-memory strategy extracts and
@@ -299,7 +410,7 @@ class AgentCoreMemoryBackend(MemoryBackend):
             return len(events), len(records)
 
         total_stm, total_ltm = 0, 0
-        for field_name in self.schema.model_fields:
+        for field_name in self._leaf_parameter_names():
             stm, ltm = self.record_counts(field_name)
             total_stm += stm
             total_ltm += ltm
@@ -315,31 +426,44 @@ class AgentCoreMemoryBackend(MemoryBackend):
 
     def delete_all(self, wait: bool = False) -> None:
         """Delete every field's memories for this actor (fire-and-forget by default)."""
-        for field_name in self.schema.model_fields:
+        for field_name in self._leaf_parameter_names():
             self._delete_records(field_name, wait=False)
         if wait:
-            for field_name in self.schema.model_fields:
+            for field_name in self._leaf_parameter_names():
                 self._wait_until_empty(field_name)
 
-    def _delete_records(self, name: str, wait: bool = True) -> None:
-        """Delete all STM events and LTM records for a parameter."""
+    def _delete_records(self, name: str, wait: bool = True, strict: bool = False) -> None:
+        """Delete all STM events and LTM records for a parameter.
+
+        Args:
+            name: Parameter name (slash-separated for nested fields).
+            wait: Block until the records are observably gone.
+            strict: Re-raise deletion failures instead of logging them.
+                ``_save`` deletes strictly: replacing a value must not
+                silently leave old records behind, or they would be
+                concatenated with the new value on the next recall.
+        """
         actor = self._parameter_actor(name)
         ns = f"/{actor}/"
         events, records = self._retrieve_raw(actor, query=None, top_k=MAX_MEMORY_RECORDS)
         if not events and not records:
             return
 
-        for eid in (e.get("eventId") for e in events):
+        for eid in (e.get("eventId") for e in events):  # pyright: ignore[reportAny]
             if eid:
                 try:
                     self.manager.delete_event(actor_id=actor, session_id=self.session_id, event_id=eid)
-                except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                except Exception as e:  # noqa: BLE001 - best-effort cleanup unless strict
+                    if strict:
+                        raise
                     logger.warning("Failed to delete STM event '%s': %s", eid, e)
 
         if records:
             try:
                 self.manager.delete_all_long_term_memories_in_namespace(namespace=ns)
-            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup unless strict
+                if strict:
+                    raise
                 logger.warning("Failed to bulk delete LTM records in '%s': %s", ns, e)
 
         if wait:
@@ -363,8 +487,18 @@ class AgentCoreMemoryBackend(MemoryBackend):
         logger.info("AgentCoreMemoryBackend closed (memory_id: %s)", self.memory_id)
 
     def __str__(self) -> str:
-        """Return a YAML representation of the current memory state."""
+        """Return a YAML representation of the current memory state.
+
+        Keys are leaf parameter paths (slash-separated for nested fields).
+        Values are the recalled parameter contents; the schema is not
+        instantiated, so schemas with required fields render too.
+        """
         from ..optimizer._formatting import to_yaml
 
-        data: dict[str, ValueType] = {field_name: self._recall(field_name) for field_name in self.schema.model_fields}
-        return to_yaml(self.schema(**data).model_dump())
+        data: dict[str, ValueType] = {}
+        for name in self._leaf_parameter_names():
+            try:
+                data[name] = self._recall(name)[0]
+            except ValueError:  # required field with no records — render, don't raise
+                data[name] = "<unset — required field with no records>"
+        return to_yaml(data)

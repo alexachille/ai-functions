@@ -74,7 +74,7 @@ class ThreadKwargs(TypedDict, total=False):
     post_conditions: list[PostCondition]
     max_attempts: int
     structured_output: bool
-    code_execution_mode: CodeExecutionMode
+    code_execution_mode: CodeExecutionMode | str
     code_executor_additional_imports: list[str]
     code_executor_kwargs: dict[str, Any]
     agent_kwargs: AgentKwargs
@@ -116,11 +116,12 @@ class ThreadConfig:
     """Whether to use structured output mode (agent has to call a tool to
     provide an answer). Can be ``False`` only if the output type is ``str``."""
 
-    code_execution_mode: CodeExecutionMode = CodeExecutionMode.DISABLED
+    code_execution_mode: CodeExecutionMode | str = CodeExecutionMode.DISABLED
     """Whether the agent may execute Python via a sandboxed ``python_executor``
     tool. ``DISABLED`` (default) relies on structured output; ``LOCAL`` adds a
     smolagents-backed executor seeded with the cycle's bound arguments and lets
-    the agent return its answer via ``final_answer(...)`` in executed code."""
+    the agent return its answer via ``final_answer(...)`` in executed code.
+    Accepts the enum or its string value (``"local"`` / ``"disabled"``)."""
 
     code_executor_additional_imports: list[str] = field(default_factory=list)
     """Modules the ``python_executor`` sandbox may import beyond ``SAFE_BUILTINS``

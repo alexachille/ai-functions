@@ -53,6 +53,7 @@ from .wire_methods import (
     CopyEventsParams,
     DeregisterThreadParams,
     DeregisterWorkerParams,
+    ForkParams,
     GetEventsParams,
     GetThreadInfoParams,
     GetThreadStatusParams,
@@ -422,8 +423,8 @@ class CoordinatorHandlers:
         await self._coord.terminate_now(p.thread_id)
 
     @rpc_method("coordinator.fork")
-    async def fork(self, p: ThreadIdOnlyParams) -> str:
-        handle = await self._coord.fork(p.thread_id)
+    async def fork(self, p: ForkParams) -> str:
+        handle = await self._coord.fork(p.thread_id, parent_id=p.parent_id)
         return str(handle.id)
 
     # ── Approvals ──

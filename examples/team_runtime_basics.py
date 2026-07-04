@@ -21,18 +21,19 @@ class ResearchPlan(BaseModel):
 
 
 # These single-purpose agents don't message peers, so we disable the default
-# coordinator tools (``list_threads`` / ``send_message``; see examples 05/06).
-@ai_function(ResearchPlan, coordinator_tools_enabled=False)
+# coordinator tools (``list_threads`` / ``send_message``; see the
+# ``team_two_workers_local.py`` / ``team_two_workers_remote.py`` examples).
+@ai_function[ResearchPlan](coordinator_tools_enabled=False)
 def planner(topic: str):
     """Break down the research topic into 2-3 subtasks: {topic}"""
 
 
-@ai_function(str, coordinator_tools_enabled=False)
+@ai_function[str](coordinator_tools_enabled=False)
 def researcher(subtask: str):
     """Research this subtask thoroughly: {subtask}"""
 
 
-@ai_function(str, coordinator_tools_enabled=False)
+@ai_function[str](coordinator_tools_enabled=False)
 def synthesizer(findings: str):
     """Synthesize these findings into a summary:\n\n{findings}"""
 

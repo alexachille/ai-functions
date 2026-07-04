@@ -37,7 +37,7 @@ from ai_functions.testing import (
 from ai_functions.types import EventKind
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def _text_only(prompt: str) -> str:
     return prompt
 
@@ -54,7 +54,7 @@ def _mul(a: int, b: int) -> int:
     return a * b
 
 
-@ai_function(str, structured_output=False, tools=[_add, _mul])
+@ai_function[str](structured_output=False, tools=[_add, _mul])
 def _with_tools(prompt: str) -> str:
     return prompt
 
@@ -166,7 +166,7 @@ def _boom(x: int) -> int:
     raise ValueError("kaboom")
 
 
-@ai_function(str, structured_output=False, tools=[_boom])
+@ai_function[str](structured_output=False, tools=[_boom])
 def _with_failing_tool(prompt: str) -> str:
     return prompt
 

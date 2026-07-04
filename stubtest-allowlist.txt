@@ -1,11 +1,24 @@
 # PEP 695 generics create __type_params__ at runtime; not representable in stubs
 ai_functions.ai_thread.ai_function.AIFunction.__type_params__
+ai_functions.ai_thread.ai_function._TypedDecorator.__type_params__
 ai_functions.ai_thread.ai_thread.AIThread.__type_params__
 ai_functions.ai_thread.ai_thread.OutputSpec.__type_params__
 ai_functions.handle.ThreadHandle.__type_params__
 ai_functions.runtime.worker.PromptRequest.__type_params__
 ai_functions.protocols.Spawnable.__type_params__
 ai_functions.protocols.Thread.__type_params__
+ai_functions.types.graph.ParameterView.__type_params__
+ai_functions.types.graph.Result.__type_params__
+
+# ai_function is an optional-first-argument decorator factory: it can be
+# applied bare (@ai_function[T]) or called with config (@ai_function[T](...)),
+# so the runtime __call__ must accept prompt_fn as an optional first
+# positional. stubtest synthesises its comparison signature from the
+# overloads (where prompt_fn is required) and flags the mandatory runtime
+# ``= None`` default. The overloads describe the true API; the runtime
+# default is a false positive of that synthesis.
+ai_functions.ai_thread.ai_function._TypedDecorator.__call__
+ai_functions.ai_thread.ai_function._AIFunctionFactory.__call__
 
 # Annotated[Union[...], Field(...)] aliases are callable _AnnotatedAlias at runtime, not Union types
 ai_functions.network.wire.Binary

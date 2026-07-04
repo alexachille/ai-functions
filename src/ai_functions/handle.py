@@ -41,6 +41,16 @@ class ThreadHandle[**P, T]:
         """Thread id this handle refers to."""
         return self._thread_id
 
+    @property
+    def coordinator(self) -> Coordinator:
+        """The coordinator routing operations on this thread.
+
+        Exposed so callers that need to read the thread's event log after the
+        run (``AIFunction.trace``, ``build_graph``) can do so without keeping
+        a separate reference.
+        """
+        return self._coordinator
+
     async def status(self) -> ThreadStatus:
         """Return the runtime-maintained status of the thread.
 
@@ -84,6 +94,10 @@ class ThreadHandle[**P, T]:
             - The returned future rejects with the raised exception on error.
             - The returned future rejects with ``CancelledError`` on
               cooperative or hard cancel.
+            - Any ``ParameterView`` / ``Result`` dataflow handles in the
+              arguments are replaced by their ``.value`` before the request
+              is enqueued, so handles never reach prompt construction or
+              cross-process serialization.
 
         Raises:
             ThreadNotFoundError: The thread is no longer registered.
@@ -92,7 +106,14 @@ class ThreadHandle[**P, T]:
             Synchronous enqueue via the coordinator; the cycle runs
             later on the hosting worker's dispatcher.
         """
-        return cast("asyncio.Future[T]", self._coordinator.submit(self._thread_id, *args, **kwargs))
+        from .types.graph import unwrap_nodes
+
+        plain_args = cast("tuple[object, ...]", unwrap_nodes(args))
+        plain_kwargs = cast("dict[str, object]", unwrap_nodes(kwargs))
+        return cast(
+            "asyncio.Future[T]",
+            self._coordinator.submit(self._thread_id, *plain_args, **plain_kwargs),
+        )
 
     # ── Messaging ────────────────────────────────────────────────
 
@@ -180,8 +201,14 @@ class ThreadHandle[**P, T]:
 
     # ── Forking ──────────────────────────────────────────────────
 
-    async def fork(self) -> ThreadHandle[P, T]:
+    async def fork(self, *, parent_id: ThreadId | None = None) -> ThreadHandle[P, T]:
         """Fork into a new thread seeded with a copy of this thread's history.
+
+        Args:
+            parent_id: Parent to attribute the fork to. By default the fork
+                inherits this thread's own parent (it is a sibling, not a
+                child). Pass an id to override — e.g. this thread's own id to
+                take responsibility for the fork as a child.
 
         Returns:
             A new handle in ``NOT_STARTED`` state referring to the forked thread.
@@ -190,5 +217,5 @@ class ThreadHandle[**P, T]:
             ThreadNotFoundError: The thread is no longer registered.
             NotImplementedError: This thread type does not support forking.
         """
-        forked = await self._coordinator.fork(self._thread_id)
+        forked = await self._coordinator.fork(self._thread_id, parent_id=parent_id)
         return cast("ThreadHandle[P, T]", forked)

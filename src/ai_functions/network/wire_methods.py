@@ -80,9 +80,16 @@ class InjectMessageParams(BaseModel):
 
 
 class ThreadIdOnlyParams(BaseModel):
-    """Shared by pause / resume / cancel / terminate / terminate_now / fork / is_paused / etc."""
+    """Shared by pause / resume / cancel / terminate / terminate_now / is_paused / etc."""
 
     thread_id: ThreadId
+
+
+class ForkParams(BaseModel):
+    """Params for ``coordinator.fork``; ``parent_id`` overrides the inherited default."""
+
+    thread_id: ThreadId
+    parent_id: ThreadId | None = None
 
 
 class ResolveApprovalParams(BaseModel):

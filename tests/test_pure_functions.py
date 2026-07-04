@@ -28,7 +28,7 @@ from ai_functions.types.events import CustomEvent, MessageUserEvent
 async def test_serialize_deserialize_roundtrip_primitives(output_type: type, value: Any) -> None:  # type: ignore[type-arg]
     """Primitives, lists, and dicts round-trip through the serializer."""
 
-    @ai_function(output_type, structured_output=True)
+    @ai_function[output_type](structured_output=True)
     def _fn(x: str) -> str:
         return x
 
@@ -50,7 +50,7 @@ class _PydModel(BaseModel):
 async def test_serialize_deserialize_roundtrip_pydantic() -> None:
     """Pydantic models round-trip preserving field values and type."""
 
-    @ai_function(_PydModel, structured_output=True)
+    @ai_function[_PydModel](structured_output=True)
     def _fn(x: str) -> str:
         return x
 
@@ -68,7 +68,7 @@ async def test_deserialize_malformed_payload_raises() -> None:
     """A malformed payload raises ``AIFunctionError``."""
     from ai_functions.ai_thread import AIFunctionError
 
-    @ai_function(int, structured_output=True)
+    @ai_function[int](structured_output=True)
     def _fn(x: str) -> str:
         return x
 
@@ -153,7 +153,7 @@ async def test_events_are_frozen() -> None:
     async with RuntimeHarness() as h:
         model = ScriptedModel([Turn(text="ok")])
 
-        @ai_function(str, structured_output=False)
+        @ai_function[str](structured_output=False)
         def _fn(x: str) -> str:
             return x
 

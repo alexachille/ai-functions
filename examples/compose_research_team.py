@@ -45,7 +45,7 @@ def check_length(summary: str, max_words: int):
     assert len(summary.split()) <= max_words
 
 
-@ai_function(PostConditionResult)
+@ai_function[PostConditionResult]
 def check_citations(summary: str):
     """
     Validate if all the claims made in the following summary are supported by an inline citation.
@@ -55,8 +55,7 @@ def check_citations(summary: str):
     """
 
 
-@ai_function(
-    str,
+@ai_function[str](
     config=FAST_MODEL,
     description="A web search agent that researches `query` (a description of the search task in natural language) "
     "and writes a summary of its finding. Optionally use `max_words` to specify the maximum summary length",
@@ -90,13 +89,9 @@ class ReportPlan(BaseModel):
     research_topics: list[str] = Field(..., description="List of topics to research before writing the report.")
 
 
-@ai_function(
-    ReportPlan,
-    description="Tool to suggest the plan and organization of a report. "
+@ai_function[ReportPlan](description="Tool to suggest the plan and organization of a report. "
     "It will also suggest some initial topics to research. "
-    "Call this tool before starting to write the report.",
-    tools=[websearch_tool],
-)
+    "Call this tool before starting to write the report.", tools=[websearch_tool])
 def report_planner(topic: str):
     """
     Generate a plan to write a report on the following topic:
@@ -123,7 +118,7 @@ class Report:
         self._sections.append(f"## {title}\n\n{section_content}")
         self._path.write_text(self.to_markdown())
 
-    @ai_function(str, description="Give constructive criticism on the current state of the report.")
+    @ai_function[str](description="Give constructive criticism on the current state of the report.")
     def critique_report(self) -> str:
         return f"""
         Provide a constructive critique of the following report.
@@ -144,9 +139,9 @@ def main():
     # a structured ``Literal["done"]`` — it doesn't run Python, so LOCAL code
     # execution is intentionally NOT enabled here (it would add the python_executor
     # tool + sandbox system prompt to every call, bloating the context and
-    # triggering overflow). See examples 14/27 for code_execution_mode=LOCAL.
-    @ai_function(
-        Literal["done"],
+    # triggering overflow). See memory_procedural.py / compose_stock_report.py
+    # for code_execution_mode=LOCAL.
+    @ai_function[Literal["done"]](
         config=FAST_MODEL,
         tools=[report_planner, websearch_agent, report.add_section, report.critique_report],
     )

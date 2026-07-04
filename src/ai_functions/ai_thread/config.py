@@ -78,7 +78,7 @@ class ThreadKwargs(TypedDict, total=False):
     post_conditions: list[PostCondition]
     max_attempts: int
     structured_output: bool
-    code_execution_mode: CodeExecutionMode
+    code_execution_mode: CodeExecutionMode | str
     code_executor_additional_imports: list[str]
     code_executor_kwargs: dict[str, Any]
     agent_kwargs: AgentKwargs
@@ -120,8 +120,11 @@ class ThreadConfig:
     Can be False only if the output type is `str`.
     """
 
-    code_execution_mode: CodeExecutionMode = CodeExecutionMode.DISABLED
+    code_execution_mode: CodeExecutionMode | str = CodeExecutionMode.DISABLED
     """Whether the agent may execute Python via a sandboxed ``python_executor`` tool.
+
+    Accepts the enum or its string value (``"local"`` / ``"disabled"``);
+    ``CodeExecutionMode`` is a ``StrEnum``, so comparisons treat them alike.
 
     ``DISABLED`` (default): no code execution; the answer comes from structured
     output. ``LOCAL``: a smolagents-backed AST-sandboxed executor is added to
