@@ -20,6 +20,18 @@ SAFE_BUILTINS: list[str]
 """Stdlib modules the sandboxed interpreter may import (pure computation only)."""
 
 
+def procedural_signatures(code: str) -> list[str]:
+    """Advertise the callable helpers in ``code``, one signature block each.
+
+    For every top-level ``def`` / ``async def`` (skipping ``_``-prefixed
+    helpers), the block is the ``def`` line — with parameter list and return
+    annotation — followed by the docstring if present (so the agent knows when
+    to call the helper) or a ``...`` body otherwise. Returns an empty list if
+    ``code`` cannot be parsed.
+    """
+    ...
+
+
 class PythonExecuteResult(BaseModel):
     """Result of one ``python_executor`` call."""
 

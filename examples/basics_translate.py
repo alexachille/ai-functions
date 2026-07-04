@@ -12,7 +12,7 @@ model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 # Post-condition to prevent a common failure case where the model outputs
 # a transliteration for non-latin scripts
-@ai_function(PostConditionResult, model=model)
+@ai_function[PostConditionResult](model=model)
 def check_translation(text: str) -> PostConditionResult:
     """
     Check that the following text is written in the native script of the language and does not contain any romanization.
@@ -24,7 +24,7 @@ def check_translation(text: str) -> PostConditionResult:
 
 
 # Simply define the AI Function as async to use it as any other async function
-@ai_function(str, model=model, post_conditions=[check_translation])
+@ai_function[str](model=model, post_conditions=[check_translation])
 async def translate_text(text: str, lang: str) -> str:
     """
     Translate the text below to the following language: `{lang}`.

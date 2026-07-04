@@ -58,8 +58,7 @@ async def main() -> None:
         preserve_max_tokens=1200,
     )
 
-    @ai_function(
-        str,
+    @ai_function[str](
         model=MODEL,
         tools=[article.write_chapter],
         summarization_strategy=strategy,

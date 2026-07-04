@@ -692,7 +692,12 @@ class Coordinator(Protocol):
         """
         ...
 
-    async def fork(self, thread_id: ThreadId) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
+    async def fork(
+        self,
+        thread_id: ThreadId,
+        *,
+        parent_id: ThreadId | None = None,
+    ) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
         """Fork ``thread_id`` into a new thread seeded with its history.
 
         Thin sugar built on :meth:`spawn`:
@@ -701,14 +706,18 @@ class Coordinator(Protocol):
            ``WorkerAdapter.get_fork_spawnable`` (which delegates to
            ``Thread.fork()``).
         2. Call ``self.spawn(new_spawnable, seed_from=thread_id,
-           parent_id=thread_id)``.
+           parent_id=...)``.
 
-        Callers who need finer control (different seeding source,
-        different parent id, placing the child on a specific worker)
+        A fork is a divergent continuation, not a delegated sub-computation, so
+        by default it inherits the source's own ``parent_id`` (becoming its
+        sibling). Pass ``parent_id`` to override. Callers who need finer control
+        (different seeding source, placing the child on a specific worker)
         should use :meth:`spawn` directly.
 
         Args:
             thread_id: Thread to fork.
+            parent_id: Parent to attribute the fork to; defaults to the source's
+                own parent.
 
         Returns:
             A new handle (type-erased) backed by this coordinator.

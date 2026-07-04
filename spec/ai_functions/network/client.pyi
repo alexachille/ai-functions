@@ -325,7 +325,7 @@ class CoordinatorClient(Coordinator):
         """
         ...
 
-    async def fork(self, thread_id: ThreadId) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
+    async def fork(self, thread_id: ThreadId, *, parent_id: ThreadId | None = None) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
         """Fork ``thread_id`` into a new thread seeded with its history.
 
         Args:

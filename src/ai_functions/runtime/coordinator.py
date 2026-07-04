@@ -22,6 +22,7 @@ from ..types import (
     MessageId,
     ThreadId,
     ThreadInfo,
+    ThreadSpawnedEvent,
     ThreadStatus,
     WorkerId,
 )
@@ -260,6 +261,11 @@ class InMemoryCoordinator(Coordinator):
         )
         await self.register_thread(info)
 
+        # A fresh sub-computation (not a fork, which carries seed_from) records
+        # its parent→child edge in the parent's log for build_graph.
+        if seed_from is None and parent_id is not None:
+            self.append_event(ThreadSpawnedEvent(thread_id=parent_id, child_thread_id=tid))
+
         # Ask the worker to allocate per-thread state and start the dispatcher.
         await adapter.spawn(
             target,
@@ -334,18 +340,34 @@ class InMemoryCoordinator(Coordinator):
         adapter = self._adapter_for(thread_id)
         await adapter.terminate_now(thread_id)
 
-    async def fork(self, thread_id: ThreadId) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
+    async def fork(
+        self,
+        thread_id: ThreadId,
+        *,
+        parent_id: ThreadId | None = None,
+    ) -> ThreadHandle[..., Any]:  # pyright: ignore[reportExplicitAny]
         """Fork ``thread_id`` into a new thread seeded with its history.
 
         Thin sugar over :meth:`spawn`: ask the worker for a resumption
         spawnable, then spawn it with ``seed_from`` set.
+
+        A fork is a divergent continuation of the source, not a sub-computation
+        it delegated — so by default the fork inherits the source's own
+        ``parent_id`` (becoming its sibling) rather than becoming its child.
+        This keeps token rollup pointing at the true owner and keeps the fork
+        out of the source's optimization ``child_threads``. Pass ``parent_id``
+        to override — e.g. a thread forking a helper it takes responsibility for
+        passes ``parent_id=<its own id>``.
         """
+        source = self._infos.get(thread_id)
+        if source is None:
+            raise ThreadNotFoundError(thread_id)
         adapter = self._adapter_for(thread_id)
         new_spawnable = await adapter.get_fork_spawnable(thread_id)
         return await self.spawn(
             new_spawnable,
             seed_from=thread_id,
-            parent_id=thread_id,
+            parent_id=source.parent_id if parent_id is None else parent_id,
         )
 
     # ── Approvals ───────────────────────────────────────────────────────────

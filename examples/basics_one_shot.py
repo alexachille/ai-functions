@@ -15,7 +15,7 @@ from ai_functions.ai_thread import PostConditionResult
 # ── Simple: docstring prompt, primitive output ───────────────────
 
 
-@ai_function(float)
+@ai_function[float]
 def calculator(expression: str):
     """Evaluate the mathematical expression: {expression}"""
 
@@ -28,7 +28,7 @@ class TranslationResult(BaseModel):
     confidence: float
 
 
-@ai_function(TranslationResult)
+@ai_function[TranslationResult]
 def translate(text: str, target_language: str) -> str:
     return f"Translate the following to {target_language}:\n\n{text}"
 
@@ -42,11 +42,7 @@ def confidence_above_threshold(result: TranslationResult, **kwargs: object) -> P
     return PostConditionResult(passed=False, message=f"Confidence {result.confidence} below 0.8")
 
 
-@ai_function(
-    TranslationResult,
-    post_conditions=[confidence_above_threshold],
-    max_attempts=3,
-)
+@ai_function[TranslationResult](post_conditions=[confidence_above_threshold], max_attempts=3)
 def reliable_translate(text: str, target_language: str) -> str:
     return f"Translate to {target_language} (be confident):\n\n{text}"
 

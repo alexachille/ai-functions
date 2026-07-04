@@ -126,8 +126,7 @@ def validate_risk_flags(result: ContractAnalysis) -> None:
 # substituted with actual argument values. The function body is empty by design.
 
 
-@ai_function(
-    ContractAnalysis,
+@ai_function[ContractAnalysis](
     post_conditions=[validate_clause_coverage, validate_excerpts, validate_risk_flags],
     max_attempts=6,
 )

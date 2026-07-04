@@ -37,6 +37,16 @@ class ThreadHandle[**P, T]:
         """Thread id this handle refers to."""
         ...
 
+    @property
+    def coordinator(self) -> Coordinator:
+        """The coordinator routing operations on this thread.
+
+        Exposed so callers that need to read the thread's event log after the
+        run (``AIFunction.trace``, ``build_graph``) can do so without keeping
+        a separate reference.
+        """
+        ...
+
     async def status(self) -> ThreadStatus:
         """Return the runtime-maintained status of the thread.
 
@@ -80,6 +90,10 @@ class ThreadHandle[**P, T]:
             - The returned future rejects with the raised exception on error.
             - The returned future rejects with ``CancelledError`` on
               cooperative or hard cancel.
+            - Any ``ParameterView`` / ``Result`` dataflow handles in the
+              arguments are replaced by their ``.value`` before the request
+              is enqueued, so handles never reach prompt construction or
+              cross-process serialization.
 
         Raises:
             ThreadNotFoundError: The thread is no longer registered.
@@ -176,7 +190,7 @@ class ThreadHandle[**P, T]:
 
     # ── Forking ──────────────────────────────────────────────────
 
-    async def fork(self) -> ThreadHandle[P, T]:
+    async def fork(self, *, parent_id: ThreadId | None = None) -> ThreadHandle[P, T]:
         """Fork into a new thread seeded with a copy of this thread's history.
 
         Returns:

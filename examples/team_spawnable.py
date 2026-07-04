@@ -26,12 +26,12 @@ class AnalysisReport(BaseModel):
     word_count: int
 
 
-@ai_function(list[str])
+@ai_function[list[str]]
 def outline_generator(topic: str):
     """Generate 3 section titles for a report about: {topic}"""
 
 
-@ai_function(str)
+@ai_function[str]
 def section_writer(title: str, topic: str):
     """Write a short section titled '{title}' for a report about: {topic}"""
 

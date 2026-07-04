@@ -29,9 +29,9 @@ from ai_functions import (
     ai_function,
     build_graph,
 )
-from ai_functions.optimizer._graph import topological_sort
+from ai_functions.optimizer._graph import _reconstruct_node, topological_sort
 from ai_functions.runtime import InMemoryCoordinator
-from ai_functions.types import ParameterRecalledEvent, ThreadId
+from ai_functions.types import ParameterRecalledEvent, ThreadId, current_thread_scope, thread_scope
 from ai_functions.types.events import (
     EventKind,
     MessageAssistantCompleteEvent,
@@ -117,6 +117,10 @@ def test_tool_provider_names_scoped_by_field_type(tmp_path: Path) -> None:
         "recall_tags",
         "query_tags",
         "search_tags",
+        # Entry-id CRUD tools, generated for list parameters by the JSON backend.
+        "add_to_tags",
+        "update_tags",
+        "delete_from_tags",
     }
 
 
@@ -132,9 +136,9 @@ def test_delete_resets_scalar_to_default(tmp_path: Path) -> None:
     """``delete`` restores a scalar field to its schema default."""
     mem = _backend(tmp_path)
     mem.save("joke_guidelines", "changed")
-    assert mem._recall("joke_guidelines") == "changed"  # noqa: SLF001
+    assert mem._recall("joke_guidelines")[0] == "changed"  # noqa: SLF001
     mem.delete("joke_guidelines")
-    assert mem._recall("joke_guidelines") == "No specific guidelines yet."  # noqa: SLF001
+    assert mem._recall("joke_guidelines")[0] == "No specific guidelines yet."  # noqa: SLF001
 
 
 def test_delete_required_field_raises(tmp_path: Path) -> None:
@@ -219,10 +223,14 @@ def test_deserialize_value_symmetric_for_nested_models(tmp_path: Path) -> None:
 
 
 async def test_recall_without_coordinator_emits_nothing(tmp_path: Path) -> None:
-    """A bare recall is a pure fetch and returns the stored value unchanged."""
+    """A bare recall is a pure fetch returning an un-emitted ParameterView."""
     mem = _backend(tmp_path)
-    value = await mem.recall("joke_guidelines")
-    assert value == "No specific guidelines yet."
+    view = await mem.recall("joke_guidelines")
+    assert view.value == "No specific guidelines yet."
+    assert str(view) == "No specific guidelines yet."  # f-string compatible
+    assert view.emitted is False
+    assert view.backend is mem
+    assert view.name == "joke_guidelines"
 
 
 async def test_recall_emits_event_immediately(tmp_path: Path) -> None:
@@ -231,9 +239,10 @@ async def test_recall_emits_event_immediately(tmp_path: Path) -> None:
     coord = InMemoryCoordinator()
     tid = ThreadId("joke-1")
 
-    value = await mem.recall("joke_guidelines", coordinator=coord, thread_id=tid)
+    view = await mem.recall("joke_guidelines", coordinator=coord, thread_id=tid)
 
-    assert value == "No specific guidelines yet."
+    assert view.value == "No specific guidelines yet."
+    assert view.emitted is True
     events = coord._events[tid]  # noqa: SLF001 -- inspecting the log directly
     assert len(events) == 1
     evt = events[0]
@@ -306,7 +315,119 @@ async def test_recall_confirms_deferred_append_before_returning(tmp_path: Path) 
     assert len(events) == 1
 
 
-# ── build_graph: reconstruction from a hand-built event log ─────────────────
+# ── thread_scope: ambient (coordinator, thread_id) fallback ─────────────────
+
+
+async def test_recall_uses_ambient_scope(tmp_path: Path) -> None:
+    """Inside thread_scope, a bare recall emits against the scope's thread."""
+    mem = _backend(tmp_path)
+    coord = InMemoryCoordinator()
+    tid = ThreadId("scoped-1")
+
+    with thread_scope(coord, tid):
+        view = await mem.recall("joke_guidelines")
+
+    assert view.value == "No specific guidelines yet."
+    assert view.emitted is True
+    events = coord._events[tid]  # noqa: SLF001
+    assert len(events) == 1
+    assert isinstance(events[0], ParameterRecalledEvent)
+    assert events[0].thread_id == tid
+
+
+async def test_explicit_args_override_ambient_scope(tmp_path: Path) -> None:
+    """Explicit coordinator/thread_id win over the ambient scope."""
+    mem = _backend(tmp_path)
+    ambient = InMemoryCoordinator()
+    explicit = InMemoryCoordinator()
+    explicit_tid = ThreadId("explicit-1")
+
+    with thread_scope(ambient, ThreadId("ambient-1")):
+        await mem.recall("joke_guidelines", coordinator=explicit, thread_id=explicit_tid)
+
+    assert explicit_tid in explicit._events  # noqa: SLF001
+    assert not ambient._events  # noqa: SLF001 -- ambient scope untouched
+
+
+async def test_recall_outside_scope_emits_nothing(tmp_path: Path) -> None:
+    """With no ambient scope and no explicit args, recall is a pure fetch."""
+    mem = _backend(tmp_path)
+    assert current_thread_scope() is None
+    view = await mem.recall("joke_guidelines")
+    assert view.value == "No specific guidelines yet."
+    assert view.emitted is False
+
+
+def test_thread_scope_restores_previous_on_exit() -> None:
+    """Nested scopes replace-and-restore; no scope leaks past its block."""
+    coord = InMemoryCoordinator()
+    outer, inner = ThreadId("outer"), ThreadId("inner")
+
+    assert current_thread_scope() is None
+    with thread_scope(coord, outer):
+        assert current_thread_scope().thread_id == outer  # type: ignore[union-attr]
+        with thread_scope(coord, inner):
+            assert current_thread_scope().thread_id == inner  # type: ignore[union-attr]
+        assert current_thread_scope().thread_id == outer  # type: ignore[union-attr]
+    assert current_thread_scope() is None
+
+
+async def test_in_cycle_recall_tool_attributes_to_running_thread(tmp_path: Path) -> None:
+    """The runtime opens a thread_scope per cycle, so a memory tool call inside a
+    running thread emits a ParameterRecalledEvent against that thread — no wiring."""
+    from ai_functions.testing import RuntimeHarness, ScriptedModel, Turn
+
+    mem = _backend(tmp_path)
+
+    @ai_function[str](structured_output=False, tools=[mem.tool_provider("joke_guidelines")])
+    def _writer(topic: str):
+        """Write about {topic}."""
+
+    async with RuntimeHarness() as h:
+        model = ScriptedModel([Turn(tool_calls=(("recall_joke_guidelines", {}),)), Turn(text="done")])
+        writer = await h.spawn(_writer.replace(model=model), thread_name="writer")
+        await writer.run("cats")
+
+        recalls = [e for e in await h.events(writer.id) if isinstance(e, ParameterRecalledEvent)]
+        assert len(recalls) == 1
+        assert recalls[0].name == "joke_guidelines"
+        assert recalls[0].thread_id == writer.id
+
+
+async def test_ai_function_as_tool_links_as_child(tmp_path: Path) -> None:
+    """An @ai_function called as a tool spawns on the caller's coordinator with the
+    caller as parent, so build_graph reconstructs it as a child automatically."""
+    from ai_functions.testing import RuntimeHarness, ScriptedModel, Turn
+
+    mem = _backend(tmp_path)
+
+    # The child recalls a parameter, so it carries a grad-bearing ParameterNode.
+    @ai_function[str](structured_output=False, tools=[mem.tool_provider("joke_guidelines")])
+    def _joke(topic: str):
+        """Joke about {topic}."""
+
+    @ai_function[str](structured_output=False, tools=[_joke])
+    def _orchestrator(topic: str):
+        """Write about {topic} using the _joke tool."""
+
+    async with RuntimeHarness() as h:
+        child_model = ScriptedModel([Turn(tool_calls=(("recall_joke_guidelines", {}),)), Turn(text="a joke")])
+        parent_model = ScriptedModel([Turn(tool_calls=(("_joke", {"topic": "cats"}),)), Turn(text="done")])
+        # _joke as a tool builds its own thread via __call__; give it the scripted model.
+        orch = await h.spawn(
+            _orchestrator.replace(model=parent_model, tools=[_joke.replace(model=child_model)]),
+            thread_name="orchestrator",
+        )
+        await orch.run("cats")
+
+        root = await build_graph(h.coordinator, orch.id, [mem])
+        assert len(root.child_threads) == 1
+        child = root.child_threads[0]
+        assert child.parent is root
+        assert {p.name for p in child.parameters} == {"joke_guidelines"}
+
+
+# ── _reconstruct_node: single-node reconstruction from a hand-built log ─────
 
 
 def _recall_event(backend: MemoryBackend, name: str, tid: str, **over: object) -> ParameterRecalledEvent:
@@ -322,7 +443,7 @@ def _recall_event(backend: MemoryBackend, name: str, tid: str, **over: object) -
     )
 
 
-def test_build_graph_single_parameter(tmp_path: Path) -> None:
+def test_reconstruct_node_single_parameter(tmp_path: Path) -> None:
     """A recall event becomes a ParameterNode referencing the live backend."""
     mem = _backend(tmp_path)
     events = [
@@ -334,7 +455,7 @@ def test_build_graph_single_parameter(tmp_path: Path) -> None:
         ),
     ]
 
-    node = build_graph(events, [mem])
+    node = _reconstruct_node(events, [mem])
 
     assert node.thread_id == "joke-1"
     assert node.func_name == "joke_writer"
@@ -347,7 +468,7 @@ def test_build_graph_single_parameter(tmp_path: Path) -> None:
     assert node.child_threads == []
 
 
-def test_build_graph_dedup_last_write_wins(tmp_path: Path) -> None:
+def test_reconstruct_node_dedup_last_write_wins(tmp_path: Path) -> None:
     """The same (backend, name) recalled twice yields one node; latest wins."""
     mem = _backend(tmp_path)
     events = [
@@ -355,7 +476,7 @@ def test_build_graph_dedup_last_write_wins(tmp_path: Path) -> None:
         _recall_event(mem, "joke_guidelines", "joke-1", value="new", requires_grad=False),
     ]
 
-    node = build_graph(events, [mem])
+    node = _reconstruct_node(events, [mem])
 
     assert len(node.parameters) == 1
     p = node.parameters[0]
@@ -363,7 +484,7 @@ def test_build_graph_dedup_last_write_wins(tmp_path: Path) -> None:
     assert p.requires_grad is False
 
 
-def test_build_graph_unknown_backend_skipped(tmp_path: Path) -> None:
+def test_reconstruct_node_unknown_backend_skipped(tmp_path: Path) -> None:
     """A recall event whose backend_id matches no backend is skipped."""
     mem = _backend(tmp_path)
     events = [
@@ -375,12 +496,12 @@ def test_build_graph_unknown_backend_skipped(tmp_path: Path) -> None:
         )
     ]
 
-    node = build_graph(events, [mem])
+    node = _reconstruct_node(events, [mem])
 
     assert node.parameters == []
 
 
-def test_build_graph_tool_calls_paired(tmp_path: Path) -> None:
+def test_reconstruct_node_tool_calls_paired(tmp_path: Path) -> None:
     """ToolCall + ToolResult events pair by tool_use_id into one ToolCallNode."""
     mem = _backend(tmp_path)
     events = [
@@ -398,7 +519,7 @@ def test_build_graph_tool_calls_paired(tmp_path: Path) -> None:
         ),
     ]
 
-    node = build_graph(events, [mem])
+    node = _reconstruct_node(events, [mem])
 
     assert len(node.tool_calls) == 1
     tc = node.tool_calls[0]
@@ -408,11 +529,50 @@ def test_build_graph_tool_calls_paired(tmp_path: Path) -> None:
     assert tc.status == "success"
 
 
-def test_build_graph_value_none_without_assistant_turn(tmp_path: Path) -> None:
+def test_reconstruct_node_value_none_without_assistant_turn(tmp_path: Path) -> None:
     """With no assistant turn, the node value is None."""
     mem = _backend(tmp_path)
-    node = build_graph([_recall_event(mem, "joke_guidelines", "t")], [mem])
+    node = _reconstruct_node([_recall_event(mem, "joke_guidelines", "t")], [mem])
     assert node.value is None
+
+
+# ── build_graph: recursion into spawned children ───────────────────────────
+
+
+async def test_build_graph_recurses_spawned_children(tmp_path: Path) -> None:
+    """A ThreadSpawnedEvent in the parent's log wires the child into child_threads."""
+    from ai_functions.types import ThreadSpawnedEvent
+
+    mem = _backend(tmp_path)
+    coord = InMemoryCoordinator()
+    coord.append_event(_recall_event(mem, "joke_guidelines", "parent"))
+    coord.append_event(ThreadSpawnedEvent(thread_id=ThreadId("parent"), child_thread_id=ThreadId("child")))
+    coord.append_event(_recall_event(mem, "formatting_guidelines", "child"))
+
+    root = await build_graph(coord, ThreadId("parent"), [mem])
+
+    assert root.thread_id == "parent"
+    assert len(root.child_threads) == 1
+    child = root.child_threads[0]
+    assert child.thread_id == "child"
+    assert child.parent is root
+    assert {p.name for p in child.parameters} == {"formatting_guidelines"}
+
+
+async def test_build_graph_recursion_terminates_on_cycle(tmp_path: Path) -> None:
+    """A spawn edge that points back to an ancestor is not followed twice."""
+    from ai_functions.types import ThreadSpawnedEvent
+
+    mem = _backend(tmp_path)
+    coord = InMemoryCoordinator()
+    # parent spawns child; child's log (spuriously) spawns parent again.
+    coord.append_event(ThreadSpawnedEvent(thread_id=ThreadId("parent"), child_thread_id=ThreadId("child")))
+    coord.append_event(ThreadSpawnedEvent(thread_id=ThreadId("child"), child_thread_id=ThreadId("parent")))
+
+    root = await build_graph(coord, ThreadId("parent"), [mem])
+
+    assert len(root.child_threads) == 1
+    assert root.child_threads[0].child_threads == []  # cycle back to parent pruned
 
 
 # ── topological_sort ────────────────────────────────────────────────────────
@@ -573,7 +733,7 @@ async def test_json_backend_save_and_persist(tmp_path: Path) -> None:
     mem.close()
 
     reloaded = JSONMemoryBackend(WritingMemory, actor_id="w1", path=path)
-    assert await reloaded.recall("joke_guidelines") == "Always about cats."
+    assert (await reloaded.recall("joke_guidelines")).value == "Always about cats."
 
 
 def test_json_backend_str_renders_multiline_as_literal_block(tmp_path: Path) -> None:
@@ -597,8 +757,8 @@ async def test_json_backend_namespaces_actors(tmp_path: Path) -> None:
     b.save("joke_guidelines", "actor-b value")
     b.close()
 
-    assert await JSONMemoryBackend(WritingMemory, "a", path).recall("joke_guidelines") == "actor-a value"
-    assert await JSONMemoryBackend(WritingMemory, "b", path).recall("joke_guidelines") == "actor-b value"
+    assert (await JSONMemoryBackend(WritingMemory, "a", path).recall("joke_guidelines")).value == "actor-a value"
+    assert (await JSONMemoryBackend(WritingMemory, "b", path).recall("joke_guidelines")).value == "actor-b value"
 
 
 async def test_json_backend_concurrent_open_no_clobber(tmp_path: Path) -> None:
@@ -617,14 +777,14 @@ async def test_json_backend_concurrent_open_no_clobber(tmp_path: Path) -> None:
     b.close()
     a.close()  # would previously overwrite the file and drop actor "b"
 
-    assert await JSONMemoryBackend(WritingMemory, "a", path).recall("joke_guidelines") == "actor-a value"
-    assert await JSONMemoryBackend(WritingMemory, "b", path).recall("joke_guidelines") == "actor-b value"
+    assert (await JSONMemoryBackend(WritingMemory, "a", path).recall("joke_guidelines")).value == "actor-a value"
+    assert (await JSONMemoryBackend(WritingMemory, "b", path).recall("joke_guidelines")).value == "actor-b value"
 
 
 async def test_json_backend_search_empty_list(tmp_path: Path) -> None:
     """Searching an empty list parameter returns no results."""
     mem = _backend(tmp_path)
-    assert await mem.search("tags", "anything") == []
+    assert (await mem.search("tags", "anything")).value == []
 
 
 async def test_json_backend_search_rejects_scalar(tmp_path: Path) -> None:
@@ -647,7 +807,7 @@ async def test_json_backend_search_ranks_by_bm25(tmp_path: Path) -> None:
         ],
     )
 
-    top = await mem.search("tags", "tomato sauce sugar", k=2)
+    top = (await mem.search("tags", "tomato sauce sugar", k=2)).value
 
     assert len(top) == 2
     assert top[0] == "add a pinch of sugar to tomato sauces"
@@ -846,10 +1006,10 @@ def test_code_execution_mode_defaults_disabled() -> None:
 
 
 def test_ai_function_accepts_code_execution_mode() -> None:
-    """@ai_function(code_execution_mode='local') sets the config field."""
+    """@ai_function[str](code_execution_mode='local') sets the config field."""
     from ai_functions.ai_thread.config import CodeExecutionMode
 
-    @ai_function(str, code_execution_mode="local")
+    @ai_function[str](code_execution_mode="local")
     def _fn(helpers: str):
         """Use {helpers}."""
 
@@ -864,11 +1024,11 @@ def test_procedural_param_detection() -> None:
     param would land in initial_state as an inert string the sandbox can't exec.
     """
 
-    @ai_function(str, code_execution_mode="local")
+    @ai_function[str](code_execution_mode="local")
     def proc_fn(helper_functions: Procedural, topic: str):
         """Use {helper_functions} for {topic}."""
 
-    @ai_function(str, code_execution_mode="local")
+    @ai_function[str](code_execution_mode="local")
     def str_fn(helper_functions: str):
         """Use {helper_functions}."""
 
@@ -916,7 +1076,7 @@ def test_procedural_param_code_becomes_callable() -> None:
     """
     from ai_functions.tools.local_python_executor import LocalPythonExecutorTool
 
-    @ai_function(str, code_execution_mode="local")
+    @ai_function[str](code_execution_mode="local")
     def proc_fn(helper_functions: Procedural, topic: str):
         """Use {helper_functions} for {topic}."""
 
@@ -955,7 +1115,7 @@ def _agent_result(
 def test_with_python_executor_noop_when_disabled() -> None:
     """code_execution_mode != LOCAL returns the config unchanged (no executor tool)."""
 
-    @ai_function(str)
+    @ai_function[str]
     def fn(helpers: str):
         """Use {helpers}."""
 
@@ -973,7 +1133,7 @@ def test_with_python_executor_rejects_plain_str_return() -> None:
     """
     from ai_functions.ai_thread.errors import AIFunctionError
 
-    @ai_function(str, code_execution_mode="local", structured_output=False)
+    @ai_function[str](code_execution_mode="local", structured_output=False)
     def fn(helpers: str):
         """Use {helpers}."""
 
@@ -1007,7 +1167,7 @@ def test_serialize_result_degrades_for_non_serializable() -> None:
         def __str__(self) -> str:
             return "THING-REPR"
 
-    @ai_function(_Thing, code_execution_mode="local")
+    @ai_function[_Thing](code_execution_mode="local")
     def fn(x: str):
         """Make a thing from {x}."""
 
@@ -1020,7 +1180,7 @@ def test_serialize_result_degrades_for_non_serializable() -> None:
 def test_with_python_executor_appends_executor_tool() -> None:
     """LOCAL mode appends exactly one python_executor tool to the cycle config."""
 
-    @ai_function(str, code_execution_mode="local")
+    @ai_function[str](code_execution_mode="local")
     def fn(helpers: Procedural, topic: str):
         """Use {helpers} for {topic}."""
 
@@ -1050,7 +1210,7 @@ def test_extract_result_local_prefers_executor_over_structured() -> None:
     class Answer(BaseModel):
         answer: str = Field(...)
 
-    @ai_function(Answer, code_execution_mode="local")
+    @ai_function[Answer](code_execution_mode="local")
     def fn(topic: str):
         """About {topic}."""
 
@@ -1069,7 +1229,7 @@ def test_extract_result_non_local_uses_structured_output() -> None:
     class Answer(BaseModel):
         answer: str = Field(...)
 
-    @ai_function(Answer)
+    @ai_function[Answer]
     def fn(topic: str):
         """About {topic}."""
 
@@ -1088,7 +1248,7 @@ def test_extract_result_falls_back_to_executor_when_structured_missing() -> None
     class Answer(BaseModel):
         answer: str = Field(...)
 
-    @ai_function(Answer)
+    @ai_function[Answer]
     def fn(topic: str):
         """About {topic}."""
 
@@ -1108,7 +1268,7 @@ def test_extract_result_unwraps_wrapped_executor_answer() -> None:
     result must be the inner ``answer`` value, not the wrapper.
     """
 
-    @ai_function(int, code_execution_mode="local")
+    @ai_function[int](code_execution_mode="local")
     def fn(topic: str):
         """About {topic}."""
 
@@ -1130,7 +1290,7 @@ def test_extract_result_raises_when_neither_present() -> None:
     class Answer(BaseModel):
         answer: str = Field(...)
 
-    @ai_function(Answer, code_execution_mode="local")
+    @ai_function[Answer](code_execution_mode="local")
     def fn(topic: str):
         """About {topic}."""
 
@@ -1157,7 +1317,7 @@ def test_agentcore_memory_id_matches_hyphenated_name() -> None:
 def test_bind_args_keeps_positional_inputs() -> None:
     """_bind_args names positional args by param even on the fallback path."""
 
-    @ai_function(str)
+    @ai_function[str]
     def fn(helper_functions: str, topic: str):
         """Use {helper_functions} for {topic}."""
 

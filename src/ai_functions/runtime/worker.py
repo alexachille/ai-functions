@@ -44,8 +44,10 @@ from ..types import (
     ThreadContext,
     ThreadId,
     ThreadInfo,
+    ThreadSpawnedEvent,
     ThreadStatus,
     WorkerId,
+    thread_scope,
 )
 from .errors import EventEmissionError, ThreadIdMismatchError, ThreadNotFoundError
 
@@ -449,6 +451,10 @@ class LocalWorker(WorkerAdapter):
             parent_id=parent_id,
         )
         await self._coordinator.register_thread(info)
+        # spawn_locally never seeds from another thread, so a parent_id here is
+        # always a genuine sub-computation — record its edge for build_graph.
+        if parent_id is not None:
+            self._coordinator.append_event(ThreadSpawnedEvent(thread_id=parent_id, child_thread_id=tid))
         self._allocate_state(
             target,
             thread_id=tid,
@@ -551,7 +557,7 @@ class LocalWorker(WorkerAdapter):
                 source="runtime",
             )
 
-            coro = thread.execute(ctx, *work.args, **work.kwargs)
+            coro = self._execute_in_thread_scope(thread, ctx, work.args, work.kwargs)
             task = asyncio.create_task(coro)
             self._current_task[thread_id] = task
             dispatcher_cancelling = False
@@ -586,6 +592,21 @@ class LocalWorker(WorkerAdapter):
 
             if dispatcher_cancelling:
                 raise asyncio.CancelledError
+
+    async def _execute_in_thread_scope[**P, T](
+        self,
+        thread: Thread[P, T],
+        ctx: ThreadContext,
+        args: tuple[Any, ...],  # pyright: ignore[reportExplicitAny]
+        kwargs: dict[str, Any],  # pyright: ignore[reportExplicitAny]
+    ) -> T:
+        """Run one cycle with the ambient thread scope set from ``ctx``.
+
+        Opening the scope inside the cycle's task keeps the contextvar copy
+        isolated per thread, so concurrent cycles never see each other's scope.
+        """
+        with thread_scope(ctx.coordinator, ctx.thread_id):
+            return await thread.execute(ctx, *args, **kwargs)
 
     # ── Context building ────────────────────────────────────────────────────
 

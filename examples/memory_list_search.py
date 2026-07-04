@@ -2,11 +2,16 @@
 
 Stores cooking tips as a ``list[str]`` memory parameter, retrieves the most
 relevant ones with BM25 search, writes a recipe using them, then optimizes:
-feedback is backpropagated to the ``tips`` parameter and consolidated (the
-whole list is rewritten by the consolidation AI function).
+feedback is backpropagated to the ``tips`` parameter and consolidated by an
+agentic memory manager that edits entries in place (add/update/delete by
+stable entry id) — and, because the search's ``{entry_id: value}`` results
+ride along in the recall event, consolidation targets exactly the entries
+this run retrieved instead of the whole list.
 
-Search requires the optional dependency:
-``pip install strands-ai-functions[search]``.
+The prompt function shows the idiom for manipulating a handle-typed argument
+in its body: the runtime unwraps ``ParameterView`` / ``Result`` arguments
+before the prompt is built, and ``unwrap_nodes`` is the typed no-op that lets
+the body treat the parameter as plain data.
 """
 
 import asyncio
@@ -15,8 +20,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function, build_graph
-from ai_functions.runtime import InMemoryCoordinator, LocalWorker
+from ai_functions import JSONMemoryBackend, TextGradOptimizer, Traceable, ai_function
+from ai_functions.types import unwrap_nodes
 
 model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
@@ -25,15 +30,14 @@ def _bullets(items: list[str]) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
-@ai_function(str, model=model)
-def recipe_assistant(dish: str, tips: str):
-    """
-    Write a short recipe for "{dish}".
-    Incorporate the following cooking tips where relevant:
-    <tips>
-    {tips}
-    </tips>
-    """
+@ai_function[str](model=model)
+def recipe_assistant(dish: str, tips: Traceable[list[str]]) -> str:
+    """Build the recipe prompt from the retrieved tips."""
+    return (
+        f'Write a short recipe for "{dish}".\n'
+        "Incorporate the following cooking tips where relevant:\n"
+        f"<tips>\n{_bullets(unwrap_nodes(tips))}\n</tips>"
+    )
 
 
 class CookingMemory(BaseModel):
@@ -56,21 +60,19 @@ async def main(path: str | Path) -> None:
     memory = JSONMemoryBackend(CookingMemory, actor_id="chef-1", path=path, model=model)
     optimizer = TextGradOptimizer(model=model)
 
-    coord = InMemoryCoordinator()
-    worker = await LocalWorker(coord).register()
-
     print("=== Initial Tips ===")
     print(memory)
 
     # ── Forward pass: BM25-search the relevant tips, then write a recipe ──
-    cook_h = await worker.spawn_locally(recipe_assistant, thread_name="recipe_assistant")
-    tips = await memory.search("tips", "pasta sauce tomato", k=5, coordinator=coord, thread_id=cook_h.id)
-    print(f"\n=== Retrieved Tips (search 'pasta sauce tomato') ===\n{_bullets(tips)}")
+    # search() returns a ParameterView; passing it to trace() (rather than an
+    # f-string of it) is what records the tips -> recipe graph edge.
+    tips = await memory.search("tips", "pasta sauce tomato", k=5)
+    print(f"\n=== Retrieved Tips (search 'pasta sauce tomato') ===\n{_bullets(tips.value)}")
 
-    recipe = await cook_h.run(dish="spaghetti pomodoro", tips=_bullets(tips))
+    recipe = await recipe_assistant.trace(dish="spaghetti pomodoro", tips=tips)
     print(f"\n=== Recipe ===\n{recipe}")
 
-    # ── Optimize: feedback → backward → consolidate ──
+    # ── Optimize: build graph + backward + consolidate, in one call ──
     feedback = (
         "The tip about sugar in tomato sauce is wrong — use a splash of balsamic vinegar instead. "
         "Add a tip about using San Marzano tomatoes for the best pomodoro. "
@@ -78,22 +80,16 @@ async def main(path: str | Path) -> None:
     )
     print(f"\n=== Feedback ===\n{feedback}")
 
-    node = build_graph(await coord.get_events(cook_h.id), [memory])
-
-    print("\nRunning backward pass...")
-    optimizer.backward(node, feedback)
-    for p in node.parameters:
+    print("\nRunning optimizer step...")
+    graph = await optimizer.step(recipe, feedback, backends=[memory])
+    for p in graph.parameters:
         if p.gradients:
             print(f"  {p.name}: {p.gradients}")
-
-    print("\nConsolidating tips...")
-    optimizer.consolidate(node)
 
     print("\n=== Updated Tips ===")
     print(memory)
 
     memory.close()
-    await worker.close()
     print("\nDone.")
 
 

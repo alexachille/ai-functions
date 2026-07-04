@@ -1,6 +1,6 @@
 """Shared event-formatter used by ``ai-functions logs`` and ``ai-functions attach``.
 
-The logic originated in ``examples/05_claude_code.py`` — the pretty-
+The logic originated in ``examples/integrate_claude_code.py`` — the pretty-
 printer that turns :class:`~ai_functions.types.Event` instances into one-line
 console output. Factored into the package so the CLI commands and the
 TUI share it.

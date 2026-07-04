@@ -1,6 +1,6 @@
 """Two workers talking through a remote CoordinatorEndpoint (same process).
 
-Port of ``05_two_workers_local.py`` to the network layer. Instead of an
+Port of ``team_two_workers_local.py`` to the network layer. Instead of an
 :class:`InMemoryCoordinator` directly driving two local workers, this
 example stands up a :class:`CoordinatorEndpoint` (a WebSocket server)
 and connects two clients to it. Each client hosts one worker; each
@@ -12,7 +12,7 @@ channel machinery (client → endpoint for coordinator.* calls;
 endpoint → client for worker.* calls; endpoint → client for event
 broadcasts).
 
-Tasks mirror example 05:
+Tasks mirror ``team_two_workers_local.py``:
 
 1. ``alice`` calls ``list_threads`` — sees both threads registered on
    the endpoint, even though she and bob are on different clients
@@ -35,7 +35,7 @@ from ai_functions.runtime import LocalWorker
 from ai_functions.types import EventKind, ResultEvent, WorkerId
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def chat(message: str):
     """{message}"""
 

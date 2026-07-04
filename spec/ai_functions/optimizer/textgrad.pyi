@@ -5,43 +5,55 @@ internal AI function to distribute natural-language feedback from each node to
 its grad-enabled parameter inputs, then consolidates that feedback directly
 into the memory backends referenced by each :class:`ParameterNode`.
 
-The optimizer is a pure consumer of an already-built graph: it never reads the
-event log or touches a running thread. The autograd analogy is exact —
-``backward`` is ``loss.backward()`` (textual gradients instead of numeric),
-``consolidate`` is ``optimizer.step()`` (writes improvements back into memory).
+``backward`` / ``consolidate`` are pure consumers of an already-built graph:
+they never read the event log or touch a running thread. ``step`` is the
+one-call form over a traced :class:`Result`: it builds the graph (spawned
+children from events, sibling edges from ``Result.inputs``), backpropagates,
+and consolidates — on the same graph object, built exactly once. The autograd
+analogy is exact — ``backward`` is ``loss.backward()`` (textual gradients
+instead of numeric), ``consolidate`` is ``optimizer.step()`` (writes
+improvements back into memory).
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 from strands.models import Model
 
-from ..types.graph import ThreadNode
+from ..memory.base import MemoryBackend
+from ..types.graph import Result, ThreadNode
 
 
 class TextGradOptimizer:
     """Propagate feedback through a ``ThreadNode`` graph and consolidate into memory.
 
-    Usage::
+    One-call usage over a traced result::
 
-        graph = build_graph(await coord.get_events("t1"), [memory])
+        result = await email_writer.trace(jokes=cat, formatting_guidelines=fmt)
         optimizer = TextGradOptimizer(model=model)
+        graph = await optimizer.step(result, "The email needs joke titles.", backends=[memory])
+
+    Step-by-step usage over a reconstructed graph::
+
+        graph = await build_graph(coord, thread_id, [memory])
         optimizer.backward(graph, "The output should be more concise.")
         optimizer.consolidate(graph)
     """
 
-    quiet: bool
+    last_dropped_feedback: list[str]
+    """Parameter ids from the most recent ``backward`` whose feedback matched
+    no parameter and was dropped. Empty when nothing was lost."""
 
     def __init__(
         self,
         model: Model | str | None = None,
-        quiet: bool = True,
     ) -> None:
         """Build an optimizer whose internal gradient function uses ``model``.
 
         Args:
             model: Model (or model id) the internal feedback-distribution AI
                 function runs on. ``None`` uses the library default provider.
-            quiet: Suppress the internal AI function's callback output.
         """
         ...
 
@@ -56,7 +68,8 @@ class TextGradOptimizer:
         threads, which re-refine them against their own parameters when visited
         — the child describes its own parameters far better than a parent's
         gradient call could, so this is what carries feedback through a
-        multi-level graph.
+        multi-level graph. The internal model calls run with the ambient thread
+        scope cleared, so they never pollute a running thread's event log.
 
         Args:
             root: Root of the reconstructed graph (typically the final
@@ -69,6 +82,8 @@ class TextGradOptimizer:
               refined feedback string is appended to its ``gradients``.
             - Each node's gradients are forwarded to its child threads.
             - Parameters with ``requires_grad=False`` receive no gradients.
+            - Model feedback matching no parameter is dropped with a warning
+              and recorded in ``last_dropped_feedback`` (reset on each call).
         """
         ...
 
@@ -77,8 +92,12 @@ class TextGradOptimizer:
 
         Groups gradients by ``(backend, parameter name)`` so a parameter
         recalled in several threads is consolidated once, then calls
-        ``param.backend.consolidate(name, feedbacks)`` through each node's
-        direct backend reference. No external backend lookup table is used.
+        ``param.backend.consolidate(name, feedbacks, retrieved=...)`` through
+        each node's direct backend reference. No external backend lookup table
+        is used. Search-derived retrieval context (``meta["results"]``, the
+        ``{entry_id: value}`` mapping of the entries the forward pass actually
+        retrieved) is merged across the group and passed along, so a backend
+        can target consolidation at those entries instead of the full value.
 
         Args:
             root: Root of the graph whose gradients should be written back.
@@ -86,7 +105,8 @@ class TextGradOptimizer:
         Ensures:
             - Each ``(backend, name)`` group triggers exactly one
               ``backend.consolidate`` call carrying all of that parameter's
-              gradients across the graph.
+              gradients across the graph, plus the merged retrieval context
+              (``None`` when no grouped node carries ``meta["results"]``).
             - Parameters with no gradients are skipped.
         """
         ...
@@ -100,5 +120,30 @@ class TextGradOptimizer:
         Ensures:
             - Every reachable ``ThreadNode.gradients`` and
               ``ParameterNode.gradients`` is emptied.
+        """
+        ...
+
+    async def step(
+        self,
+        result: Result[Any],
+        feedback: str,
+        backends: list[MemoryBackend],
+    ) -> ThreadNode:
+        """Build the graph from a traced result, backpropagate, and consolidate.
+
+        The whole optimization dance in one call: reconstructs the graph from
+        ``result`` via :func:`build_graph_from_result`, runs :meth:`backward`
+        with ``feedback``, then :meth:`consolidate` — on the **same** graph
+        object, preserving the invariant that gradients accumulate and are
+        consolidated on nodes built exactly once. The blocking model calls run
+        in a worker thread, keeping the event loop responsive.
+
+        Args:
+            result: The root ``Result`` returned by ``AIFunction.trace``.
+            feedback: Natural-language feedback on the root's output.
+            backends: Live memory backends, matched by ``backend_id``.
+
+        Returns:
+            The graph, for inspection (gradients, structure) after the step.
         """
         ...

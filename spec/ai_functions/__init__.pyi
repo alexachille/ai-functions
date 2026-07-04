@@ -17,7 +17,7 @@ from .discovery import (
 )
 from .handle import ThreadHandle
 from .memory import AgentCoreMemoryBackend, Frozen, JSONMemoryBackend, MemoryBackend, Procedural
-from .optimizer import TextGradOptimizer, build_graph
+from .optimizer import TextGradOptimizer, build_graph, build_graph_from_result
 from .protocols import Coordinator, Spawnable, Thread
 from .runtime import (
     InMemoryCoordinator,
@@ -26,6 +26,7 @@ from .runtime import (
 )
 from .serve import aserve, serve
 from .session import FileSessionStore, SessionData, SessionStore
+from .types import ParameterView, Result, Traceable
 from .utils import run_blocking
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "AIThread",
     "aserve",
     "build_graph",
+    "build_graph_from_result",
     "connect",
     "Coordinator",
     "CoordinatorAlreadyRunningError",
@@ -47,7 +49,9 @@ __all__ = [
     "LocalWorker",
     "MemoryBackend",
     "NoCoordinatorError",
+    "ParameterView",
     "Procedural",
+    "Result",
     "run_blocking",
     "RuntimeInfo",
     "serve",
@@ -59,5 +63,6 @@ __all__ = [
     "TextGradOptimizer",
     "Thread",
     "ThreadHandle",
+    "Traceable",
     "WorkerAdapter",
 ]

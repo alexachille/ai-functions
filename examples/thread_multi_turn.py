@@ -10,7 +10,7 @@ import asyncio
 from ai_functions import ai_function
 
 
-@ai_function(str)
+@ai_function[str]
 def assistant(message: str):
     """{message}"""
 

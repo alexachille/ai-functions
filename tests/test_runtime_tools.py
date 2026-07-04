@@ -17,7 +17,7 @@ from ai_functions.types import EventKind, ThreadId
 from ai_functions.types.events import MessageUserEvent
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def _chat(message: str) -> str:
     """Simple chat responder: {message}"""
     return message
@@ -34,7 +34,7 @@ def _tool_result_text(event) -> str:  # type: ignore[no-untyped-def]
 async def test_coordinator_tools_can_be_disabled() -> None:
     """``coordinator_tools_enabled=False`` suppresses list_threads/send_message."""
 
-    @ai_function(str, structured_output=False, coordinator_tools_enabled=False)
+    @ai_function[str](structured_output=False, coordinator_tools_enabled=False)
     def _solo(message: str) -> str:
         """Answer directly: {message}"""
 
@@ -333,7 +333,7 @@ async def test_send_message_continue_then_receive_rejects_non_str_sender() -> No
             thread_name="bob",
         )
 
-        @ai_function(str, structured_output=False)
+        @ai_function[str](structured_output=False)
         def _two_arg(a: str, b: str) -> str:
             """Structured: {a} / {b}"""
             return f"{a}-{b}"

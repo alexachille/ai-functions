@@ -26,7 +26,7 @@ def check_length(response: MeetingSummary, max_length: int):
 
 
 # Post-conditions can be other AI Functions using `PostConditionResult` as return type
-@ai_function(PostConditionResult, model=fast_model)
+@ai_function[PostConditionResult](model=fast_model)
 def check_style(response: MeetingSummary) -> PostConditionResult:
     """
     Check if the summary below satisfies the following criteria:
@@ -41,7 +41,7 @@ def check_style(response: MeetingSummary) -> PostConditionResult:
 
 # Main AI Function definition, with post-condition and the number of times the agent will try to generate
 # a result passing all required conditions before an exception is raised.
-@ai_function(MeetingSummary, model=summary_model, post_conditions=[check_length, check_style], max_attempts=5)
+@ai_function[MeetingSummary](model=summary_model, post_conditions=[check_length, check_style], max_attempts=5)
 def summarize_meeting(transcripts: str, max_length: int = 50) -> MeetingSummary:
     """
     Write a summary of the following meeting in less than {max_length} words.

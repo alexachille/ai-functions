@@ -4,9 +4,11 @@
 schema (``recall_<name>``, ``query_<name>``, ``search_<name>`` for lists,
 ``save_<name>`` / ``delete_<name>`` for scalars). Attaching them via
 ``.replace(tools=[...])`` lets a travel assistant look up the user's preferences
-and past trips — and update them — during a cycle. These tools are pure
-fetches/writes: they do not feed the optimization graph (that path uses
-``recall(coordinator, thread_id)`` + ``build_graph``, see examples 11-13).
+and past trips — and update them — during a cycle. Recall-type tool calls pick
+up the ambient thread scope the runtime opens per cycle, so they also emit
+``ParameterRecalledEvent`` s and feed the optimization graph (see the
+``memory_optimization`` and ``memory_procedural`` examples for the ``trace`` +
+``optimizer.step`` workflow).
 """
 
 import asyncio
@@ -40,7 +42,7 @@ class TravelMemory(BaseModel):
     )
 
 
-@ai_function(str)
+@ai_function[str]
 def travel_assistant(request: str):
     """You are a travel planning assistant with access to the user's travel memory.
     Use the available tools to look up their preferences and past trips before

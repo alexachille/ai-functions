@@ -9,7 +9,7 @@ errors into memory:
                     ``common_pitfalls``, then consolidate once.
   3. Trained test — re-solve the test problem with the learned memory.
 
-The mental model is PyTorch autograd (see example 11): ``recall`` reads a
+The mental model is PyTorch autograd (see ``memory_optimization.py``): ``recall`` reads a
 learnable weight, ``backward`` distributes textual gradients, ``consolidate``
 writes improvements back. The 8 training nodes are gathered under a synthetic
 root so a single ``consolidate`` merges every parameter's gradients (grouped by
@@ -20,13 +20,12 @@ import asyncio
 import tempfile
 from dataclasses import dataclass
 
+from _ds1000_scipy import TEST_PROBLEMS, TRAIN_PROBLEMS
 from _ds1000_utils import build_feedback, run_batch_parallel, run_problem
-from _scipy_problems import TEST_PROBLEMS, TRAIN_PROBLEMS
 from pydantic import BaseModel, Field
 from strands.models import BedrockModel
 
-from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function
-from ai_functions.runtime import InMemoryCoordinator, LocalWorker
+from ai_functions import JSONMemoryBackend, TextGradOptimizer, Traceable, ai_function
 from ai_functions.types.graph import ThreadNode
 
 # temperature=0 for deterministic generation — the demo reproduces run to run.
@@ -60,8 +59,8 @@ class LearningMemory(BaseModel):
     )
 
 
-@ai_function(str, model=_model)
-def generate_code(coding_patterns: str, common_pitfalls: str, problem_prompt: str, library: str):
+@ai_function[str](model=_model)
+def generate_code(coding_patterns: Traceable[str], common_pitfalls: Traceable[str], problem_prompt: str, library: str):
     """Solve the data science problem below by generating Python code.
 
     Output ONLY the Python code — no explanations, no markdown fences.
@@ -88,15 +87,12 @@ def _print_result(tag: str, problem: dict, solution: str, passed: bool, error: s
 
 
 async def main(path: str) -> None:
-    coord = InMemoryCoordinator()
-    worker = await LocalWorker(coord).register()
-
     # ── Step 1: direct test with empty memory ──
     print("=" * 70, "\nStep 1 — Direct test (empty memory)\n", "=" * 70, sep="")
     memory = JSONMemoryBackend(LearningMemory, "demo", path=path, model=_model)
     direct: dict[str, ExecResultView] = {}
     for problem in TEST_PROBLEMS:
-        solution, exec_result, _ = await run_problem(problem, memory, generate_code, coord, worker)
+        solution, exec_result, _ = await run_problem(problem, memory, generate_code)
         _print_result("direct", problem, solution, exec_result.passed, exec_result.error)
         direct[problem["id"]] = ExecResultView(solution, exec_result.passed)
     memory.close()
@@ -106,7 +102,7 @@ async def main(path: str) -> None:
     memory = JSONMemoryBackend(LearningMemory, "demo", path=path, model=_model)
     optimizer = TextGradOptimizer(model=_model)
 
-    batch = await run_batch_parallel(TRAIN_PROBLEMS, memory, generate_code, coord, worker)
+    batch = await run_batch_parallel(TRAIN_PROBLEMS, memory, generate_code)
     train_nodes: list[ThreadNode] = []
     for problem, (solution, exec_result, node) in zip(TRAIN_PROBLEMS, batch, strict=True):
         status = "PASS" if exec_result.passed else "FAIL"
@@ -134,14 +130,12 @@ async def main(path: str) -> None:
     print(await memory.recall("common_pitfalls"))
 
     for problem in TEST_PROBLEMS:
-        solution, exec_result, _ = await run_problem(problem, memory, generate_code, coord, worker)
+        solution, exec_result, _ = await run_problem(problem, memory, generate_code)
         _print_result("trained", problem, solution, exec_result.passed, exec_result.error)
         before = direct[problem["id"]]
         if not before.passed and exec_result.passed:
             print(f"\n>>> {problem['id']}: FAIL → PASS (memory-driven improvement)")
     memory.close()
-
-    await worker.close()
 
 
 if __name__ == "__main__":

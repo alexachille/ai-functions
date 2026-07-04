@@ -6,6 +6,16 @@ long-term memory automatically, so ``consolidate`` appends feedback as turns
 rather than running an explicit merge AI function (as ``JSONMemoryBackend``
 does).
 
+Error semantics: a *not-found* response from the service reads as "no records
+yet" (the parameter falls back to its schema default). Any other failure —
+auth, throttling, outage — propagates to the caller rather than silently
+reading as an empty memory.
+
+List storage: list values are written one item per message so items round-trip
+individually; blank lines inside an item are collapsed on write (a blank line
+is the item separator in the legacy format, which reads remain compatible
+with). Nested schema fields are addressed with slash paths (``profile/tone``).
+
 ``bedrock-agentcore`` is an optional dependency: importing this module is cheap,
 but constructing :class:`AgentCoreMemoryBackend` raises ``ImportError`` if the
 package is not installed (``pip install strands-ai-functions[agentcore]``).
@@ -39,9 +49,10 @@ class AgentCoreMemoryBackend(MemoryBackend):
     """AWS Bedrock AgentCore-backed memory for parameters.
 
     Each parameter is stored under its own AgentCore actor namespace; recall
-    concatenates the actor's short-term events and long-term records.
-    Procedural fields are not supported — use :class:`JSONMemoryBackend` for
-    those.
+    concatenates the actor's short-term events and long-term records (list
+    parameters collect one item per message). Procedural fields are not
+    supported — anywhere in the schema, nested models included — use
+    :class:`JSONMemoryBackend` for those.
     """
 
     memory_id: str

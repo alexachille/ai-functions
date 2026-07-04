@@ -11,6 +11,13 @@ Three node types:
 
 All grad-bearing nodes share a common base carrying ``node_id``, ``value``,
 ``requires_grad``, and ``gradients``.
+
+Two further types are *handles*, not graph nodes: :class:`ParameterView`
+(returned by ``memory.recall/query/search``) and :class:`Result` (returned by
+``AIFunction.trace``). They exist so Python dataflow between threads — one
+function's output passed as another's input — can be discovered by scanning
+arguments at trace time. They carry no gradients; the graph nodes above are
+still reconstructed exclusively from the event log.
 """
 
 from __future__ import annotations
@@ -22,6 +29,8 @@ from strands.types.content import Message
 
 if TYPE_CHECKING:
     from ..memory.base import MemoryBackend
+    from ..protocols import Coordinator
+    from .ids import ThreadId
 
 
 @dataclass
@@ -80,3 +89,141 @@ class ThreadNode(Node):
     parent: ThreadNode | None = field(default=None, repr=False)
 
     events: list[Any] = field(default_factory=list, repr=False)  # pyright: ignore[reportExplicitAny]
+
+
+# ── Dataflow handles (not graph nodes) ────────────────────────────────────────
+
+
+@dataclass(kw_only=True, eq=False)
+class ParameterView[T]:
+    """A recalled parameter value plus the metadata needed to link it into a graph.
+
+    Returned by ``MemoryBackend.recall`` / ``query`` / ``search``. An opaque
+    wrapper — **not** a ``str`` or ``list`` subclass and not a graph node.
+    ``__str__`` returns ``str(value)`` so a view interpolates into f-strings
+    and prompt templates unchanged; passing the view itself (not an f-string
+    of it) to ``AIFunction.trace`` or ``__call__`` keeps its identity so the
+    dataflow edge is preserved. The runtime unwraps views to ``value`` at the
+    ``ThreadHandle.run`` boundary before any prompt is built or serialized.
+
+    Attributes:
+        value: The recalled value.
+        name: Parameter name on the backend (slash-separated for nesting).
+        backend: The live backend the value came from.
+        derivation: How the value was derived (``full`` recall, ``query``,
+            or ``search``).
+        requires_grad: Whether the parameter participates in optimization.
+        description: Schema description of the parameter.
+        meta: Derivation metadata (e.g. the query string).
+        emitted: Whether a ``ParameterRecalledEvent`` has already been
+            appended for this view (at recall time, under an ambient or
+            explicit thread scope). ``AIFunction.trace`` emits for views that
+            were *not* emitted at recall time and skips the rest, so one
+            logical recall never lands in two logs.
+    """
+
+    value: T
+    name: str
+    backend: MemoryBackend
+    derivation: Literal["full", "query", "search"] = "full"
+    requires_grad: bool = True
+    description: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)  # pyright: ignore[reportExplicitAny]
+    emitted: bool = False
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(kw_only=True, eq=False)
+class Result[T]:
+    """The output of one ``AIFunction.trace`` call plus its provenance.
+
+    Minimal by design: no agent reference, no messages — the thread's events
+    are the source of truth, read back from ``coordinator`` by
+    ``build_graph_from_result``. ``inputs`` carries the sibling dataflow edges
+    discovered by scanning the trace call's arguments. ``__str__`` returns
+    ``str(value)`` for casual printing; like :class:`ParameterView`, a
+    ``Result`` interpolated into an f-string loses its identity (the
+    computation still works, the optimization edge is dropped).
+
+    Attributes:
+        value: The typed cycle result.
+        coordinator: Coordinator holding the traced thread's event log
+            (kept alive by this reference).
+        thread_id: Id of the traced thread.
+        inputs: ``ParameterView`` / ``Result`` handles found in the call's
+            arguments, in discovery order, deduplicated by identity.
+    """
+
+    value: T
+    coordinator: Coordinator
+    thread_id: ThreadId
+    inputs: list[ParameterView[Any] | Result[Any]] = field(default_factory=list)  # pyright: ignore[reportExplicitAny]
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+type Traceable[T] = T | ParameterView[T] | Result[T]
+"""A value of type ``T``, or a dataflow handle wrapping one.
+
+Annotate prompt-function parameters that may receive a recalled
+``ParameterView`` or a traced ``Result`` — e.g.
+``def email_writer(jokes: Traceable[str], ...)`` — so passing handles
+type-checks. The runtime unwraps handles to their ``.value`` at the
+``ThreadHandle.run`` boundary either way; the alias only makes the
+already-supported call pattern visible to the type checker.
+"""
+
+
+def collect_nodes(value: Any) -> list[ParameterView[Any] | Result[Any]]:  # pyright: ignore[reportExplicitAny]
+    """Recursively find the dataflow handles in ``value``.
+
+    Scans dicts (values), lists, tuples, and sets. Returns handles in
+    discovery order, deduplicated by identity — the same view passed twice is
+    one edge, not two.
+    """
+    out: list[ParameterView[Any] | Result[Any]] = []  # pyright: ignore[reportExplicitAny]
+    seen: set[int] = set()
+
+    def _walk(v: Any) -> None:  # pyright: ignore[reportExplicitAny]
+        if isinstance(v, (ParameterView, Result)):
+            if id(v) not in seen:
+                seen.add(id(v))
+                out.append(v)
+        elif isinstance(v, dict):
+            for item in v.values():  # pyright: ignore[reportUnknownVariableType]
+                _walk(item)
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            for item in v:  # pyright: ignore[reportUnknownVariableType]
+                _walk(item)
+
+    _walk(value)
+    return out
+
+
+def unwrap_nodes(value: Any) -> Any:  # pyright: ignore[reportExplicitAny]
+    """Recursively replace ``ParameterView`` / ``Result`` handles with their ``.value``.
+
+    Rebuilds dicts, lists, tuples (including ``NamedTuple``), and sets;
+    returns every other value unchanged. Called at the ``ThreadHandle.run``
+    boundary so handles never reach prompt construction or cross-process
+    serialization.
+    """
+    if isinstance(value, (ParameterView, Result)):
+        return value.value  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    if isinstance(value, dict):
+        return {k: unwrap_nodes(v) for k, v in value.items()}  # pyright: ignore[reportUnknownVariableType]
+    if isinstance(value, tuple):
+        items = [unwrap_nodes(item) for item in value]  # pyright: ignore[reportUnknownVariableType]
+        # NamedTuple subclasses take positional fields, not an iterable.
+        if hasattr(value, "_fields"):
+            return type(value)(*items)
+        return tuple(items) if type(value) is tuple else type(value)(items)
+    if isinstance(value, list):
+        items = [unwrap_nodes(item) for item in value]  # pyright: ignore[reportUnknownVariableType]
+        return items if type(value) is list else type(value)(items)
+    if isinstance(value, (set, frozenset)):
+        return type(value)(unwrap_nodes(item) for item in value)  # pyright: ignore[reportUnknownVariableType]
+    return value

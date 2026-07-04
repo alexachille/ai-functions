@@ -36,7 +36,7 @@ from ai_functions.types.events import (
 )
 
 
-@ai_function(str, structured_output=False)
+@ai_function[str](structured_output=False)
 def _simple(prompt: str) -> str:
     return prompt
 

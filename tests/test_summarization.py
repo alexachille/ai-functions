@@ -315,7 +315,7 @@ def test_aithread_rejects_user_supplied_conversation_manager() -> None:
     from ai_functions.ai_thread.ai_thread import AIThread
     from ai_functions.ai_thread.config import AgentKwargs
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _greet() -> str:
         return "hi"
 
@@ -344,7 +344,7 @@ def test_build_agent_user_callback_handler_does_not_collide() -> None:
     def user_cb(**kwargs: object) -> None:
         calls.append(kwargs)
 
-    @ai_function(str, structured_output=False)
+    @ai_function[str](structured_output=False)
     def _greet() -> str:
         return "hi"
 
@@ -489,8 +489,7 @@ async def test_summarization_flow_emits_context_summarized_event() -> None:
         preserve_max_tokens=100_000,
     )
 
-    @ai_function(
-        str,
+    @ai_function[str](
         structured_output=False,
         model=cast(Any, model),  # pyright: ignore[reportExplicitAny]
         summarization_strategy=strategy,
@@ -574,8 +573,7 @@ async def test_proactive_summarization_fires_on_token_threshold() -> None:
         preserve_max_tokens=20,
     )
 
-    @ai_function(
-        str,
+    @ai_function[str](
         structured_output=False,
         model=cast(Any, _CompositeModel()),  # pyright: ignore[reportExplicitAny]
         summarization_strategy=strategy,
@@ -633,7 +631,7 @@ async def test_no_proactive_summarization_when_threshold_unset() -> None:
             del args, kwargs
             raise NotImplementedError
 
-    @ai_function(str, structured_output=False, model=cast(Any, _AnswerModel()))  # pyright: ignore[reportExplicitAny]
+    @ai_function[str](structured_output=False, model=cast(Any, _AnswerModel()))  # pyright: ignore[reportExplicitAny]
     def _ask(q: str) -> str:
         return q
 
