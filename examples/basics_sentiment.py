@@ -14,18 +14,20 @@ Demonstrates:
 import json
 from typing import Literal
 
+from _utils import display
+
 from ai_functions import ai_function
 from ai_functions.ai_thread import PostConditionResult
 
 model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
-# ── Classification ──────────────────────────────────────────────────────────
+# Classification
 # Literal return type constrains the model to one of the specified values.
 # No Pydantic model or JSON schema needed — the type annotation is the schema.
 
 
-@ai_function[Literal["positive", "negative", "neutral"]](model=model)
+@ai_function(model=model)
 def classify_sentiment(review: str) -> Literal["positive", "negative", "neutral"]:
     """
     Classify the sentiment of the following customer review.
@@ -34,7 +36,7 @@ def classify_sentiment(review: str) -> Literal["positive", "negative", "neutral"
     """
 
 
-# ── Summarization with post-condition ───────────────────────────────────────
+# Summarization with post-condition
 # The ALL CAPS constraint is deliberately chosen because the model almost never
 # produces uppercase output unprompted. This makes the self-correction loop
 # visible when running the example — watch for the retry in the console output.
@@ -46,7 +48,7 @@ def check_uppercase(summary: str) -> PostConditionResult:
     return PostConditionResult(passed=True)
 
 
-@ai_function[str](model=model, post_conditions=[check_uppercase], max_attempts=3)
+@ai_function(model=model, post_conditions=[check_uppercase], max_attempts=3)
 def summarize_review(review: str) -> str:
     """
     Summarize the following customer review in one sentence, written in ALL CAPS.
@@ -55,7 +57,7 @@ def summarize_review(review: str) -> str:
     """
 
 
-# ── Pipeline ────────────────────────────────────────────────────────────────
+# Pipeline
 # ai_functions are regular callables — compose them with plain Python.
 # These two calls are independent, so they could also be run in parallel
 # by defining the ai_functions as async and using asyncio.gather():
@@ -76,4 +78,4 @@ if __name__ == "__main__":
     ]
 
     results = [analyze_review(r) for r in reviews]
-    print(json.dumps(results, indent=2))
+    display("Analyzed Reviews", json.dumps(results, indent=2), lang="json")

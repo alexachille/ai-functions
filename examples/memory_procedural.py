@@ -7,10 +7,10 @@ runs a task using those helpers and returns its answer by calling
 ``final_answer(...)`` inside executed code. Feedback is then backpropagated and
 consolidated to improve the stored code.
 
-The prompt parameter is annotated ``Traceable[Procedural]``: it accepts either
-the raw code string or the ``ParameterView`` that ``recall`` returns, and the
-``Procedural`` marker still tells the runtime to define the code in the
-execution environment.
+The prompt parameter is annotated ``Procedural``: the body receives the raw
+code string (``trace`` unwraps the ``ParameterView`` that ``recall`` returns
+before the body runs), and the ``Procedural`` marker tells the runtime to
+define the code in the execution environment.
 
 This example is also a live check of the code-execution *advertisement*: the
 runtime tells the agent which helpers are already defined — by signature and
@@ -25,16 +25,17 @@ import asyncio
 import tempfile
 from pathlib import Path
 
+from _utils import display, rule
 from pydantic import BaseModel, Field
 
-from ai_functions import JSONMemoryBackend, Procedural, TextGradOptimizer, Traceable, ai_function
+from ai_functions import JSONMemoryBackend, Procedural, TextGradOptimizer, ai_function
 
 # Use default model
 model = None
 
 
-@ai_function[str](model=model, code_execution_mode="local")
-def run_task(task: str, helper_functions: Traceable[Procedural]):
+@ai_function(model=model, code_execution_mode="local")
+def run_task(task: str, helper_functions: Procedural) -> str:
     """
     {task}
 
@@ -62,33 +63,28 @@ async def main(path: str | Path) -> None:
     memory = JSONMemoryBackend(Schema, actor_id="coder-1", path=path, model=model)
     optimizer = TextGradOptimizer(model=model)
 
-    print("=== Initial Procedural Memory ===")
-    print(memory)
+    display("Initial Procedural Memory", str(memory))
 
-    # ── Turn 1: an open-ended task that the seed code does not directly solve ──
+    # Turn 1: an open-ended task that the seed code does not directly solve.
     # Only `secret_greeting` is defined, so the run exercises the environment;
     # feedback then grows the stored code into reusable multi-language helpers.
     result = await run_task.trace(
         task="Greet Alice in Spanish.",
         helper_functions=await memory.recall("helper_functions"),
     )
-    print(f"\n=== Turn 1 Result ===\n{result}")
+    display("Turn 1 Result", str(result))
 
-    feedback = (
-        "Analyze the execution trace and create and save reusable helper functions."
-    )
-    print(f"\n=== Feedback ===\n{feedback}")
+    feedback = "Analyze the execution trace and create and save reusable helper functions."
+    display("Feedback", feedback)
 
-    print("\nRunning optimizer step...")
+    rule("Running optimizer step")
     graph = await optimizer.step(result, feedback, backends=[memory])
-    for p in graph.parameters:
-        if p.gradients:
-            print(f"  {p.name}: {p.gradients}")
+    gradients = [f"{p.name}: {p.gradients}" for p in graph.parameters if p.gradients]
+    display("Parameter Gradients", "\n".join(gradients), lang="text")
 
-    print("\n=== Updated Procedural Memory ===")
-    print(memory)
+    display("Updated Procedural Memory", str(memory))
 
-    # ── Turn 2: does the seed helper survive, and can the agent find it unaided? ──
+    # Turn 2: does the seed helper survive, and can the agent find it unaided?
     # We recall the *updated* code and ask for the secret greeting WITHOUT naming
     # the function or its signature. The agent has to read the advertised helper
     # signatures + docstrings to pick secret_greeting; a correct, non-guessable
@@ -98,12 +94,11 @@ async def main(path: str | Path) -> None:
         task="Return the caller's personal secret greeting for the name 'Bob', exactly as the helper produces it.",
         helper_functions=await memory.recall("helper_functions"),
     )
-    print(f"\n=== Turn 2 Result (expected to contain 'Zphqr, Bob! (code 7731)') ===\n{secret}")
+    display("Turn 2 Result (expected to contain 'Zphqr, Bob! (code 7731)')", str(secret))
     ok = "Zphqr, Bob! (code 7731)" in str(secret)
-    print(f"\nsecret_greeting survived and was found via the advertisement: {ok}")
+    display("secret_greeting survived and was found via the advertisement", str(ok), lang="text")
 
     memory.close()
-    print("\nDone.")
 
 
 if __name__ == "__main__":

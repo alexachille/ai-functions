@@ -85,13 +85,18 @@ class _AttachApp(App[None]):
     Screen { layout: vertical; }
     #log { height: 1fr; border: round $primary; }
     #banner { height: 3; padding: 1; color: $warning; }
-    #input  { dock: bottom; height: 3; }
+    /* Match the log's rounded border, keep it identical when focused */
+    #input { dock: bottom; height: 3; border: round $primary; }
+    #input:focus { border: round $primary; }
+    /* The footer key hints default to bold */
+    Footer FooterKey .footer-key--key { text-style: none; }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "quit", "Detach"),
-        Binding("alt+enter", "inject", "Inject message"),
-        Binding("ctrl+o", "toggle_view", "Toggle view (all events / conversation only)"),
+        # ``key_display`` shows the macOS option glyph instead of "alt+".
+        Binding("alt+enter", "inject", "Inject message", key_display="⌥⏎"),
+        Binding("ctrl+o", "toggle_view", "Toggle view"),
     ]
 
     def __init__(self, client: CoordinatorClient, info: ThreadInfo) -> None:
@@ -112,6 +117,15 @@ class _AttachApp(App[None]):
         # conversation view correlates results back to the call to hide
         # both (the answer is already surfaced as the turn's content).
         self._structured_output_ids: set[str] = set()
+        # Whether any turn has been written since the log was last cleared;
+        # gates the blank-line separator so the first turn has no leading
+        # gap. Tracked explicitly because ``RichLog.lines`` is not populated
+        # synchronously by ``write`` during the mount-time replay.
+        self._wrote_turn: bool = False
+        # Whether the previous rendered conversation turn was a tool call;
+        # its result is kept adjacent (no blank-line separator) so the call
+        # and its output read as a single unit.
+        self._prev_was_tool_call: bool = False
         super().__init__()
         # ``title`` is a Textual reactive attribute, not something to
         # override with a property (that breaks Textual's own assignment
@@ -120,9 +134,8 @@ class _AttachApp(App[None]):
         self._refresh_title()
 
     def _refresh_title(self) -> None:
-        """Update the header title to reflect the active view mode."""
-        mode = "conversation" if self._conversation_view else "all events"
-        self.title = f"ai-functions attach {self._info.thread_id} ({self._label}) — {mode}"
+        """Set the header title to ``<name> agent (<thread-id>)``."""
+        self.title = f"{self._label} agent ({self._info.thread_id})"
 
     def compose(self) -> ComposeResult:
         """Build the widget tree — header, log, optional input, footer."""
@@ -206,7 +219,16 @@ class _AttachApp(App[None]):
                 return
             if not filter_events_full(event):
                 return
-            self._log_widget.write(format_event_full(event))
+            # Separate turns with a blank line, skipping the leading gap
+            # before the first turn of the current render pass and keeping a
+            # tool result flush against the tool call it follows
+            result_after_call = isinstance(event, ToolResultEvent) and self._prev_was_tool_call
+            if self._wrote_turn and not result_after_call:
+                self._log_widget.write(Text(""))
+            # ``expand=True`` widens each renderable to the full pane
+            self._log_widget.write(format_event_full(event), expand=True)
+            self._wrote_turn = True
+            self._prev_was_tool_call = isinstance(event, ToolCallEvent)
         else:
             if not filter_events(event):
                 return
@@ -224,6 +246,8 @@ class _AttachApp(App[None]):
         if self._log_widget is None:
             return
         self._log_widget.clear()
+        self._wrote_turn = False
+        self._prev_was_tool_call = False
         for event in self._events:
             self._render_event(event)
 

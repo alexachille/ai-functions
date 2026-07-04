@@ -20,6 +20,11 @@ SAFE_BUILTINS: list[str]
 """Stdlib modules the sandboxed interpreter may import (pure computation only)."""
 
 
+def generate_signature_from_model(model: type[BaseModel], func_name: str = "final_answer") -> str:
+    """Build a ``final_answer(...)`` signature string from a pydantic model's fields."""
+    ...
+
+
 def procedural_signatures(code: str) -> list[str]:
     """Advertise the callable helpers in ``code``, one signature block each.
 

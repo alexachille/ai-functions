@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 from typing import Any
+from xml.sax.saxutils import escape
 
 from strands.types.content import Message
 
-from ..types.graph import Node
+from ..types.graph import Node, ParameterNode, ThreadNode
 from ._formatting import to_yaml, truncate
 
 
@@ -24,9 +25,23 @@ def _yaml_safe_value(value: Any) -> Any:  # pyright: ignore[reportExplicitAny]
 
 
 def render_inputs(nodes: Sequence[Node]) -> str:
+    """Render backward-pass targets as a YAML string keyed by ``node_id``.
+
+    Each target carries a ``type`` the backward prompt keys off. Grad-enabled
+    ``ParameterNode`` s render as ``type: parameter`` (or ``type: code`` for
+    procedural parameters, so the model treats them as code to edit); child
+    ``ThreadNode`` s render as ``type: result`` (a downstream function output
+    that can be improved). The distinction lets the model route feedback to the
+    right target instead of dumping everything into the one visible parameter.
+    """
     result: dict[str, Any] = {}  # pyright: ignore[reportExplicitAny]
     for node in nodes:
-        node_type = node.__class__.__name__.lower()
+        if isinstance(node, ParameterNode):
+            node_type = "code" if node.procedural else "parameter"
+        elif isinstance(node, ThreadNode):
+            node_type = "result"
+        else:
+            node_type = node.__class__.__name__.lower()
         result[node.node_id] = {
             "type": node_type,
             "description": getattr(node, "description", ""),
@@ -90,9 +105,9 @@ def render_messages(
             if not isinstance(block, dict):
                 continue
             if reasoning_text := block.get("reasoningContent", {}).get("text"):
-                msg_dict["content"].append({"reasoning": reasoning_text})
+                msg_dict["content"].append({"reasoning": maybe_truncate(reasoning_text)})
             if text := block.get("text", ""):
-                msg_dict["content"].append({"text": text})
+                msg_dict["content"].append({"text": maybe_truncate(text)})
             if tool_use := block.get("toolUse", None):
                 original_id = tool_use.get("toolUseId")
                 _, call_type = _convert_id(original_id, tool_id_to_tool_result_id)
@@ -128,7 +143,11 @@ def _format_tool_inputs(inputs: Any) -> str:  # pyright: ignore[reportExplicitAn
 def to_xml(message_list: list[dict[str, Any]]) -> str:  # pyright: ignore[reportExplicitAny]
     """Convert the message_list produced by render_messages into an XML string.
 
-    Content is NOT XML-escaped so embedded XML/HTML tags are preserved verbatim.
+    Each message becomes a ``<message>`` tag with ``step`` and ``role``
+    attributes. All content is XML-escaped so trace text containing ``<`` /
+    ``&`` cannot break out of its tag or corrupt the surrounding structure.
+    ``python_executor`` tool calls render as ``<execute_code>`` / ``<result>``
+    pairs; other tool calls use a generic ``<tool_call>`` tag.
     """
     parts: list[str] = []
     for entry in message_list:
@@ -141,9 +160,9 @@ def to_xml(message_list: list[dict[str, Any]]) -> str:  # pyright: ignore[report
 
         for block in msg["content"]:
             if isinstance(block, dict) and "reasoning" in block:
-                parts.append(f"<reasoning>{block['reasoning']}</reasoning>")
+                parts.append(f"<reasoning>{escape(str(block['reasoning']))}</reasoning>")
             elif isinstance(block, dict) and "text" in block:
-                parts.append(str(block["text"]))
+                parts.append(escape(str(block["text"])))
             elif isinstance(block, dict) and "type" in block:
                 name = block.get("name", "")
                 inputs_raw = block.get("inputs", "")
@@ -157,19 +176,19 @@ def to_xml(message_list: list[dict[str, Any]]) -> str:  # pyright: ignore[report
                         code = parsed.get("code", inputs_raw) if isinstance(parsed, dict) else str(inputs_raw)
                     except (json.JSONDecodeError, TypeError):
                         code = str(inputs_raw)
-                    parts.append(f"<execute_code>\n{code}\n</execute_code>")
+                    parts.append(f"<execute_code>\n{escape(str(code))}\n</execute_code>")
                     if output_text:
-                        parts.append(f"<result>\n{output_text}\n</result>")
+                        parts.append(f"<result>\n{escape(output_text)}\n</result>")
                 else:
                     formatted_inputs = _format_tool_inputs(inputs_raw)
-                    attrs = f' name="{name}"'
+                    attrs = f' name="{escape(str(name))}"'
                     if status:
-                        attrs += f' status="{status}"'
-                    inner = f"<inputs>{formatted_inputs}</inputs>"
+                        attrs += f' status="{escape(str(status))}"'
+                    inner = f"<inputs>{escape(formatted_inputs)}</inputs>"
                     if block.get("id"):
-                        inner += f"\n<id>{block['id']}</id>"
+                        inner += f"\n<id>{escape(str(block['id']))}</id>"
                     if output_text:
-                        inner += f"\n<output>{output_text}</output>"
+                        inner += f"\n<output>{escape(output_text)}</output>"
                     parts.append(f"<tool_call{attrs}>{inner}</tool_call>")
 
         parts.append("</message>")

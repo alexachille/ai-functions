@@ -21,6 +21,7 @@ from .errors import AIFunctionError, ValidationError
 from .postcondition import PostCondition, PostConditionResult
 from .reconstruction import reconstruct_messages, render_renderable_events
 from .summarization import (
+    ContextFitter,
     DefaultSummarizationStrategy,
     SummarizationFailedError,
     SummarizationStrategy,
@@ -34,6 +35,7 @@ __all__ = [
     "AIFunctionError",
     "AIThread",
     "CodeExecutionMode",
+    "ContextFitter",
     "coordinator_tools",
     "DefaultSummarizationStrategy",
     "OutputSpec",

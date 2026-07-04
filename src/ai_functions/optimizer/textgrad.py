@@ -1,9 +1,14 @@
 """TextGrad-style optimizer over a reconstructed computation graph.
 
-Walks a ``ThreadNode`` graph in reverse topological order, using an internal AI
-function to distribute feedback from each node to its grad-enabled parameter
-inputs, then consolidates feedback directly into the memory backends referenced
-by each ``ParameterNode``.
+Walks a ``ThreadNode`` graph in reverse topological order. At each node an
+internal AI function distributes the node's accumulated feedback across its
+routable targets: its grad-enabled ``ParameterNode`` inputs *and* its child
+``ThreadNode`` s that lead to a grad-enabled parameter. Feedback routed to a
+parameter accumulates for consolidation; feedback routed to a child thread is
+*refined* feedback appended to that child, which re-distributes it to its own
+targets when it is visited later in the walk. Parameter gradients are finally
+consolidated directly into the memory backends referenced by each
+``ParameterNode``.
 """
 
 from __future__ import annotations
@@ -16,9 +21,11 @@ from pydantic import BaseModel, Field
 from strands.models import Model
 
 from ..ai_thread import ai_function
+from ..ai_thread.errors import AIFunctionError
+from ..ai_thread.postcondition import PostConditionResult
 from ..types.context import no_thread_scope
-from ..types.graph import ParameterNode, ThreadNode
-from ._graph import build_graph_from_result, topological_sort
+from ..types.graph import Node, ParameterNode, ThreadNode
+from ._graph import build_graph_from_result, leads_to_grad_parameter, topological_sort
 from .rendering import render_inputs, render_messages
 
 if TYPE_CHECKING:
@@ -28,38 +35,73 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+OPTIMIZE_TOOLS_PROMPT = (
+    "You can also provide feedback to function calls that appears in the trace. "
+    "However try to minimize the number of function calls to which you provide feedback. "
+    "You cannot provide feedback to tool calls."
+)
+
+DO_NOT_OPTIMIZE_TOOLS_PROMPT = "Do not provide any feedback to tool calls or function calls."
+
+
 class Feedback(BaseModel):
-    node_name: str = Field(..., description="The parameter node_id to provide feedback to.")
-    feedback: str = Field(..., description="How the parameter should change.")
+    """A single feedback entry targeting a specific input node."""
+
+    node_id: str = Field(..., description="The id of the node or tool call to which you are providing feedback.")
+    feedback: str = Field(
+        ...,
+        description="How the input node should change. "
+        "The feedback MUST be relevant to the node description, if any. "
+        "Feedback MUST be general and applicable to different future inputs.",
+    )
 
 
 class Feedbacks(BaseModel):
+    """Collection of feedback entries produced by the optimizer."""
+
     feedbacks: list[Feedback]
 
 
 @ai_function[Feedbacks]
 def _compute_gradients(
-    parameters: str,
+    inputs: str,
     trace: str,
     output: str,
     feedback: list[str],
+    optimize_tools: bool,
 ) -> str:
-    """Build the backward prompt that distributes feedback to parameters."""
+    """Build the backward prompt that distributes feedback across a node's inputs."""
     issues = "\n".join(f"- {f}" for f in feedback)
+    tools_rule = OPTIMIZE_TOOLS_PROMPT if optimize_tools else DO_NOT_OPTIMIZE_TOOLS_PROMPT
     return (
-        "An agent received the following parameter inputs:\n"
-        f"<parameters>\n{parameters}\n</parameters>\n\n"
-        "The agent produced the following execution trace:\n"
-        f"<trace>\n{trace}\n</trace>\n\n"
-        "At the end, it produced the following output:\n"
-        f"<output>\n{output}\n</output>\n\n"
-        "The following issues need to be fixed:\n"
-        f"<issues>\n{issues}\n</issues>\n\n"
-        "Return feedback for each parameter that needs to change.\n"
-        "Rules:\n"
-        "- Only provide feedback relevant to the parameter's description.\n"
-        "- Feedback must be general and applicable to different future inputs.\n"
-        "- If a parameter doesn't need changes, omit it."
+        "You are an optimization agent. You analyze conversation traces to determine how\n"
+        "parameters and inputs to an agent should be updated. You will be provided with\n"
+        "input results, parameters (with their current values) and the execution\n"
+        "trace of an agent using this information.\n\n"
+        "# Inputs to the agent\n"
+        f"{inputs}\n\n"
+        "## Conversation trace\n"
+        f"{trace}\n\n"
+        "## Agent Output\n"
+        f"{output}\n\n"
+        "## Issues\n"
+        f"{issues}\n\n"
+        "## Rules\n"
+        "Analyze the trace and produce per-input feedback.\n\n"
+        "1. If the input has parameter type, provide feedback using the following bullet point format:\n"
+        "```\n"
+        "- add: <text> — information to add to the input\n"
+        "- update: <text> — information to change in the input\n"
+        "- delete: <text> — information to remove from the input\n"
+        "```\n\n"
+        "2. If the input has result type, provide feedback using the following format:\n"
+        "```\n"
+        "- improve: <text> — concrete feedback of how this specific result should change to resolve the issues\n"
+        "```\n\n"
+        "3. ONLY provide feedback that is relevant to the parameter's description. It may be that some of the user\n"
+        "  feedback is not relevant to any of the input nodes. It is fine to ignore this feedback.\n\n"
+        "4. The feedback you provide should always be general and applicable to future inputs.\n\n"
+        f"{tools_rule}"
     )
 
 
@@ -78,73 +120,139 @@ class TextGradOptimizer:
         optimizer.backward(graph, "The output should be more concise.")
         optimizer.consolidate(graph)
 
+    Args:
+        optimize_tools: Whether the backward model may also target function
+            calls that appear in the trace.
+        model: LLM model for computing gradients.
+
     Attributes:
-        last_dropped_feedback: Parameter ids from the most recent ``backward``
-            for which the backward model returned feedback that matched no
-            parameter (that feedback is dropped). Empty when nothing was lost.
+        last_dropped_feedback: Node ids from the most recent ``backward`` for
+            which the backward model returned feedback that matched no routable
+            target *after retries were exhausted* (that feedback is dropped).
+            Empty when nothing was lost.
     """
 
     def __init__(
         self,
+        optimize_tools: bool = False,
         model: Model | str | None = None,
     ) -> None:
+        self.optimize_tools = optimize_tools
         self._backward_fn = _compute_gradients.replace(model=model)
         self.last_dropped_feedback: list[str] = []
 
     def backward(self, root: ThreadNode, feedback: str) -> None:
-        """Propagate feedback through the graph.
+        """Propagate ``feedback`` from ``root`` through the graph.
 
-        Appends feedback to root, then for each ThreadNode with gradients and
-        grad-enabled parameters, runs the backward AI function to distribute
-        feedback to individual parameters. A node's gradients are forwarded to
-        its child threads, which re-refine them against their own parameters
-        when visited — this carries feedback through a multi-level graph.
+        Seeds ``root`` with ``feedback`` and distributes it across each node's
+        routable targets in reverse topological order. Idempotent: intermediate
+        node gradients are cleared first, so calling ``backward`` twice does not
+        double-count. Parameter gradients deliberately accumulate and are reset
+        only by :meth:`zero_grad`.
         """
+        sorted_nodes = topological_sort(root)
+
+        # Idempotent backward: reset node gradients (parameter gradients persist
+        # and accumulate; they are cleared explicitly by zero_grad).
+        for node in sorted_nodes:
+            node.gradients.clear()
+
         root.gradients.append(feedback)
         self.last_dropped_feedback = []
 
-        for node in topological_sort(root):
+        for node in sorted_nodes:
             if not node.gradients:
                 continue
+
             grad_params = [p for p in node.parameters if p.requires_grad]
-            if not grad_params:
+            grad_children = [c for c in node.child_threads if leads_to_grad_parameter(c)]
+            targets: list[Node] = [*grad_params, *grad_children]
+
+            # No routable target: forward raw gradients to children (pass-through).
+            if not targets:
                 for child in node.child_threads:
                     child.gradients.extend(node.gradients)
                 continue
 
-            # The backward model call must not attribute to any ambient thread
-            # scope — it would spawn as a child of the user's thread and
-            # pollute the event log the graph was built from.
-            with no_thread_scope():
-                result = self._backward_fn.run_sync(
-                    parameters=render_inputs(grad_params),
-                    trace=render_messages(node.messages, {}),
-                    output=str(node.value or ""),
-                    feedback=node.gradients,
-                )
-
-            param_map = {p.node_id: p for p in grad_params}
-            for fb in result.feedbacks:
-                if fb.node_name in param_map:
-                    param_map[fb.node_name].gradients.append(fb.feedback)
-                else:
-                    self.last_dropped_feedback.append(fb.node_name)
-                    logger.warning(
-                        "Backward: feedback for '%s' but no such parameter in node %s",
-                        fb.node_name,
-                        node.thread_id,
-                    )
-
-            for child in node.child_threads:
-                child.gradients.extend(node.gradients)
+            self._distribute(node, targets)
 
         if self.last_dropped_feedback:
             logger.warning(
-                "Backward: %d feedback item(s) matched no parameter and were dropped: %s. "
+                "Backward: %d feedback item(s) matched no target and were dropped: %s. "
                 "Inspect TextGradOptimizer.last_dropped_feedback.",
                 len(self.last_dropped_feedback),
                 ", ".join(self.last_dropped_feedback),
             )
+
+    def _distribute(self, node: ThreadNode, targets: list[Node]) -> None:
+        """Run the backward model for one node and route feedback to its targets.
+
+        ``targets`` are the node's grad-enabled parameters and grad-reaching
+        child threads, keyed by ``node_id``. A post-condition asserts every
+        returned id is a valid target, so an invalid id triggers an automatic
+        retry; if retries are exhausted the last attempt is salvaged and
+        unroutable ids are recorded in ``last_dropped_feedback`` rather than
+        crashing the whole backward pass.
+        """
+        target_map: dict[str, Node] = {t.node_id: t for t in targets}
+        valid_ids = set(target_map)
+        # Capture each attempt's result so the safety net can salvage the last
+        # one if the post-condition never passes within the retry budget.
+        last_result: list[Feedbacks] = []
+
+        def _node_ids_valid(res: Feedbacks) -> PostConditionResult | None:
+            last_result.append(res)
+            invalid = [fb.node_id for fb in res.feedbacks if fb.node_id not in valid_ids]
+            if invalid:
+                return PostConditionResult(
+                    passed=False,
+                    message=(
+                        f"Feedback references unknown node id(s) {invalid}. "
+                        f"Valid ids: {sorted(valid_ids)}. Only use ids from the listed inputs."
+                    ),
+                )
+            return None
+
+        # The backward model call must not attribute to any ambient thread
+        # scope — it would spawn as a child of the user's thread and pollute the
+        # event log the graph was built from.
+        try:
+            with no_thread_scope():
+                result = self._backward_fn.replace(post_conditions=[_node_ids_valid]).run_sync(
+                    inputs=render_inputs(targets),
+                    trace=render_messages(node.messages, {}),
+                    output=str(node.value or ""),
+                    feedback=list(node.gradients),
+                    optimize_tools=self.optimize_tools,
+                )
+        except AIFunctionError:
+            # Retries exhausted without valid ids. Salvage the last attempt as a
+            # best effort rather than aborting the whole graph.
+            if not last_result:
+                logger.warning(
+                    "Backward: model produced no usable feedback for node %s after retries.",
+                    node.thread_id,
+                )
+                return
+            result = last_result[-1]
+
+        for fb in result.feedbacks:
+            target = target_map.get(fb.node_id)
+            if target is None:
+                # Only reachable on the salvage path above; a passing
+                # post-condition guarantees every id is valid.
+                self.last_dropped_feedback.append(fb.node_id)
+                logger.warning(
+                    "Backward: feedback for '%s' but no such target in node %s (dropped).",
+                    fb.node_id,
+                    node.thread_id,
+                )
+            elif isinstance(target, ParameterNode):
+                target.gradients.append(fb.feedback)
+            else:
+                # Child ThreadNode: append refined feedback; the child
+                # re-distributes it to its own targets when visited.
+                target.gradients.append(fb.feedback)
 
     def consolidate(self, root: ThreadNode) -> None:
         """Consolidate accumulated parameter gradients into their memory backends.

@@ -15,6 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
+import yaml
 from pydantic import BaseModel, Field
 
 from ai_functions import (
@@ -43,7 +44,6 @@ from ai_functions.types.graph import (
     collect_nodes,
     unwrap_nodes,
 )
-
 
 # ── Schema / helpers ─────────────────────────────────────────────────────────
 
@@ -112,8 +112,10 @@ def test_unwrap_nodes_rebuilds_containers(tmp_path: Path) -> None:
 def test_procedural_marker_detected_through_traceable() -> None:
     """A ``Traceable[Procedural]`` param is still recognized as procedural code.
 
-    The marker lives in the ``Annotated`` metadata of a union member; detection
-    must recurse into the union (the ``memory_procedural`` example relies on this).
+    Prompt functions should annotate parameters with the plain type (``Procedural``),
+    but ``Traceable[Procedural]`` remains a valid annotation: the marker then lives in
+    the ``Annotated`` metadata of a union member, so detection must recurse into the
+    union rather than only inspecting the top-level hint.
     """
 
     @ai_function[str](code_execution_mode="local")
@@ -124,8 +126,10 @@ def test_procedural_marker_detected_through_traceable() -> None:
     def _plain(note: Traceable[str]):
         """Run a task using {note}."""
 
-    assert _task.to_thread()._procedural_param_names() == {"helpers"}  # noqa: SLF001
-    assert _plain.to_thread()._procedural_param_names() == set()  # noqa: SLF001
+    from ai_functions.ai_thread.code_execution import detect_procedural_params
+
+    assert detect_procedural_params(_task.prompt_fn) == {"helpers"}
+    assert detect_procedural_params(_plain.prompt_fn) == set()
 
 
 def test_parameter_view_str_and_identity(tmp_path: Path) -> None:
@@ -256,7 +260,7 @@ async def test_trace_emits_unemitted_views_on_traced_thread(tmp_path: Path) -> N
     mem = _backend(tmp_path)
 
     @ai_function[str](structured_output=False)
-    def _writer(topic: str, joke_guidelines: Traceable[str]):
+    def _writer(topic: str, joke_guidelines: str):
         """Write about {topic} using {joke_guidelines}."""
 
     view = await mem.recall("joke_guidelines")
@@ -279,7 +283,7 @@ async def test_trace_does_not_reemit_views_emitted_elsewhere(tmp_path: Path) -> 
     other_tid = ThreadId("other-thread")
 
     @ai_function[str](structured_output=False)
-    def _writer(joke_guidelines: Traceable[str]):
+    def _writer(joke_guidelines: str):
         """Use {joke_guidelines}."""
 
     with thread_scope(coord, other_tid):
@@ -299,7 +303,7 @@ async def test_trace_dedupes_duplicate_views(tmp_path: Path) -> None:
     mem = _backend(tmp_path)
 
     @ai_function[str](structured_output=False)
-    def _writer(a: Traceable[str], b: Traceable[str]):
+    def _writer(a: str, b: str):
         """Combine {a} and {b}."""
 
     view = await mem.recall("joke_guidelines")
@@ -315,7 +319,7 @@ async def test_prompt_fn_receives_unwrapped_values(tmp_path: Path) -> None:
     seen: dict[str, object] = {}
 
     @ai_function[str](structured_output=False)
-    def _writer(joke_guidelines: Traceable[str]) -> str:
+    def _writer(joke_guidelines: str) -> str:
         seen["arg"] = joke_guidelines
         return f"Guidelines: {joke_guidelines}"
 
@@ -332,12 +336,14 @@ async def test_call_also_unwraps_views(tmp_path: Path) -> None:
     seen: dict[str, object] = {}
 
     @ai_function[str](structured_output=False)
-    def _writer(joke_guidelines: Traceable[str]) -> str:
+    def _writer(joke_guidelines: str) -> str:
         seen["arg"] = joke_guidelines
         return f"Guidelines: {joke_guidelines}"
 
     view = await mem.recall("joke_guidelines")
-    await _writer.replace(model=_scripted())(joke_guidelines=view)
+    # Passing a handle to __call__ is off-type by design (only trace() widens to
+    # Any), but the runtime still unwraps it at the run boundary — the point here.
+    await _writer.replace(model=_scripted())(joke_guidelines=view)  # pyright: ignore[reportArgumentType]
 
     assert seen["arg"] == "No specific guidelines yet."
 
@@ -347,7 +353,7 @@ async def test_call_also_unwraps_views(tmp_path: Path) -> None:
 
 async def _traced_joke(mem: JSONMemoryBackend, topic: str) -> Result[str]:
     @ai_function[str](structured_output=False)
-    def _joke_writer(topic: str, joke_guidelines: Traceable[str]):
+    def _joke_writer(topic: str, joke_guidelines: str):
         """Write a joke about {topic} using {joke_guidelines}."""
 
     return await _joke_writer.replace(model=_scripted(f"a {topic} joke")).trace(
@@ -364,7 +370,7 @@ async def test_build_graph_from_result_wires_sibling_edges(tmp_path: Path) -> No
     prog = await _traced_joke(mem, "programmers")
 
     @ai_function[str](structured_output=False)
-    def _email_writer(joke_1: Traceable[str], joke_2: Traceable[str], formatting_guidelines: Traceable[str]):
+    def _email_writer(joke_1: str, joke_2: str, formatting_guidelines: str):
         """Email with {joke_1} and {joke_2}, formatted per {formatting_guidelines}."""
 
     email = await _email_writer.replace(model=_scripted("an email")).trace(
@@ -390,14 +396,14 @@ async def test_build_graph_from_result_diamond_shares_one_node(tmp_path: Path) -
     shared = await _traced_joke(mem, "cats")
 
     @ai_function[str](structured_output=False)
-    def _consumer(joke: Traceable[str]):
+    def _consumer(joke: str):
         """Use {joke}."""
 
     left = await _consumer.replace(model=_scripted("left")).trace(joke=shared)
     right = await _consumer.replace(model=_scripted("right")).trace(joke=shared)
 
     @ai_function[str](structured_output=False)
-    def _root(a: Traceable[str], b: Traceable[str]):
+    def _root(a: str, b: str):
         """Combine {a} and {b}."""
 
     root_result = await _root.replace(model=_scripted("combined")).trace(a=left, b=right)
@@ -416,15 +422,25 @@ async def test_build_graph_from_result_diamond_shares_one_node(tmp_path: Path) -
 # ── backward through a diamond (pure graph logic, stubbed model) ─────────────
 
 
-class _StubBackwardFn:
-    """Stands in for the backward AI function; records calls, returns nothing."""
+class _EchoBackwardFn:
+    """Stands in for the backward AI function: routes each incoming feedback item
+    verbatim to every listed input id, and records how many times it ran.
+
+    ``replace`` returns ``self`` so the optimizer's per-node
+    ``.replace(post_conditions=[...])`` is a no-op offline."""
 
     def __init__(self) -> None:
         self.calls = 0
 
-    def run_sync(self, **kwargs: object) -> Feedbacks:
+    def replace(self, **kwargs: object) -> _EchoBackwardFn:
+        del kwargs
+        return self
+
+    def run_sync(self, *, inputs: str, feedback: list[str], **kwargs: object) -> Feedbacks:
+        del kwargs
         self.calls += 1
-        return Feedbacks(feedbacks=[])
+        target_ids = list(yaml.safe_load(inputs).keys())
+        return Feedbacks(feedbacks=[Feedback(node_id=tid, feedback=f) for tid in target_ids for f in feedback])
 
 
 def _node(node_id: str, *, params: bool = False) -> ThreadNode:
@@ -433,7 +449,12 @@ def _node(node_id: str, *, params: bool = False) -> ThreadNode:
 
 
 def test_backward_diamond_accumulates_from_both_parents() -> None:
-    """Feedback reaches a shared child once per consumer, and it is visited once."""
+    """A shared child is visited once, yet accumulates feedback from both parents.
+
+    With refined routing every grad-reaching node distributes through the
+    backward fn (root → b1/b2, b1/b2 → shared, shared → its param), so the echo
+    stub runs once per such node. ``shared`` still appears once in the
+    topological walk, so it collects exactly one contribution per parent."""
     shared = _node("shared", params=True)
     b1, b2 = _node("b1"), _node("b2")
     root = _node("root")
@@ -444,23 +465,30 @@ def test_backward_diamond_accumulates_from_both_parents() -> None:
     shared.parent = b1  # first-consumer-wins; informational
 
     opt = TextGradOptimizer()
-    stub = _StubBackwardFn()
+    stub = _EchoBackwardFn()
     opt._backward_fn = cast("Any", stub)  # noqa: SLF001 -- offline stand-in for the model call
 
     opt.backward(root, "fix it")
 
     assert shared.gradients == ["fix it", "fix it"]  # one contribution per parent
-    assert stub.calls == 1  # the shared node is processed exactly once
+    # root, b1, b2, shared each distribute exactly once (shared visited once).
+    assert stub.calls == 4
+    assert shared.parameters[0].gradients == ["fix it", "fix it"]  # refined onto the leaf param
     assert opt.last_dropped_feedback == []
 
 
 def test_backward_records_dropped_feedback() -> None:
-    """Feedback for an unknown parameter id is dropped and surfaced."""
+    """Feedback for an unknown target id is dropped and surfaced in ``last_dropped_feedback``."""
     node = _node("root", params=True)
 
     class _MismatchedFn:
+        def replace(self, **kwargs: object) -> _MismatchedFn:
+            del kwargs
+            return self
+
         def run_sync(self, **kwargs: object) -> Feedbacks:
-            return Feedbacks(feedbacks=[Feedback(node_name="no-such-param", feedback="x")])
+            del kwargs
+            return Feedbacks(feedbacks=[Feedback(node_id="no-such-param", feedback="x")])
 
     opt = TextGradOptimizer()
     opt._backward_fn = cast("Any", _MismatchedFn())  # noqa: SLF001

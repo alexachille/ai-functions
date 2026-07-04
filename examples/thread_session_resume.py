@@ -37,6 +37,8 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from _utils import display, rule
+
 from ai_functions import FileSessionStore, SessionStore, ai_function
 from ai_functions.runtime import InMemoryCoordinator, LocalWorker
 from ai_functions.types import Event
@@ -46,12 +48,12 @@ RESEARCHER = "researcher"
 WRITER = "writer"
 
 
-@ai_function[str](structured_output=False)
+@ai_function(structured_output=False)
 def researcher(prompt: str) -> str:
     """{prompt}"""
 
 
-@ai_function[str](structured_output=False)
+@ai_function(structured_output=False)
 def writer(prompt: str) -> str:
     """{prompt}"""
 
@@ -187,10 +189,9 @@ RESUME_PROMPTS = {
 }
 
 
-def _print_replies(replies: dict[str, str]) -> None:
-    """Print each thread's reply for one turn."""
-    for name, reply in replies.items():
-        print(f"{name}: {reply}")
+def _show_replies(title: str, replies: dict[str, str]) -> None:
+    """Render each thread's reply for one turn in a single panel."""
+    display(title, "\n".join(f"{name}: {reply}" for name, reply in replies.items()), lang="text")
 
 
 async def main() -> None:
@@ -202,18 +203,18 @@ async def main() -> None:
 
     store = FileSessionStore(args.session_dir)
 
-    # ── Phase 1: fresh session. Both threads start clean and are saved. ──
-    print("── fresh session ──")
+    # Phase 1: fresh session. Both threads start clean and are saved.
+    rule("Fresh session")
     fresh = await run_session(store, args.session_id, FRESH_PROMPTS, resume=False)
-    _print_replies(fresh)
+    _show_replies("Fresh replies", fresh)
 
-    # ── Phase 2: resume from disk. Both logs are reloaded and each thread
-    # re-spawns under its original id, so the follow-up turn sees phase 1. ──
-    print("\n── resuming session (both threads keep their history) ──")
+    # Phase 2: resume from disk. Both logs are reloaded and each thread
+    # re-spawns under its original id, so the follow-up turn sees phase 1.
+    rule("Resuming session (both threads keep their history)")
     resumed = await run_session(store, args.session_id, RESUME_PROMPTS, resume=True)
-    _print_replies(resumed)
+    _show_replies("Resumed replies", resumed)
 
-    print(f"\nsession saved to {args.session_dir / args.session_id}")
+    display("Session saved", str(args.session_dir / args.session_id), lang="text")
 
 
 if __name__ == "__main__":

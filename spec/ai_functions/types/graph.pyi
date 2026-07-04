@@ -64,6 +64,7 @@ class ParameterNode(Node):
     derivation: Literal["full", "query", "search"] = "full"
     backend: MemoryBackend | None = field(default=None, repr=False)
     description: str = ""
+    procedural: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
 
 

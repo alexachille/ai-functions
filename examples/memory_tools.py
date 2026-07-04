@@ -14,15 +14,11 @@ up the ambient thread scope the runtime opens per cycle, so they also emit
 import asyncio
 import tempfile
 
+from _utils import display
 from pydantic import BaseModel, Field
 
 from ai_functions import ai_function
 from ai_functions.memory.json_backend import JSONMemoryBackend
-
-
-def display(title: str, body: object) -> None:
-    """Print a titled section."""
-    print(f"\n{'=' * 8} {title} {'=' * 8}\n{body}")
 
 
 class TravelMemory(BaseModel):
@@ -42,8 +38,8 @@ class TravelMemory(BaseModel):
     )
 
 
-@ai_function[str]
-def travel_assistant(request: str):
+@ai_function
+def travel_assistant(request: str) -> str:
     """You are a travel planning assistant with access to the user's travel memory.
     Use the available tools to look up their preferences and past trips before
     making recommendations. You can also update their memory when they share
@@ -55,7 +51,7 @@ def travel_assistant(request: str):
 
 async def main(path: str):
     memory = JSONMemoryBackend(TravelMemory, "traveler-1", path=path)
-    display("Initial Memory", memory.dump())
+    display("Initial Memory", str(memory.dump()))
 
     # Give the agent tools for both parameters.
     tools = memory.tool_provider("preferences", "visited")
@@ -72,7 +68,7 @@ async def main(path: str):
     )
     display("Update Response", response)
 
-    display("Updated Memory", memory.dump())
+    display("Updated Memory", str(memory.dump()))
 
     # One more query to verify the agent uses the updated memory.
     response = await assistant("Based on what you know about me, what European city should I visit next?")

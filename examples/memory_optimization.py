@@ -12,27 +12,28 @@ The mental model is PyTorch autograd:
 - ``trace()``    ≈ a forward pass that remembers its inputs
 - ``step(fb)``   ≈ ``loss.backward()`` + ``optimizer.step()`` in one call
 
-No coordinator, worker, or graph wiring: passing a ``Result`` (``cat_joke``)
-or a recalled ``ParameterView`` directly as an argument is what creates the
-graph edge. Interpolating them into an f-string still computes the right
-value, but drops the edge.
+Passing a ``Result`` (``cat_joke``) or a recalled ``ParameterView`` directly
+as an argument is what creates the graph edge. Interpolating them into an
+f-string still computes the right value, but drops the edge.
 """
 
 import asyncio
 import tempfile
 from pathlib import Path
 
+from _utils import display, rule
 from pydantic import BaseModel, Field
 
-from ai_functions import JSONMemoryBackend, TextGradOptimizer, Traceable, ai_function
+from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function
 
 model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
-# Traceable[str] = str | ParameterView[str] | Result[str]: the parameter takes
-# a plain string or a dataflow handle (recalled parameter / traced result).
-@ai_function[str](model=model)
-def joke_writer(topic: str, joke_guidelines: Traceable[str]):
+# The prompt function declares its parameters as the plain types it receives:
+# trace() unwraps any recalled parameter / traced result to its value before
+# the body runs, so the body only ever sees a ``str`` here.
+@ai_function(model=model)
+def joke_writer(topic: str, joke_guidelines: str) -> str:
     """
     Write a joke about the following topic: "{topic}".
     Use the following guidelines:
@@ -42,8 +43,8 @@ def joke_writer(topic: str, joke_guidelines: Traceable[str]):
     """
 
 
-@ai_function[str](model=model)
-def email_writer(joke_1: Traceable[str], joke_2: Traceable[str], formatting_guidelines: Traceable[str]):
+@ai_function(model=model)
+def email_writer(joke_1: str, joke_2: str, formatting_guidelines: str) -> str:
     """
     Write an email to Jane Doe containing the following jokes:
     Joke 1: {joke_1}
@@ -70,23 +71,21 @@ async def main(path: str | Path) -> None:
     memory = JSONMemoryBackend(WritingMemory, actor_id="writer-1", path=path, model=model)
     optimizer = TextGradOptimizer(model=model)
 
-    print("=== Initial Memory ===")
-    print(memory)
+    display("Initial Memory", str(memory))
 
-    # ── Forward pass ──
-    # trace() runs the function like a call, but returns a Result that
-    # remembers the recalled parameters and Results passed to it.
+    # Forward pass: trace() runs the function like a call, but returns a Result
+    # that remembers the recalled parameters and Results passed to it.
     cat_joke = await joke_writer.trace(
         topic="cats",
         joke_guidelines=await memory.recall("joke_guidelines"),
     )
-    print(f"\n=== Cat Joke ===\n{cat_joke}")
+    display("Cat Joke", str(cat_joke))
 
     prog_joke = await joke_writer.trace(
         topic="programmers",
         joke_guidelines=await memory.recall("joke_guidelines"),
     )
-    print(f"\n=== Programmer Joke ===\n{prog_joke}")
+    display("Programmer Joke", str(prog_joke))
 
     # Passing the Results directly (not f-strings of them) wires the edges.
     email = await email_writer.trace(
@@ -94,32 +93,32 @@ async def main(path: str | Path) -> None:
         joke_2=prog_joke,
         formatting_guidelines=await memory.recall("formatting_guidelines"),
     )
-    print(f"\n=== Email ===\n{email}")
+    display("Email", str(email))
 
-    # ── Optimize: build graph + backward + consolidate, in one call ──
+    # Optimize: build graph + backward + consolidate, in a single call.
     feedback = (
         "Jokes about cats should always be about Siamese cats. "
         "Jokes about programmers should be about coffee. "
         "The email should include a title for each joke."
     )
-    print(f"\n=== Feedback ===\n{feedback}")
+    display("Feedback", feedback)
 
-    print("\nRunning optimizer step...")
+    rule("Running optimizer step")
     graph = await optimizer.step(email, feedback, backends=[memory])
 
-    print("\n=== Graph ===")
-    print(f"Root {graph.thread_id}: params={[p.name for p in graph.parameters]}")
+    # The returned graph exposes the gradients backpropagated to each parameter —
+    # the root's own parameters (formatting_guidelines) and each child's.
+    lines = [f"Root {graph.thread_id}: params={[p.name for p in graph.parameters]}"]
+    lines.extend(f"  {p.name}: {p.gradients}" for p in graph.parameters if p.gradients)
     for child in graph.child_threads:
-        print(f"  {child.thread_id}: params={[p.name for p in child.parameters]}")
-        for p in child.parameters:
-            if p.gradients:
-                print(f"    {p.name}: {p.gradients}")
+        lines.append(f"  {child.thread_id}: params={[p.name for p in child.parameters]}")
+        lines.extend(f"    {p.name}: {p.gradients}" for p in child.parameters if p.gradients)
+    display("Optimizer Graph", "\n".join(lines), lang="text")
 
-    print("\n=== Final Memory ===")
-    print(memory)
+    display("Final Memory", str(memory))
 
     memory.close()
-    print("\nDone — recall() now returns the improved guidelines.")
+    # recall() now returns the improved guidelines on every future run.
 
 
 if __name__ == "__main__":

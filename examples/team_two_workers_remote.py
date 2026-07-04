@@ -29,24 +29,26 @@ from __future__ import annotations
 
 import asyncio
 
+from _utils import display, rule
+
 from ai_functions import ai_function
 from ai_functions.network import CoordinatorClient, CoordinatorEndpoint
 from ai_functions.runtime import LocalWorker
 from ai_functions.types import EventKind, ResultEvent, WorkerId
 
 
-@ai_function[str](structured_output=False)
-def chat(message: str):
+@ai_function(structured_output=False)
+def chat(message: str) -> str:
     """{message}"""
 
 
 async def main() -> None:
-    # ── Endpoint: the authoritative coordinator, served over WebSocket.
+    # The endpoint is the authoritative coordinator, served over WebSocket.
     endpoint = CoordinatorEndpoint()
     await endpoint.start(host="127.0.0.1", port=9901)
-    print(f"endpoint listening at {endpoint.url}")
+    display("Endpoint", f"listening at {endpoint.url}", lang="text")
 
-    # ── Two clients, each hosting one worker.
+    # Two clients, each hosting one worker.
     client_a = await CoordinatorClient.connect(endpoint.url)
     worker_a = LocalWorker(client_a, worker_id=WorkerId("worker-A"))
     await worker_a.register()
@@ -59,37 +61,38 @@ async def main() -> None:
     alice = await worker_a.spawn_locally(chat, thread_name="alice")
     bob = await worker_b.spawn_locally(chat, thread_name="bob")
 
-    print(f"alice → {alice.id} (hosted on worker-A, client A)")
-    print(f"bob   → {bob.id} (hosted on worker-B, client B)")
-    print()
+    display(
+        "Threads",
+        "\n".join(
+            [
+                f"alice → {alice.id} (hosted on worker-A, client A)",
+                f"bob   → {bob.id} (hosted on worker-B, client B)",
+            ]
+        ),
+        lang="text",
+    )
 
     try:
-        # ── Task 1: alice lists threads registered with the coordinator ──
-        print("── Task 1: ask alice to list threads ──")
+        rule("Task 1: ask alice to list threads")
         listing = await alice.run(
             "Call the list_threads tool with no arguments. Then report back "
             "in one sentence: which threads are registered, and which of them is you?",
         )
-        print(f"alice: {listing.strip()}")
-        print()
+        display("Alice", listing.strip())
 
-        # ── Task 2: alice calls send_message(mode=wait) ──
-        print("── Task 2: ask alice to query bob (mode=wait) ──")
+        rule("Task 2: ask alice to query bob (mode=wait)")
         relayed = await alice.run(
             "Use send_message to ask bob "
             "'What is the capital of Japan?' with mode='wait'. "
             "Then report bob's reply verbatim.",
         )
-        print(f"alice: {relayed.strip()}")
-        print()
+        display("Alice", relayed.strip())
 
-        # ── Task 3: alice calls send_message(mode=continue_then_receive) ──
-        #
         # The second cycle is kicked off on the endpoint side (the
         # coordinator_tools handler schedules a peer.run(notification) on
         # alice). We subscribe to alice's RESULT events on the endpoint's
         # inner coordinator to wait for the follow-up cycle.
-        print("── Task 3: ask alice to query bob (mode=continue_then_receive) ──")
+        rule("Task 3: ask alice to query bob (mode=continue_then_receive)")
         results: asyncio.Queue[ResultEvent] = asyncio.Queue()
 
         def _on_result(event: object) -> None:
@@ -107,15 +110,14 @@ async def main() -> None:
                 "using mode='continue_then_receive'. "
                 "Then reply 'dispatched, awaiting bob' and stop.",
             )
-            print(f"alice (cycle 1): {cycle1.strip()}")
+            display("Alice (cycle 1)", cycle1.strip())
 
             # First RESULT is cycle 1 (already fired above); drop it.
             # The second one is the follow-up driven by bob's reply.
             _ = await asyncio.wait_for(results.get(), timeout=30.0)
             followup = await asyncio.wait_for(results.get(), timeout=30.0)
 
-        print(f"alice (cycle 2, triggered by bob's reply): {followup.payload.strip()}")
-        print()
+        display("Alice (cycle 2, triggered by bob's reply)", followup.payload.strip())
     finally:
         # Clean up: close clients (their channels close, workers deregister
         # from the endpoint automatically via the connection teardown),

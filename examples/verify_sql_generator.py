@@ -8,12 +8,10 @@ references, then column references — all using sqlglot's AST parser.
 """
 
 import sqlglot
+from _utils import display
 from sqlglot import exp
 
 from ai_functions import ai_function
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-# Parses CREATE TABLE DDL into a lookup table used by the post-condition validators.
 
 
 def _build_schema_catalog(schema_ddl: str) -> dict[str, set[str]]:
@@ -34,11 +32,8 @@ def _build_schema_catalog(schema_ddl: str) -> dict[str, set[str]]:
     return catalog
 
 
-# ── Post-condition 1: Syntax ────────────────────────────────────────────────
-# Three post-conditions validate progressively deeper: syntax → tables → columns.
+# Three post-conditions validate progressively deeper: syntax -> tables -> columns.
 # `dialect` and `schema` are injected from generate_sql's parameters of the same name.
-
-
 def validate_syntax(result: str, dialect: str) -> None:
     """Parse the SQL with sqlglot to catch syntax errors."""
     if not result or not result.strip():
@@ -53,9 +48,6 @@ def validate_syntax(result: str, dialect: str) -> None:
     valid_types = {"Select", "Insert", "Update", "Delete", "Union"}
     if stmt_type not in valid_types:
         raise ValueError(f"Expected a query statement, got: {stmt_type}")
-
-
-# ── Post-condition 2: Table references ──────────────────────────────────────
 
 
 def validate_table_references(result: str, schema: str, dialect: str) -> None:
@@ -88,9 +80,6 @@ def validate_table_references(result: str, schema: str, dialect: str) -> None:
 
     if unknown:
         raise ValueError(f"Unknown tables: {sorted(unknown)}. Valid tables: {sorted(valid_tables)}")
-
-
-# ── Post-condition 3: Column references ─────────────────────────────────────
 
 
 def validate_column_references(result: str, schema: str, dialect: str) -> None:
@@ -144,13 +133,9 @@ def validate_column_references(result: str, schema: str, dialect: str) -> None:
         raise ValueError("\n".join(invalid))
 
 
-# ── AI Function ─────────────────────────────────────────────────────────────
-# LOCAL mode (default): LLM gets a python_executor tool with sqlglot available,
-# so it can build/validate queries programmatically before returning the result.
-# code_executor_kwargs sets a 5s timeout to prevent runaway code.
-
-
-@ai_function[str](
+# LOCAL mode (the default) gives the LLM a python_executor tool with sqlglot
+# available, so it can build and validate queries before returning the result.
+@ai_function(
     post_conditions=[validate_syntax, validate_table_references, validate_column_references],
     max_attempts=3,
 )
@@ -169,8 +154,6 @@ def generate_sql(question: str, schema: str, dialect: str = "postgres") -> str:
     Return well-formatted SQL.
     """
 
-
-# ── Sample Data ──────────────────────────────────────────────────────────────
 
 ECOMMERCE_SCHEMA = """\
 CREATE TABLE customers (
@@ -205,8 +188,6 @@ CREATE TABLE order_items (
 );
 """
 
-# ── Main ────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     questions = [
         "List all customers from New York who placed an order in the last 30 days",
@@ -215,4 +196,4 @@ if __name__ == "__main__":
     ]
     for question in questions:
         sql = generate_sql.run_sync(question=question, schema=ECOMMERCE_SCHEMA)
-        print(f"Q: {question}\n{sql}\n")
+        display(question, sql, lang="sql")

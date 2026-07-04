@@ -24,6 +24,12 @@ from strands.models import Model
 from ..memory.base import MemoryBackend
 from ..types.graph import Result, ThreadNode
 
+OPTIMIZE_TOOLS_PROMPT: str
+"""Backward-prompt rule allowing feedback on function calls in the trace."""
+
+DO_NOT_OPTIMIZE_TOOLS_PROMPT: str
+"""Backward-prompt rule forbidding feedback on tool and function calls."""
+
 
 class TextGradOptimizer:
     """Propagate feedback through a ``ThreadNode`` graph and consolidate into memory.
@@ -45,13 +51,19 @@ class TextGradOptimizer:
     """Parameter ids from the most recent ``backward`` whose feedback matched
     no parameter and was dropped. Empty when nothing was lost."""
 
+    optimize_tools: bool
+    """Whether the backward model may also target function calls in the trace."""
+
     def __init__(
         self,
+        optimize_tools: bool = False,
         model: Model | str | None = None,
     ) -> None:
         """Build an optimizer whose internal gradient function uses ``model``.
 
         Args:
+            optimize_tools: Whether the backward model may also target function
+                calls that appear in the trace.
             model: Model (or model id) the internal feedback-distribution AI
                 function runs on. ``None`` uses the library default provider.
         """

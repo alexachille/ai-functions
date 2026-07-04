@@ -7,9 +7,10 @@ import re
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from strands.hooks import BeforeToolCallEvent, HookProvider, HookRegistry
-from strands.types.content import Message
+from strands.types.content import Message, Messages
 
 from ..types import (
+    ContextSummarizedEvent,
     Event,
     MessageAssistantCompleteEvent,
     MessageUserEvent,
@@ -31,6 +32,11 @@ if TYPE_CHECKING:
 # a bit more aggressively. That is the safer direction: oversized tails are
 # what trigger runaway overflow.
 _CHARS_PER_TOKEN: float = 3.5
+
+# Hard cap on summarization attempts per invocation (proactive + reactive
+# combined). Bounds the worst case when every strategy configuration still
+# overflows.
+_MAX_SUMMARIZATION_ATTEMPTS: int = 3
 
 # System prompt used by the dedicated-summarizer path (when forking is
 # incompatible with the parent's structured-output shape).
@@ -279,13 +285,34 @@ class DefaultSummarizationStrategy:
         split_idx = n_messages
         for i in range(n_messages - 1, -1, -1):
             msg_tokens = _estimate_message_tokens(all_messages[i])
-            if preserved_token_estimate + msg_tokens > self._preserve_max_tokens:
+            # Always keep the most-recent message, even if it alone exceeds
+            # ``preserve_max_tokens``: an empty tail would hand the whole history
+            # to the summarizer and could never shrink below its own input.
+            # Keeping >=1 message makes the summarized prefix strictly smaller,
+            # so the history shrinks monotonically; the ceiling governs the rest.
+            if preserved_count >= 1 and preserved_token_estimate + msg_tokens > self._preserve_max_tokens:
                 break
             preserved_token_estimate += msg_tokens
             preserved_count += 1
             split_idx = i
             if preserved_count >= self._preserve_min_messages and preserved_token_estimate >= self._preserve_min_tokens:
                 break
+
+        # Degenerate case: a single most-recent message larger than the
+        # preserved-tail budget. No split helps — it must sit in either the tail
+        # or the summarizer's input, and neither fits — so fail immediately
+        # rather than burning the attempt budget on an ever-shrinking prefix.
+        if preserved_token_estimate > self._preserve_max_tokens:
+            raise SummarizationFailedError(
+                function_name="",
+                reason=(
+                    f"the most recent message alone (~{preserved_token_estimate} estimated "
+                    f"tokens) exceeds the preserved-tail budget ({self._preserve_max_tokens} "
+                    "tokens); summarization cannot compact a single oversized message. "
+                    "Reduce individual message / tool-output size, or raise "
+                    "preserve_max_tokens."
+                ),
+            )
 
         split_idx = _adjust_split_point_for_tool_pairs(all_messages, split_idx)
 
@@ -364,15 +391,17 @@ class DefaultSummarizationStrategy:
                 thread_name=f"summarize:{ctx.thread_id}",
                 parent_id=ctx.thread_id,
             )
-            await coordinator.copy_events(
-                source_id=ctx.thread_id,
-                target_id=child_handle.id,
-                until_event_id=EventId(boundary_event_id),
-            )
             try:
+                await coordinator.copy_events(
+                    source_id=ctx.thread_id,
+                    target_id=child_handle.id,
+                    until_event_id=EventId(boundary_event_id),
+                )
                 raw = await child_handle.run()
             finally:
-                # Always tear the helper down, even on failure.
+                # Always tear the helper down, even if copy_events or the
+                # cycle raises — otherwise a spawned-but-failed summarizer
+                # leaks on the coordinator for the life of the session.
                 try:
                     await child_handle.terminate_now()
                 except Exception:
@@ -386,6 +415,124 @@ class DefaultSummarizationStrategy:
             ) from exc
 
         return _extract_summary_text(raw)
+
+
+class ContextFitter:
+    """Drive one invocation's summarization loop: fit history to the context budget.
+
+    Runs a :class:`SummarizationStrategy` on both the proactive threshold check
+    and the reactive post-overflow path, emitting a ``ContextSummarizedEvent``
+    boundary for each compaction.
+
+    One instance serves one ``invoke`` call. A shared attempt counter bounds
+    total summarizations per invocation so a strategy that fails to shrink the
+    history cannot loop forever. Do not reuse an instance across invocations:
+    a long-lived counter would starve later cycles of their summarization budget.
+
+    Args:
+        strategy: The pluggable compaction strategy to run.
+        function_name: Owning ``AIFunction`` name, for error attribution.
+        max_attempts: Cap on summarizations per invocation (proactive +
+            reactive combined).
+    """
+
+    __slots__ = ("_strategy", "_function_name", "_max_attempts", "_attempts")
+
+    def __init__(
+        self,
+        strategy: SummarizationStrategy,
+        function_name: str,
+        max_attempts: int = _MAX_SUMMARIZATION_ATTEMPTS,
+    ) -> None:
+        self._strategy = strategy
+        self._function_name = function_name
+        self._max_attempts = max_attempts
+        self._attempts = 0
+
+    async def fit(self, ctx: ThreadContext, cycle_config: ThreadConfig) -> Messages:
+        """Fetch the event log and return a message history under the threshold.
+
+        Proactively compacts (possibly repeatedly, up to the attempt cap) while
+        the estimated token count of the reconstructed history exceeds
+        ``cycle_config.summarization_threshold``. With no threshold configured,
+        this is a plain fetch-and-reconstruct.
+
+        Returns:
+            The reconstructed (possibly compacted) message history.
+        """
+        while True:
+            events = await ctx.coordinator.get_events(ctx.thread_id)
+            messages: Messages = reconstruct_messages(events)
+            threshold = cycle_config.summarization_threshold
+            if (
+                cycle_config.summarization_enabled
+                and threshold is not None
+                and self._attempts < self._max_attempts
+                and sum(_estimate_message_tokens(m) for m in messages) > threshold
+            ):
+                self._attempts += 1
+                await self._summarize_and_emit(ctx, cycle_config, events)
+                continue
+            return messages
+
+    async def compact_after_overflow(
+        self,
+        ctx: ThreadContext,
+        cycle_config: ThreadConfig,
+        exc: Exception,
+    ) -> None:
+        """Compact reactively after a ``ContextWindowOverflowException``.
+
+        Re-fetches the event log so the compaction includes the user turns the
+        failed model call had already appended.
+
+        With ``summarization_enabled=False`` the overflow is not compacted: the
+        original ``exc`` is re-raised unchanged so the thread fails loudly. This
+        also keeps summarizer helper threads non-recursive, since their template
+        sets the flag ``False``.
+
+        Raises:
+            ContextWindowOverflowException: ``summarization_enabled`` is
+                ``False``; the original ``exc`` propagates unchanged.
+            SummarizationFailedError: The attempt cap was already exhausted;
+                chained to ``exc``.
+        """
+        if not cycle_config.summarization_enabled:
+            raise exc
+        if self._attempts >= self._max_attempts:
+            raise SummarizationFailedError(
+                function_name=self._function_name,
+                reason=(
+                    f"Context window still overflowed after {self._max_attempts} summarization attempts: {exc}"
+                ),
+            ) from exc
+        self._attempts += 1
+        fresh_events = await ctx.coordinator.get_events(ctx.thread_id)
+        await self._summarize_and_emit(ctx, cycle_config, fresh_events)
+
+    async def _summarize_and_emit(
+        self,
+        ctx: ThreadContext,
+        cycle_config: ThreadConfig,
+        events: list[Event],
+    ) -> None:
+        """Run the strategy over ``events`` and emit the boundary event.
+
+        Wraps strategy failures in ``SummarizationFailedError`` and appends a
+        ``ContextSummarizedEvent`` whose ``new_history`` replaces the
+        summarized prefix on the next reconstruction (the I9
+        cache-invalidation point).
+        """
+        try:
+            new_history = await self._strategy.summarize(events, ctx, cycle_config)
+        except SummarizationFailedError:
+            raise
+        except Exception as strategy_exc:
+            raise SummarizationFailedError(
+                function_name=self._function_name,
+                reason=f"summarization strategy raised: {strategy_exc!r}",
+            ) from strategy_exc
+        ctx.on_event(ContextSummarizedEvent(new_history=new_history))
 
 
 class SummarizationFailedError(AIFunctionError):
@@ -463,6 +610,11 @@ def _build_fork_summarizer_template(cycle_config: ThreadConfig) -> AIFunction[[]
         post_conditions=(),
         config_hook=None,
         summarization_strategy=None,
+        # The summarizer must never summarize itself: disabling context
+        # management here makes an overflow inside the summarization cycle
+        # propagate instead of recursively spawning another summarizer.
+        summarization_enabled=False,
+        summarization_threshold=None,
         agent_kwargs=cast("AgentKwargs", new_agent_kwargs),
         thread_name="summarize:fork",
     )
@@ -487,6 +639,8 @@ def _build_dedicated_summarizer_template(cycle_config: ThreadConfig) -> AIFuncti
         agent_kwargs=AgentKwargs(),
         config_hook=None,
         summarization_strategy=None,
+        # See the fork builder: a summarizer must not summarize itself.
+        summarization_enabled=False,
         thread_name="summarize:dedicated",
     )
     return AIFunction(

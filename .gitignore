@@ -1,4 +1,5 @@
 .idea/
+.claude/
 
 *.pyc
 __pycache__/
@@ -9,10 +10,13 @@ uv.lock
 .ruff_cache/
 .venv/
 
-
 # MkDocs
 site/
 .cache/
+
+# screenshot generation scratch
+.screenshots/
+.DS_Store
 
 # example output
 examples/*.html

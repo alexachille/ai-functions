@@ -17,6 +17,8 @@ from __future__ import annotations
 from typing import cast
 
 from rich.console import Console, RenderableType
+from rich.padding import Padding
+from rich.table import Table
 from rich.text import Text
 
 from ..types import (
@@ -40,6 +42,31 @@ _MAX_PREVIEW = 240
 _MAX_USER_PREVIEW = 120
 _MAX_ARG_PREVIEW = 60
 _MAX_TOOL_RESULT_PREVIEW = 500
+
+# ── Conversation-view styling ──────────────────────────────────────────────
+_USER_PROMPT = "❯"
+_ASSISTANT_MARK = "⏺"
+_TOOL_CALL_MARK = "⚙"
+_TOOL_RESULT_MARK = "∟"
+_USER_BG = "on grey23"
+
+
+def _turn(marker: Text, body: Text) -> Table:
+    """Lay out a conversation turn with a hanging indent.
+
+    Args:
+        marker: The already-styled leading glyph (``❯`` / ``⏺`` / …).
+        body: The already-styled turn content.
+
+    Returns:
+        A borderless, full-width ``Table`` grid with a single row.
+    """
+    grid = Table.grid(expand=True, padding=0)
+    grid.add_column(width=2, no_wrap=True)
+    grid.add_column(ratio=1)
+    grid.add_row(marker, body)
+    return grid
+
 
 STRUCTURED_OUTPUT_TOOL = "FinalAnswer"
 """Name of the structured-output wrapper tool.
@@ -172,40 +199,38 @@ def format_event(event: Event, *, markup: bool = True) -> RenderableType:
 def format_event_full(event: Event) -> RenderableType:
     """Render a conversation event with full, untruncated content.
 
-    The content a user is meant to read — user turns and completed
-    assistant turns — is rendered untruncated. Tool activity is machine
-    noise, so it is still abbreviated: tool-call arguments use the same
-    per-value cap as :func:`format_event`, and a tool result's body is
-    shown but capped to a short preview. Callers decide *whether* to
-    render an event in the conversation view with
-    :func:`filter_events_full`; this function always returns a
+    Every turn is a marker glyph with a hanging indent (see :func:`_turn`),
+    so wrapped lines align to the right of the marker.
+
+    Callers decide *whether* to render an event in the conversation view
+    with :func:`filter_events_full`; this function always returns a
     renderable.
 
     Args:
         event: Any :class:`~ai_functions.types.Event` subclass.
 
     Returns:
-        A Rich renderable with the event's complete content.
+        A Rich renderable with the event's content styled for the
+        conversation view.
     """
     match event:
         case MessageUserEvent(text=text):
-            return Text(f"  ▷ user: {text}", style="cyan")
+            # ``expand=True`` stretches the grey band across the full pane
+            turn = _turn(Text(_USER_PROMPT, style="bold"), Text(text))
+            return Padding(turn, (0, 0), style=_USER_BG, expand=True)
         case MessageAssistantCompleteEvent(content=content):
             joined = _join_assistant_text(content)
             body = joined if joined else "<no text content>"
-            return Text(f"  ◁ assistant: {body}", style="magenta")
+            return _turn(Text(_ASSISTANT_MARK, style="bold"), Text(body))
         case ToolCallEvent():
-            return Text(
-                f"    ⚙ tool call: {event.tool_name}({_format_args(event.arguments)})",
-                style="blue",
-            )
+            body = Text(style="white")
+            body.append(event.tool_name, style="bright_white")
+            body.append(f"({_format_args(event.arguments)})")
+            return _turn(Text(_TOOL_CALL_MARK, style="white"), body)
         case ToolResultEvent():
-            body = _truncate(_join_tool_result_text(event.content), _MAX_TOOL_RESULT_PREVIEW)
-            suffix = f"\n{body}" if body else ""
-            return Text(
-                f"    ⚙ tool result: {event.tool_use_id} [{event.status}]{suffix}",
-                style="blue dim",
-            )
+            text = _truncate(_join_tool_result_text(event.content), _MAX_TOOL_RESULT_PREVIEW)
+            text = text if text else f"[{event.status}]"
+            return _turn(Text(_TOOL_RESULT_MARK, style="white"), Text(text, style="white"))
         case _:
             # Non-conversation kinds are excluded by ``filter_events_full``
             # before reaching here; fall back to the compact renderer.

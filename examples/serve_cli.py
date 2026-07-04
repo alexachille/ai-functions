@@ -37,14 +37,9 @@ import ai_functions
 from ai_functions import ai_function
 
 
-@ai_function[str](structured_output=False)
-def assistant(message: str) -> str:
+@ai_function(structured_output=False)
+def main(message: str) -> str:
     """{message}"""
-
-
-# ``ai-functions run examples/serve_cli.py`` hosts this object. The
-# attribute name ``main`` is the default ``--attr`` that ``run`` resolves.
-main = assistant
 
 
 if __name__ == "__main__":

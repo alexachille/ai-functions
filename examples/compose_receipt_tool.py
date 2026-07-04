@@ -9,17 +9,15 @@ The agent orchestrates three tools: read, parse, and save.
 import json
 import textwrap
 
+from _utils import display
 from pydantic import BaseModel, Field
 from strands import Agent, tool
 from strands.models import BedrockModel
 
 from ai_functions import ai_function
 
-# ── Pydantic Models ─────────────────────────────────────────────────────────
-# These models define the structured output schema.
-# The LLM's response is constrained to produce JSON matching this exact schema.
-# The Field descriptions are included in the schema sent to the LLM, so they
-# serve as guidance for what each field should contain.
+# Field descriptions are included in the JSON schema sent to the LLM, so they
+# double as per-field guidance for the model.
 
 
 class LineItem(BaseModel):
@@ -43,10 +41,9 @@ class ReceiptData(BaseModel):
     total: float = Field(description="Final total (subtotal + tax)")
 
 
-# ── Post-conditions ──────────────────────────────────────────────────────────
-# Post-conditions are regular Python functions that run AFTER the LLM produces
-# its structured output. They validate the result and, if any fail, the error
-# message is fed back to the LLM which retries (up to max_attempts times).
+# Post-conditions are plain Python functions that run after the LLM produces
+# its structured output. If one raises, the error is fed back to the LLM, which
+# retries (up to max_attempts times).
 
 
 def validate_math(result: ReceiptData) -> None:
@@ -93,12 +90,11 @@ def validate_completeness(result: ReceiptData) -> None:
         raise ValueError("\n".join(errors))
 
 
-# ── AI Function (used directly as a tool) ──────────────────────────────────
-# The `description` argument is used as the tool description that the
-# orchestrating agent sees when deciding which tool to call.
+# Used directly as a tool: the `description` argument becomes the tool
+# description the orchestrating agent sees when choosing which tool to call.
 
 
-@ai_function[ReceiptData](
+@ai_function(
     description="Parse a receipt or invoice text and extract structured expense data",
     post_conditions=[validate_math, validate_completeness],
     max_attempts=3,
@@ -121,9 +117,7 @@ def parse_receipt(receipt_text: str) -> ReceiptData:
     """
 
 
-# ── Strands Agent's Tools ────────────────────────────────────────────────────
-
-# Simulates a database or file store — the agent's save_expense tool writes here
+# Stands in for a database or file store — the save_expense tool writes here.
 _saved_expenses: list[dict] = []
 
 
@@ -162,10 +156,8 @@ def read_receipt(receipt_id: str) -> str:
     return f"Receipt '{receipt_id}' not found. Available: {available}"
 
 
-# ── Sample Data ──────────────────────────────────────────────────────────────
 # Three receipts in intentionally different formats (tabular, inline, dotted)
-# to test the LLM's ability to parse varied real-world receipt styles.
-
+# to exercise parsing of varied real-world receipt styles.
 SAMPLE_RECEIPTS = {
     "receipt_1": textwrap.dedent("""\
         INVOICE #ACT-2025-0847
@@ -216,8 +208,6 @@ SAMPLE_RECEIPTS = {
 }
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     _saved_expenses.clear()
     agent = Agent(
@@ -229,4 +219,4 @@ if __name__ == "__main__":
         "parse each one to extract the expense data, save each expense, "
         "and then give me a summary of all expenses with the grand total."
     )
-    print(result)
+    display("Expense Summary", str(result))

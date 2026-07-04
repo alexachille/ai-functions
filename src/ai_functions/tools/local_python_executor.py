@@ -6,18 +6,14 @@ no attribute escapes; only an allowlist of modules). Used to run ``Procedural``
 memory parameters: their code is injected into the execution namespace, and the
 agent calls helpers and returns a typed result via the ``final_answer`` callback.
 
-``smolagents`` is an optional dependency: importing this module is cheap, but
-constructing :class:`LocalPythonExecutorTool` raises ``ImportError`` if the
-package is not installed (``pip install strands-ai-functions[procedural]``).
+Importing this module is cheap; constructing :class:`LocalPythonExecutorTool`
+raises ``ImportError`` if ``smolagents`` is unavailable.
 
 The model returns its answer by calling ``final_answer(...)`` inside executed
 code. The tool captures that, writes it into
 ``tool_context.invocation_state["request_state"]["python_executor_result"]``,
 and requests the event loop to stop. The runtime then reads it from
-``AgentResult.state`` (see ``AIThread._extract_result``). This ``request_state``
-channel is the v2-Strands-correct location (verified to surface as
-``AgentResult.state``); the predecessor wrote to top-level ``invocation_state``,
-which does not surface in this Strands version.
+``AgentResult.state`` (see ``AIThread._extract_result``).
 """
 
 from __future__ import annotations
@@ -44,7 +40,7 @@ SAFE_BUILTINS = [
 ]  # fmt: skip
 
 
-def _generate_signature_from_model(model: type[BaseModel], func_name: str = "final_answer") -> str:
+def generate_signature_from_model(model: type[BaseModel], func_name: str = "final_answer") -> str:
     """Build a ``final_answer(...)`` signature string from a pydantic model's fields."""
     params: list[inspect.Parameter] = []
     for field_name, field_info in model.model_fields.items():
@@ -164,7 +160,7 @@ class LocalPythonExecutorTool:
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
             raise ImportError(
                 "LocalPythonExecutorTool requires the 'smolagents' package. "
-                "Install it with: pip install strands-ai-functions[procedural]"
+                "Install it with: pip install smolagents"
             ) from exc
 
         assert issubclass(output_type, BaseModel)
@@ -193,7 +189,7 @@ class LocalPythonExecutorTool:
         self.python_executor.tool_spec["description"] = self._build_tool_description()
 
     def _build_tool_description(self) -> str:
-        signature = _generate_signature_from_model(self._output_type)
+        signature = generate_signature_from_model(self._output_type)
         return textwrap.dedent(f"""\
             Execute Python code in a persistent environment.
 
@@ -222,7 +218,7 @@ class LocalPythonExecutorTool:
         if args:
             raise ValueError(
                 f"final_answer only accepts keyword arguments with the signature: "
-                f"{_generate_signature_from_model(self._output_type)}"
+                f"{generate_signature_from_model(self._output_type)}"
             )
         self._final_answer = kwargs
 

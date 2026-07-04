@@ -85,6 +85,7 @@ class ThreadKwargs(TypedDict, total=False):
     config_hook: "Callable[[ThreadContext], ThreadKwargs] | None"
     summarization_strategy: "SummarizationStrategy | None"
     summarization_threshold: int | None
+    summarization_enabled: bool
     coordinator_tools_enabled: bool
 
 
@@ -178,7 +179,22 @@ class ThreadConfig:
     ``None`` (default) is purely reactive: history is compacted only on a
     ``ContextWindowOverflowException``. When set, the runtime compacts at cycle
     entry before the model call. Keep it above the strategy's preserved tail
-    (``DefaultSummarizationStrategy.preserve_max_tokens``) so it converges."""
+    (``DefaultSummarizationStrategy.preserve_max_tokens``) so it converges.
+
+    Ignored when ``summarization_enabled`` is ``False``."""
+
+    summarization_enabled: bool = True
+    """Master switch for all context management on this thread.
+
+    ``True`` (default): the runtime compacts history via the configured
+    ``summarization_strategy`` — proactively when ``summarization_threshold``
+    is crossed, and reactively on a ``ContextWindowOverflowException``.
+
+    ``False``: no compaction ever runs. The proactive threshold check is
+    skipped and a ``ContextWindowOverflowException`` propagates unchanged
+    instead of triggering summarization — the thread fails loudly rather than
+    silently rewriting its own history. Also set on every summarizer helper
+    template so a summarization cycle can never recursively spawn another."""
 
     coordinator_tools_enabled: bool = True
     """Auto-inject the coordinator tools (``list_threads`` / ``send_message``).

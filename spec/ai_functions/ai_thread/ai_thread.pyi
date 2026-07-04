@@ -14,6 +14,7 @@ from strands.types.content import Messages
 
 from ..protocols import Thread
 from ..types import ThreadContext
+from .code_execution import CodeExecutionPlan, DisabledPlan
 from .config import ThreadConfig
 from .postcondition import PostCondition
 
@@ -150,11 +151,16 @@ class AIThread[**P, T](Thread[P, T]):
 
     # ── Internal pipeline steps ──
 
-    async def _run_cycle(self, ctx: ThreadContext) -> T:
+    async def _run_cycle(self, ctx: ThreadContext, prompt: str, bound_args: dict[str, object]) -> T:
         """Run the shared agent execution loop for one cycle.
 
         Args:
             ctx: Freshly built per-cycle context.
+            prompt: The rendered prompt for this cycle.
+            bound_args: Name→value dict of the cycle's call arguments,
+                produced by ``bind_call_args``. Used by the code-execution
+                plan (sandbox seeding / preamble) and by post-condition
+                validators that accept function parameters.
 
         Returns:
             The typed result produced by the agent.
@@ -242,12 +248,21 @@ class AIThread[**P, T](Thread[P, T]):
         """
         ...
 
-    def _extract_result(self, response: AgentResult, state: dict[str, object]) -> T:
+    def _extract_result(
+            self,
+            response: AgentResult,
+            state: dict[str, object],
+            plan: CodeExecutionPlan | DisabledPlan,
+    ) -> T:
         """Extract the typed result from a Strands ``AgentResult``.
 
         Args:
             response: The Strands agent result.
             state: Per-cycle execution state.
+            plan: The code-execution plan for this cycle. Its
+                ``claim_result`` is tried first; when code execution is
+                enabled and the executor produced a result, it takes
+                precedence over structured output.
 
         Returns:
             The typed result as declared by ``output_type``.

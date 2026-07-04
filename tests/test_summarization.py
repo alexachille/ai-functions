@@ -230,7 +230,7 @@ def test_split_raises_when_everything_preserved() -> None:
 
 
 def test_split_enforces_max_tokens() -> None:
-    """A single huge message is folded into the summarized prefix even if recent."""
+    """A huge OLDER message is folded into the summarized prefix; recent tail preserved."""
     huge_text = "x" * 200_000  # vastly over preserve_max_tokens=40_000 default
     events: list[Event] = [
         _mk_user_event("first"),
@@ -244,13 +244,87 @@ def test_split_enforces_max_tokens() -> None:
         preserve_max_tokens=40_000,
     )
     to_summarize, preserved, _boundary = strategy._split(events)  # noqa: SLF001
-    # The huge message is NOT in preserved (it exceeds the ceiling).
+    # The huge message is NOT in preserved (it exceeds the ceiling once the
+    # most-recent "tail" message is already kept).
     for ev in preserved:
         if isinstance(ev, MessageUserEvent):
             assert len(ev.text) < 100_000, "huge message should not be preserved"
     # ... but it IS somewhere in to_summarize (as a MessageUserEvent).
     summarized_texts = [e.text for e in to_summarize if isinstance(e, MessageUserEvent)]
     assert any(len(t) >= 100_000 for t in summarized_texts)
+
+
+def test_split_preserves_newest_and_shrinks_when_newest_fits() -> None:
+    """When the newest message fits the ceiling, it is preserved and the prefix shrinks.
+
+    The monotonic-shrink guarantee: a successful split always yields a non-empty
+    preserved tail (containing at least the newest message) and a summarized
+    prefix strictly smaller than the full history. An empty preserved tail is
+    not a valid split; that case raises instead (see the degenerate tests).
+    """
+    huge_older = "x" * 200_000
+    events: list[Event] = [
+        _mk_user_event(huge_older),  # must be summarized
+        _mk_user_event("recent small turn"),  # newest: fits, must be preserved
+    ]
+    strategy = DefaultSummarizationStrategy(
+        preserve_min_messages=1,
+        preserve_min_tokens=0,
+        preserve_max_tokens=2_000,  # above the small newest turn, below the huge one
+    )
+    to_summarize, preserved, _boundary = strategy._split(events)  # noqa: SLF001
+    # The newest message is preserved; the huge older one is summarized.
+    assert len(preserved) == 1
+    assert isinstance(preserved[0], MessageUserEvent)
+    assert preserved[0].text == "recent small turn"
+    # Prefix is non-empty and strictly smaller than the input (the shrink
+    # guarantee).
+    assert len(to_summarize) == 1
+    assert len(to_summarize) < len(events)
+
+
+def test_split_raises_on_single_oversized_message() -> None:
+    """A single message bigger than the tail budget fails honestly (degenerate case).
+
+    When the most-recent message alone exceeds ``preserve_max_tokens`` there is
+    no split that helps: the oversized message must live in either the preserved
+    tail or the summarizer's input, and neither fits. ``_split`` raises
+    immediately rather than summarizing an ever-shrinking prefix while the
+    oversized tail survives every pass.
+    """
+    huge_text = "x" * 200_000
+    events: list[Event] = [
+        _mk_user_event("small older turn"),
+        _mk_user_event(huge_text),  # newest message: alone exceeds the ceiling
+    ]
+    strategy = DefaultSummarizationStrategy(
+        preserve_min_messages=1,
+        preserve_min_tokens=0,
+        preserve_max_tokens=1_000,
+    )
+    with pytest.raises(SummarizationFailedError, match="single oversized message"):
+        strategy._split(events)  # noqa: SLF001
+
+
+def test_split_two_message_degenerate_case_raises() -> None:
+    """The exact two-message shape: small prompt + oversized tool result → honest error.
+
+    A user prompt followed by one tool result that by itself fills the context.
+    Summarizing the prompt does not help; the giant result cannot be split.
+    ``_split`` raises rather than looping.
+    """
+    huge_result = "y" * 300_000
+    events: list[Event] = [
+        _mk_user_event("please read the giant file"),
+        _mk_assistant_event(huge_result),  # stands in for an oversized tool result
+    ]
+    strategy = DefaultSummarizationStrategy(
+        preserve_min_messages=1,
+        preserve_min_tokens=0,
+        preserve_max_tokens=2_000,
+    )
+    with pytest.raises(SummarizationFailedError, match="single oversized message"):
+        strategy._split(events)  # noqa: SLF001
 
 
 # ── Tool-pair adjustment helper ───────────────────────────────────────────────
@@ -379,7 +453,173 @@ async def test_strategy_rejects_forking_with_structured_output() -> None:
         await strategy.summarize(events, cast(Any, object()), cycle_config)  # pyright: ignore[reportExplicitAny]
 
 
+# ── summarization_enabled: recursion guard on summarizer templates ────────────
+
+
+def test_summarizer_templates_disable_summarization() -> None:
+    """Both summarizer builders produce a template with summarization disabled.
+
+    This is the recursion guard: a summarizer thread must never itself summarize
+    (proactively or reactively), or a summarization cycle could spawn another
+    summarizer without bound.
+    """
+    from ai_functions.ai_thread.config import ThreadConfig
+    from ai_functions.ai_thread.summarization import (
+        _build_dedicated_summarizer_template,
+        _build_fork_summarizer_template,
+    )
+
+    # Fork path: inherits parent config but must force the guard on. Parent has
+    # summarization on with a threshold set — neither may leak to the child.
+    parent = ThreadConfig(
+        structured_output=False,
+        summarization_enabled=True,
+        summarization_threshold=1_000,
+    )
+    fork = _build_fork_summarizer_template(parent)  # noqa: SLF001
+    assert fork.config.summarization_enabled is False
+    assert fork.config.summarization_threshold is None
+
+    # Dedicated path: minimal config, also guarded.
+    dedicated = _build_dedicated_summarizer_template(parent)  # noqa: SLF001
+    assert dedicated.config.summarization_enabled is False
+    assert dedicated.config.summarization_threshold is None
+
+
+async def test_summarization_disabled_reraises_overflow() -> None:
+    """With summarization_enabled=False, a ContextWindowOverflowException propagates.
+
+    The thread fails loudly instead of compacting. This is both a standalone
+    option (surface overflow rather than rewrite history) and the mechanism that
+    makes summarizer helpers non-recursive.
+    """
+    # A model that always overflows. With summarization disabled there is no
+    # reactive compaction, so the overflow must surface unchanged.
+    always_overflow = _OverflowAlwaysModel()
+
+    @ai_function[str](
+        structured_output=False,
+        model=cast(Any, always_overflow),  # pyright: ignore[reportExplicitAny]
+        summarization_enabled=False,
+    )
+    def _ask(q: str) -> str:
+        return q
+
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_ask)
+        with pytest.raises(ContextWindowOverflowException):
+            await handle.run("hello")
+
+
+async def test_forked_summarizer_that_overflows_does_not_recurse() -> None:
+    """A summarizer child that itself overflows re-raises — it never re-summarizes.
+
+    Both the parent and the summarizer model overflow. Because the summarizer
+    template disables summarization, the child raises instead of spawning a
+    grandchild, and the parent surfaces a bounded SummarizationFailedError. A
+    call counter proves only one summarizer thread was ever created.
+    """
+    summarizer_calls = 0
+
+    class _ParentOverflowSummarizerOverflowModel(Model):
+        """Parent call overflows once; every summarizer call also overflows."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._parent_raised = False
+
+        def update_config(self, **_config: Any) -> None:  # pyright: ignore[reportExplicitAny, reportAny]
+            pass
+
+        def get_config(self) -> dict[str, object]:
+            return {}
+
+        def stream(
+            self,
+            messages: Messages,
+            tool_specs: list[ToolSpec] | None = None,
+            system_prompt: str | None = None,
+            *,
+            tool_choice: ToolChoice | None = None,
+            system_prompt_content: list[SystemContentBlock] | None = None,
+            invocation_state: dict[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
+            **kwargs: Any,  # pyright: ignore[reportExplicitAny, reportAny]
+        ) -> AsyncIterable[StreamEvent]:
+            del tool_specs, tool_choice, system_prompt_content, invocation_state, kwargs
+            nonlocal summarizer_calls
+            if system_prompt and "summarization" in system_prompt.lower():
+                summarizer_calls += 1
+                raise ContextWindowOverflowException("summarizer input also too long")
+            if not self._parent_raised:
+                self._parent_raised = True
+                raise ContextWindowOverflowException("parent overflow triggers summarization")
+            from ai_functions.testing.scripted_model import _stream_turn  # noqa: PLC0415
+
+            return _stream_turn(Turn(text="unreachable"))
+
+        def structured_output(self, *args: object, **kwargs: object) -> Any:  # pyright: ignore[reportExplicitAny]
+            del args, kwargs
+            raise NotImplementedError
+
+    strategy = DefaultSummarizationStrategy(
+        summarize_by_forking=False,  # dedicated path routes by summarizer system prompt
+        preserve_min_messages=1,
+        preserve_min_tokens=0,
+        preserve_max_tokens=100_000,
+    )
+
+    @ai_function[str](
+        structured_output=False,
+        model=cast(Any, _ParentOverflowSummarizerOverflowModel()),  # pyright: ignore[reportExplicitAny]
+        summarization_strategy=strategy,
+    )
+    def _ask(q: str) -> str:
+        return q
+
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_ask)
+        await handle.notify("seed 1")
+        await handle.notify("seed 2")
+        # Parent overflows → summarize → summarizer overflows → child re-raises
+        # (no recursion) → parent wraps as SummarizationFailedError. Bounded.
+        with pytest.raises(SummarizationFailedError):
+            await handle.run("hello")
+
+    # The summarizer thread ran and overflowed, but did NOT spawn another
+    # summarizer: exactly one summarizer model call, not an unbounded chain.
+    assert summarizer_calls == 1
+
+
 # ── End-to-end: reactive summarization on overflow ────────────────────────────
+
+
+class _OverflowAlwaysModel(Model):
+    """Model that raises ``ContextWindowOverflowException`` on every call."""
+
+    def update_config(self, **_config: Any) -> None:  # pyright: ignore[reportExplicitAny, reportAny]
+        pass
+
+    def get_config(self) -> dict[str, object]:
+        return {}
+
+    def stream(
+        self,
+        messages: Messages,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
+        *,
+        tool_choice: ToolChoice | None = None,
+        system_prompt_content: list[SystemContentBlock] | None = None,
+        invocation_state: dict[str, Any] | None = None,  # pyright: ignore[reportExplicitAny]
+        **kwargs: Any,  # pyright: ignore[reportExplicitAny, reportAny]
+    ) -> AsyncIterable[StreamEvent]:
+        del messages, tool_specs, system_prompt, tool_choice
+        del system_prompt_content, invocation_state, kwargs
+        raise ContextWindowOverflowException("simulated overflow: input is too long")
+
+    def structured_output(self, *args: object, **kwargs: object) -> Any:  # pyright: ignore[reportExplicitAny]
+        del args, kwargs
+        raise NotImplementedError
 
 
 class _OverflowOnceModel(Model):
@@ -520,13 +760,14 @@ async def test_summarization_flow_emits_context_summarized_event() -> None:
 async def test_proactive_summarization_fires_on_token_threshold() -> None:
     """summarization_threshold compacts accumulated history BEFORE a model call.
 
-    Proactive summarization is a cross-cycle mechanism: it runs at the entry of
-    each cycle over the logged history. Here a scripted model returns a long
-    answer on the first ``run`` (logged), so the second ``run`` enters with a
-    history above the tiny threshold and compacts proactively — no
-    ``ContextWindowOverflowException`` involved.
+    Proactive summarization runs at cycle entry over the logged history. A big
+    turn is seeded via ``notify`` and logged by the first ``run``; the second
+    ``run`` enters above the tiny threshold and compacts proactively, summarizing
+    the big older turn while preserving the small recent tail. No
+    ``ContextWindowOverflowException`` is involved.
     """
-    long_answer = Turn(text="word " * 400)  # ~400 tokens, logged after cycle 1
+    big_older_turn = "word " * 400  # ~570 tokens, becomes an older logged turn
+    first_answer = Turn(text="first-answer")
     short_answer = Turn(text="second-answer")
     summary_turn = Turn(text="<summary>COMPACTED</summary>")
 
@@ -558,34 +799,39 @@ async def test_proactive_summarization_fires_on_token_threshold() -> None:
             if system_prompt and "summarization" in system_prompt.lower():
                 return _stream_turn(summary_turn)
             self._answers += 1
-            return _stream_turn(long_answer if self._answers == 1 else short_answer)
+            return _stream_turn(first_answer if self._answers == 1 else short_answer)
 
         def structured_output(self, *args: object, **kwargs: object) -> Any:  # pyright: ignore[reportExplicitAny]
             del args, kwargs
             raise NotImplementedError
 
-    # Preserve only a tiny tail so ONE compaction drops the history below the
-    # threshold (otherwise proactive summarization re-fires up to the cap).
+    # min_messages=1 preserves only the most-recent (small) turn; the big older
+    # turn falls into the summarized prefix. preserve_max_tokens sits above the
+    # small tail and below the big turn so ONE compaction drops the history
+    # under the threshold.
     strategy = DefaultSummarizationStrategy(
         summarize_by_forking=False,
         preserve_min_messages=1,
         preserve_min_tokens=0,
-        preserve_max_tokens=20,
+        preserve_max_tokens=200,
     )
 
     @ai_function[str](
         structured_output=False,
         model=cast(Any, _CompositeModel()),  # pyright: ignore[reportExplicitAny]
         summarization_strategy=strategy,
-        summarization_threshold=100,  # first answer (~400 tokens) will exceed this
+        summarization_threshold=100,  # the big older turn (~570 tokens) will exceed this
     )
     def _ask(q: str) -> str:
         return q
 
     async with RuntimeHarness() as h:
         handle = await h.spawn(_ask)
-        first = await handle.run("start")  # logs a long assistant answer
-        assert first.strip() == long_answer.text.strip()
+        # Seed the big turn as OLDER content: it is drained + logged by run 1,
+        # then summarized when run 2 enters above the threshold.
+        await handle.notify(big_older_turn)
+        first = await handle.run("start")  # logs [user(big), user("start"), assistant(first)]
+        assert first.strip() == "first-answer"
 
         events_after_first = await h.worker.coordinator.get_events(handle.id)
         assert not [e for e in events_after_first if isinstance(e, ContextSummarizedEvent)]

@@ -30,6 +30,7 @@ from ai_functions import (
     build_graph,
 )
 from ai_functions.optimizer._graph import _reconstruct_node, topological_sort
+from ai_functions.optimizer.textgrad import Feedback, Feedbacks
 from ai_functions.runtime import InMemoryCoordinator
 from ai_functions.types import ParameterRecalledEvent, ThreadId, current_thread_scope, thread_scope
 from ai_functions.types.events import (
@@ -536,6 +537,55 @@ def test_reconstruct_node_value_none_without_assistant_turn(tmp_path: Path) -> N
     assert node.value is None
 
 
+def test_reconstruct_node_value_prefers_result_event_over_preamble(tmp_path: Path) -> None:
+    """The node value is the serialized ResultEvent output, not the assistant preamble.
+
+    The backward pass needs the true output so distinct child results are
+    distinguishable (the JSON payload is decoded back to the bare string).
+    """
+    from ai_functions.types.events import ResultEvent
+
+    mem = _backend(tmp_path)
+    events = [
+        _recall_event(mem, "joke_guidelines", "joke-1"),
+        MessageAssistantCompleteEvent(
+            thread_id=ThreadId("joke-1"),
+            content=[{"text": "I'll write a joke about cats for you."}],
+        ),
+        ResultEvent(thread_id=ThreadId("joke-1"), payload='"Why did the Siamese cat cross the road?"'),
+    ]
+
+    node = _reconstruct_node(events, [mem])
+
+    assert node.value == "Why did the Siamese cat cross the road?"
+
+
+def test_reconstruct_node_falls_back_to_preamble_without_result_event(tmp_path: Path) -> None:
+    """Without a ResultEvent, the node value still falls back to the assistant text."""
+    mem = _backend(tmp_path)
+    events = [
+        _recall_event(mem, "joke_guidelines", "joke-1"),
+        MessageAssistantCompleteEvent(thread_id=ThreadId("joke-1"), content=[{"text": "just the text"}]),
+    ]
+
+    node = _reconstruct_node(events, [mem])
+
+    assert node.value == "just the text"
+
+
+def test_reconstruct_node_ids_unique_per_thread(tmp_path: Path) -> None:
+    """Two threads sharing a func name but distinct ids get distinct node_ids.
+
+    node_id must be injective on thread_id — render_inputs / the backward pass
+    key routable targets by it, so a collision would silently drop a sibling
+    result.
+    """
+    mem = _backend(tmp_path)
+    a = _reconstruct_node([_recall_event(mem, "joke_guidelines", "thread-aaaa1111")], [mem])
+    b = _reconstruct_node([_recall_event(mem, "joke_guidelines", "thread-bbbb2222")], [mem])
+    assert a.node_id != b.node_id
+
+
 # ── build_graph: recursion into spawned children ───────────────────────────
 
 
@@ -1017,12 +1067,13 @@ def test_ai_function_accepts_code_execution_mode() -> None:
 
 
 def test_procedural_param_detection() -> None:
-    """_procedural_param_names detects Procedural-typed params, ignores plain str.
+    """detect_procedural_params detects Procedural-typed params, ignores plain str.
 
     This is the central wiring: only params the thread reports as procedural get
     their code DEFINED in the executor namespace (via initial_code). A plain str
     param would land in initial_state as an inert string the sandbox can't exec.
     """
+    from ai_functions.ai_thread.code_execution import detect_procedural_params
 
     @ai_function[str](code_execution_mode="local")
     def proc_fn(helper_functions: Procedural, topic: str):
@@ -1032,8 +1083,8 @@ def test_procedural_param_detection() -> None:
     def str_fn(helper_functions: str):
         """Use {helper_functions}."""
 
-    assert proc_fn.to_thread()._procedural_param_names() == {"helper_functions"}  # noqa: SLF001
-    assert str_fn.to_thread()._procedural_param_names() == set()  # noqa: SLF001
+    assert detect_procedural_params(proc_fn.prompt_fn) == {"helper_functions"}
+    assert detect_procedural_params(str_fn.prompt_fn) == set()
 
 
 @pytest.mark.skipif(not _HAS_SMOLAGENTS, reason="requires smolagents installed")
@@ -1069,20 +1120,24 @@ def test_with_python_executor_is_fresh_per_attempt() -> None:
 def test_procedural_param_code_becomes_callable() -> None:
     """End-to-end wiring (offline): a Procedural param's recalled code is callable.
 
-    Replicates the split _run_cycle performs — procedural-typed args go to
-    initial_code (defined at setup), the rest to initial_state — and proves the
-    helper is then callable. This covers the integration path that the live
+    Replicates the split CodeExecutionPlan performs — procedural-typed args go
+    to initial_code (defined at setup), the rest to initial_state — and proves
+    the helper is then callable. This covers the integration path that the live
     example exercises, without a model.
     """
+    from ai_functions.ai_thread.code_execution import bind_call_args, detect_procedural_params
     from ai_functions.tools.local_python_executor import LocalPythonExecutorTool
 
     @ai_function[str](code_execution_mode="local")
     def proc_fn(helper_functions: Procedural, topic: str):
         """Use {helper_functions} for {topic}."""
 
-    thread = proc_fn.to_thread()
-    bound = thread._bind_args(helper_functions="def shout(s):\n    return s.upper()\n", topic="x")  # noqa: SLF001
-    procedural = thread._procedural_param_names()  # noqa: SLF001
+    bound = bind_call_args(
+        proc_fn.prompt_fn,
+        ("def shout(s):\n    return s.upper()\n", "x"),
+        {},
+    )
+    procedural = detect_procedural_params(proc_fn.prompt_fn)
     initial_code = [str(v) for k, v in bound.items() if k in procedural and isinstance(v, str)]
     initial_state = {k: v for k, v in bound.items() if k not in procedural}
 
@@ -1112,34 +1167,35 @@ def _agent_result(
     )
 
 
-def test_with_python_executor_noop_when_disabled() -> None:
-    """code_execution_mode != LOCAL returns the config unchanged (no executor tool)."""
+def test_plan_disabled_when_code_execution_off() -> None:
+    """CodeExecutionPlan.build returns a DisabledPlan when mode != LOCAL."""
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan, DisabledPlan
 
     @ai_function[str]
     def fn(helpers: str):
         """Use {helpers}."""
 
-    thread = fn.to_thread()
-    cfg = thread.config
-    # DISABLED is the default -> identical config object, no tool appended.
-    assert thread._with_python_executor(cfg) is cfg  # noqa: SLF001
+    plan = CodeExecutionPlan.build(fn.config, None, set(), {}, fn.name)
+    assert isinstance(plan, DisabledPlan)
+    assert plan.preamble() == ""
+    assert plan.config_with_tool(fn.config) is fn.config
 
 
-def test_with_python_executor_rejects_plain_str_return() -> None:
+def test_plan_rejects_plain_str_return() -> None:
     """code_execution_mode=LOCAL with a plain str return raises a clear error.
 
     The python_executor's final_answer needs a typed model; a bare str return
     has none (structured_output_model is None), so the guard must fail fast.
     """
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
     from ai_functions.ai_thread.errors import AIFunctionError
 
     @ai_function[str](code_execution_mode="local", structured_output=False)
     def fn(helpers: str):
         """Use {helpers}."""
 
-    thread = fn.to_thread()
     with pytest.raises(AIFunctionError, match="plain str return type"):
-        thread._with_python_executor(thread.config)  # noqa: SLF001
+        CodeExecutionPlan.build(fn.config, None, set(), {}, fn.name)
 
 
 def test_non_json_serializable_return_disables_structured_output() -> None:
@@ -1177,24 +1233,29 @@ def test_serialize_result_degrades_for_non_serializable() -> None:
 
 
 @pytest.mark.skipif(not _HAS_SMOLAGENTS, reason="requires smolagents installed")
-def test_with_python_executor_appends_executor_tool() -> None:
-    """LOCAL mode appends exactly one python_executor tool to the cycle config."""
+def test_plan_appends_executor_tool() -> None:
+    """LOCAL mode plan appends exactly one python_executor tool via config_with_tool."""
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan, bind_call_args, detect_procedural_params
 
     @ai_function[str](code_execution_mode="local")
     def fn(helpers: Procedural, topic: str):
         """Use {helpers} for {topic}."""
 
-    thread = fn.to_thread()
-    thread._bound_args = thread._bind_args(  # noqa: SLF001
-        helpers="def shout(s):\n    return s.upper()\n", topic="x"
+    bound = bind_call_args(fn.prompt_fn, ("def shout(s):\n    return s.upper()\n", "x"), {})
+    plan = CodeExecutionPlan.build(
+        fn.config,
+        fn.to_thread()._output_spec.structured_output_model,  # noqa: SLF001
+        detect_procedural_params(fn.prompt_fn),
+        bound,
+        fn.name,
     )
-    new_cfg = thread._with_python_executor(thread.config)  # noqa: SLF001
+    new_cfg = plan.config_with_tool(fn.config)
 
-    assert len(new_cfg.tools) == len(thread.config.tools) + 1
+    assert len(new_cfg.tools) == len(fn.config.tools) + 1
     appended = new_cfg.tools[-1]
     assert getattr(appended, "tool_name", None) == "python_executor"
     # The source config is untouched (a fresh config per attempt).
-    assert len(thread.config.tools) == len(new_cfg.tools) - 1
+    assert len(fn.config.tools) == len(new_cfg.tools) - 1
 
 
 # ── _extract_result: structured / executor / error branches ─────────────────
@@ -1206,6 +1267,7 @@ def test_extract_result_local_prefers_executor_over_structured() -> None:
     A late structured tool call must not override the answer the model
     explicitly committed to via final_answer(...).
     """
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
 
     class Answer(BaseModel):
         answer: str = Field(...)
@@ -1215,16 +1277,18 @@ def test_extract_result_local_prefers_executor_over_structured() -> None:
         """About {topic}."""
 
     thread = fn.to_thread()
+    plan = CodeExecutionPlan.build(thread.config, Answer, set(), {}, fn.name)
     response = _agent_result(
         structured=Answer(answer="from-structured"),
         state={"python_executor_result": Answer(answer="from-executor")},
     )
-    result = thread._extract_result(response, response.state)  # noqa: SLF001
+    result = thread._extract_result(response, response.state, plan)  # noqa: SLF001
     assert result.answer == "from-executor"
 
 
 def test_extract_result_non_local_uses_structured_output() -> None:
     """Without LOCAL mode the structured output wins over any executor state."""
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
 
     class Answer(BaseModel):
         answer: str = Field(...)
@@ -1234,16 +1298,18 @@ def test_extract_result_non_local_uses_structured_output() -> None:
         """About {topic}."""
 
     thread = fn.to_thread()
+    plan = CodeExecutionPlan.build(thread.config, Answer, set(), {}, fn.name)
     response = _agent_result(
         structured=Answer(answer="from-structured"),
         state={"python_executor_result": Answer(answer="from-executor")},
     )
-    result = thread._extract_result(response, response.state)  # noqa: SLF001
+    result = thread._extract_result(response, response.state, plan)  # noqa: SLF001
     assert result.answer == "from-structured"
 
 
 def test_extract_result_falls_back_to_executor_when_structured_missing() -> None:
     """When structured output is absent the executor result is used as fallback."""
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
 
     class Answer(BaseModel):
         answer: str = Field(...)
@@ -1253,11 +1319,12 @@ def test_extract_result_falls_back_to_executor_when_structured_missing() -> None
         """About {topic}."""
 
     thread = fn.to_thread()
+    plan = CodeExecutionPlan.build(thread.config, Answer, set(), {}, fn.name)
     response = _agent_result(
         structured=None,
         state={"python_executor_result": Answer(answer="from-executor")},
     )
-    result = thread._extract_result(response, response.state)  # noqa: SLF001
+    result = thread._extract_result(response, response.state, plan)  # noqa: SLF001
     assert result.answer == "from-executor"
 
 
@@ -1267,6 +1334,7 @@ def test_extract_result_unwraps_wrapped_executor_answer() -> None:
     Non-pydantic output types are wrapped in a FinalAnswer model; the extracted
     result must be the inner ``answer`` value, not the wrapper.
     """
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
 
     @ai_function[int](code_execution_mode="local")
     def fn(topic: str):
@@ -1276,16 +1344,48 @@ def test_extract_result_unwraps_wrapped_executor_answer() -> None:
     wrapped_model = thread._output_spec.structured_output_model  # noqa: SLF001
     assert wrapped_model is not None
     assert thread._output_spec.is_wrapped is True  # noqa: SLF001
+    plan = CodeExecutionPlan.build(thread.config, wrapped_model, set(), {}, fn.name)
     response = _agent_result(
         structured=None,
         state={"python_executor_result": wrapped_model(answer=42)},
     )
-    assert thread._extract_result(response, response.state) == 42  # noqa: SLF001
+    assert thread._extract_result(response, response.state, plan) == 42  # noqa: SLF001
 
 
-def test_extract_result_raises_when_neither_present() -> None:
-    """No structured output and no executor result is a hard error, not None."""
-    from ai_functions.ai_thread.errors import AIFunctionError
+def test_extract_result_honors_cycle_config_not_base_config() -> None:
+    """Executor-result precedence follows the cycle config, not the base config.
+
+    A config_hook may enable code execution for a single cycle. The plan built
+    from the patched cycle config claims the executor result; a DisabledPlan
+    (from the base config) would not.
+    """
+    import dataclasses
+
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
+    from ai_functions.ai_thread.config import CodeExecutionMode
+
+    class Answer(BaseModel):
+        answer: str = Field(...)
+
+    @ai_function[Answer]  # base config: code execution DISABLED
+    def fn(topic: str):
+        """About {topic}."""
+
+    thread = fn.to_thread()
+    cycle_config = dataclasses.replace(thread.config, code_execution_mode=CodeExecutionMode.LOCAL)
+    plan = CodeExecutionPlan.build(cycle_config, Answer, set(), {}, fn.name)
+    response = _agent_result(
+        structured=Answer(answer="from-structured"),
+        state={"python_executor_result": Answer(answer="from-executor")},
+    )
+    result = thread._extract_result(response, response.state, plan)  # noqa: SLF001
+    assert result.answer == "from-executor"
+
+
+def test_extract_result_signals_no_result() -> None:
+    """No structured output and no executor result raises the internal no-result marker."""
+    from ai_functions.ai_thread.ai_thread import _NoResultProduced
+    from ai_functions.ai_thread.code_execution import CodeExecutionPlan
 
     class Answer(BaseModel):
         answer: str = Field(...)
@@ -1295,9 +1395,10 @@ def test_extract_result_raises_when_neither_present() -> None:
         """About {topic}."""
 
     thread = fn.to_thread()
+    plan = CodeExecutionPlan.build(thread.config, Answer, set(), {}, fn.name)
     response = _agent_result(structured=None, state={})
-    with pytest.raises(AIFunctionError, match="neither a structured"):
-        thread._extract_result(response, response.state)  # noqa: SLF001
+    with pytest.raises(_NoResultProduced):
+        thread._extract_result(response, response.state, plan)  # noqa: SLF001
 
 
 # ── Targeted regression tests for review findings ───────────────────────────
@@ -1315,14 +1416,14 @@ def test_agentcore_memory_id_matches_hyphenated_name() -> None:
 
 
 def test_bind_args_keeps_positional_inputs() -> None:
-    """_bind_args names positional args by param even on the fallback path."""
+    """bind_call_args names positional args by param even on the fallback path."""
+    from ai_functions.ai_thread.code_execution import bind_call_args
 
     @ai_function[str]
     def fn(helper_functions: str, topic: str):
         """Use {helper_functions} for {topic}."""
 
-    thread = fn.to_thread()
-    bound = thread._bind_args("code-here", "the-topic")  # noqa: SLF001 -- positional
+    bound = bind_call_args(fn.prompt_fn, ("code-here", "the-topic"), {})
     assert bound["helper_functions"] == "code-here"
     assert bound["topic"] == "the-topic"
 
@@ -1338,32 +1439,150 @@ def test_render_messages_skips_non_dict_blocks() -> None:
     assert "real" in out
 
 
-def test_backward_forwards_feedback_to_child_params() -> None:
-    """backward forwards a parent's gradients to children, which refine to their params.
+class _RouteToIdFn:
+    """Offline stand-in for the backward AI function.
 
-    Deterministic via a stubbed gradient fn that refines whatever feedback it
-    receives onto the visited node's own parameter. Proves feedback reaches a
-    depth-2 child's parameter (the multi-hop path).
+    Returns one feedback item per (id in ``responses``) that also appears in the
+    rendered ``inputs`` YAML, so it can drive multi-hop routing deterministically
+    without a model. ``replace`` returns ``self`` so the optimizer's per-node
+    ``.replace(post_conditions=[...])`` is a no-op offline."""
+
+    def __init__(self, responses: dict[str, str]) -> None:
+        self.responses = responses
+        self.seen_inputs: list[dict[str, dict[str, object]]] = []
+
+    def replace(self, **kwargs: object) -> _RouteToIdFn:
+        del kwargs
+        return self
+
+    def run_sync(self, *, inputs: str, feedback: list[str], **kwargs: object) -> Feedbacks:  # noqa: ARG002
+        import yaml
+
+        rendered = yaml.safe_load(inputs) or {}
+        self.seen_inputs.append(rendered)
+        return Feedbacks(
+            feedbacks=[Feedback(node_id=nid, feedback=fb) for nid, fb in self.responses.items() if nid in rendered]
+        )
+
+
+def test_backward_forwards_refined_feedback_to_child_params() -> None:
+    """backward routes refined feedback to a child thread, which re-refines to its param.
+
+    Deterministic via a stubbed gradient fn keyed by node id. The root routes
+    refined feedback to the child *thread* (a routable target); when the child
+    is visited it routes that refined feedback to its own parameter — proving
+    the multi-hop path with refined (not raw-forwarded) feedback.
     """
-    from ai_functions.optimizer import textgrad as tg
-
     backend = _RecordingBackend(WritingMemory, "w1")
     child_param = ParameterNode(node_id="cp", name="joke_guidelines", backend=backend, requires_grad=True)
     child = ThreadNode(node_id="child", thread_id="child", parameters=[child_param])
     root = ThreadNode(node_id="root", thread_id="root", child_threads=[child])
 
-    # Fake gradient fn: refine the incoming feedback onto every grad param it
-    # is given (matched by node_id, which is what the real fn returns).
-    class _FakeFn:
-        def run_sync(self, *, parameters: str, trace: str, output: str, feedback: list[str]) -> tg.Feedbacks:
-            del parameters, trace, output
-            return tg.Feedbacks(feedbacks=[tg.Feedback(node_name="cp", feedback="refined-for-param")])
-
+    # At root, the only routable target is the child thread (node_id "child").
+    # At the child, the only routable target is its parameter (node_id "cp").
+    fn = _RouteToIdFn({"child": "refined-for-child", "cp": "refined-for-param"})
     opt = TextGradOptimizer()
-    opt._backward_fn = _FakeFn()  # type: ignore[assignment]  # noqa: SLF001
+    opt._backward_fn = fn  # type: ignore[assignment]  # noqa: SLF001
     opt.backward(root, "top-level feedback")
 
-    # Root (no grad params) forwarded its gradients to the child; the child
-    # then refined them onto its own parameter.
-    assert "top-level feedback" in child.gradients
-    assert "refined-for-param" in child_param.gradients
+    # Root refined the top-level feedback onto the child thread (NOT raw-forwarded).
+    assert child.gradients == ["refined-for-child"]
+    assert "top-level feedback" not in child.gradients
+    # The child then refined its gradients onto its own parameter.
+    assert child_param.gradients == ["refined-for-param"]
+
+
+def test_backward_offers_child_threads_as_routable_targets() -> None:
+    """A grad-reaching child thread is rendered to the backward model as a target.
+
+    The root has one grad-enabled parameter of its own and one child thread that
+    reaches a grad parameter; both must appear in the rendered inputs the model
+    sees, so it can split feedback between them.
+    """
+    backend = _RecordingBackend(WritingMemory, "w1")
+    root_param = ParameterNode(node_id="fmt", name="formatting_guidelines", backend=backend, requires_grad=True)
+    child_param = ParameterNode(node_id="jg", name="joke_guidelines", backend=backend, requires_grad=True)
+    child = ThreadNode(node_id="joke-1", thread_id="joke-1", value="a joke", parameters=[child_param])
+    root = ThreadNode(node_id="email", thread_id="email", parameters=[root_param], child_threads=[child])
+
+    fn = _RouteToIdFn({})  # returns nothing; we only inspect what it was shown
+    opt = TextGradOptimizer()
+    opt._backward_fn = fn  # type: ignore[assignment]  # noqa: SLF001
+    opt.backward(root, "titles please")
+
+    # The root's distribute call saw both its own parameter and the child thread.
+    root_inputs = fn.seen_inputs[0]
+    assert set(root_inputs) == {"fmt", "joke-1"}
+    # The parameter renders as type 'parameter', the child thread as type 'result'.
+    assert root_inputs["fmt"]["type"] == "parameter"
+    assert root_inputs["joke-1"]["type"] == "result"
+
+
+def test_backward_routes_through_intermediate_thread_to_leaf_param() -> None:
+    """Refined feedback traverses root → mid → leaf → leaf param (three hops).
+
+    Each grad-reaching node distributes to the next via the model. The stub is
+    keyed by the node id the model is shown at each hop (child thread ids, then
+    the leaf's parameter id), proving multi-level refined routing end to end.
+    """
+    backend = _RecordingBackend(WritingMemory, "w1")
+    leaf_param = ParameterNode(node_id="lp", name="joke_guidelines", backend=backend, requires_grad=True)
+    leaf = ThreadNode(node_id="leaf", thread_id="leaf", parameters=[leaf_param])
+    mid = ThreadNode(node_id="mid", thread_id="mid", child_threads=[leaf])
+    root = ThreadNode(node_id="root", thread_id="root", child_threads=[mid])
+
+    # root sees child "mid"; mid sees child "leaf"; leaf sees param "lp".
+    fn = _RouteToIdFn({"mid": "for-mid", "leaf": "for-leaf", "lp": "for-param"})
+    opt = TextGradOptimizer()
+    opt._backward_fn = fn  # type: ignore[assignment]  # noqa: SLF001
+    opt.backward(root, "deep feedback")
+
+    assert mid.gradients == ["for-mid"]
+    assert leaf.gradients == ["for-leaf"]
+    assert leaf_param.gradients == ["for-param"]
+
+
+def test_backward_pass_through_when_no_routable_target() -> None:
+    """A node with gradients but no routable target forwards raw gradients to children.
+
+    A node with neither a grad parameter nor a grad-reaching child still hands
+    its raw gradients to its children rather than swallowing them. Here the root
+    has no grad parameter and only a grad-free child, so the backward model is
+    never called and the raw feedback is forwarded verbatim.
+    """
+    gradless_child = ThreadNode(node_id="c", thread_id="c")  # no parameters
+    root = ThreadNode(node_id="root", thread_id="root", child_threads=[gradless_child])
+
+    fn = _RouteToIdFn({})
+    opt = TextGradOptimizer()
+    opt._backward_fn = fn  # type: ignore[assignment]  # noqa: SLF001
+    opt.backward(root, "raw feedback")
+
+    # No routable target at the root → model not called, raw gradients forwarded.
+    assert fn.seen_inputs == []
+    assert gradless_child.gradients == ["raw feedback"]
+
+
+def test_backward_is_idempotent_across_repeated_calls() -> None:
+    """Calling backward twice does not double-count node gradients.
+
+    Node gradients are reset at the start of every backward; only parameter
+    gradients accumulate (and are cleared explicitly by zero_grad). Two
+    identical backward calls must leave the child's node gradients as if called
+    once.
+    """
+    backend = _RecordingBackend(WritingMemory, "w1")
+    child_param = ParameterNode(node_id="cp", name="joke_guidelines", backend=backend, requires_grad=True)
+    child = ThreadNode(node_id="child", thread_id="child", parameters=[child_param])
+    root = ThreadNode(node_id="root", thread_id="root", child_threads=[child])
+
+    fn = _RouteToIdFn({"child": "refined-for-child", "cp": "refined-for-param"})
+    opt = TextGradOptimizer()
+    opt._backward_fn = fn  # type: ignore[assignment]  # noqa: SLF001
+
+    opt.backward(root, "fb")
+    opt.backward(root, "fb")
+
+    # Node gradients reset each call — child holds exactly one refined item, not two.
+    assert child.gradients == ["refined-for-child"]
+    assert root.gradients == ["fb"]

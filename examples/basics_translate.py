@@ -1,8 +1,8 @@
-"""
-Example showing the use of async to AI Functions to translate a sentence to multiple languages in parallel.
-"""
+"""Translate one sentence into multiple languages concurrently with async AI functions."""
 
 import asyncio
+
+from _utils import display
 
 from ai_functions import ai_function
 from ai_functions.ai_thread import PostConditionResult
@@ -10,9 +10,9 @@ from ai_functions.ai_thread import PostConditionResult
 model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
-# Post-condition to prevent a common failure case where the model outputs
-# a transliteration for non-latin scripts
-@ai_function[PostConditionResult](model=model)
+# Post-condition guarding a common failure: the model transliterating
+# non-Latin scripts instead of using the native script.
+@ai_function(model=model)
 def check_translation(text: str) -> PostConditionResult:
     """
     Check that the following text is written in the native script of the language and does not contain any romanization.
@@ -23,8 +23,8 @@ def check_translation(text: str) -> PostConditionResult:
     """
 
 
-# Simply define the AI Function as async to use it as any other async function
-@ai_function[str](model=model, post_conditions=[check_translation])
+# An async AI function is awaited like any other coroutine.
+@ai_function(model=model, post_conditions=[check_translation])
 async def translate_text(text: str, lang: str) -> str:
     """
     Translate the text below to the following language: `{lang}`.
@@ -37,13 +37,11 @@ async def translate_text(text: str, lang: str) -> str:
 async def main():
     text = "It was the best of times, it was the worst of times"
     languages = ["fr", "ja", "it", "zh"]
-    # run multiple functions in parallel to translate to each language and wait for all of them to terminate
+    # gather() fans out one translation per language and awaits them together.
     translations = await asyncio.gather(*(translate_text(text, lang) for lang in languages))
 
-    print()
-    print(f"=== {text} ===")
-    for lang, translation in zip(languages, translations, strict=True):
-        print(f"({lang}) {translation}")
+    body = "\n".join(f"({lang}) {translation}" for lang, translation in zip(languages, translations, strict=True))
+    display(text, body)
 
 
 if __name__ == "__main__":

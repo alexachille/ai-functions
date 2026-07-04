@@ -154,8 +154,8 @@ async def run_problem(
     """Generate code for one problem, execute it, and return the reconstructed graph node.
 
     ``trace`` runs ``generate_fn`` and records the recalled ``ParameterView``
-    arguments as graph edges (no coordinator or thread wiring); the solution is
-    executed, and the thread node is rebuilt for the optimizer.
+    arguments as graph edges; the solution is executed, and the thread node is
+    rebuilt for the optimizer.
     """
     recalled = {name: await memory.recall(name) for name in PARAM_NAMES}
     result = await generate_fn.trace(

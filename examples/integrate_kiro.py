@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 
+from _utils import console, display
 from strands.types.tools import ToolResultContent
 
 from ai_functions.kiro import KiroAgent
@@ -45,17 +46,17 @@ from ai_functions.types import (
 
 
 def log_event(event: Event) -> None:
-    """Pretty-print one ai_functions event to the console."""
+    """Render one ai_functions event to the console as it streams in."""
     match event:
         case StartedEvent(thread_name=name):
-            print(f"  ▶ {name or 'thread'} started")
+            console.print(f"  ▶ {name or 'thread'} started", markup=False)
         case CompletedEvent(thread_name=name):
-            print(f"  ✓ {name or 'thread'} completed")
+            console.print(f"  ✓ {name or 'thread'} completed", markup=False)
         case FailedEvent(thread_name=name, error=error):
-            print(f"  ✗ {name or 'thread'} failed: {error}")
+            console.print(f"  ✗ {name or 'thread'} failed: {error}", markup=False)
         case MessageUserEvent(text=text):
             preview = text if len(text) <= 120 else text[:117] + "..."
-            print(f"  ▷ user: {preview}")
+            console.print(f"  ▷ user: {preview}", markup=False)
         case MessageAssistantCompleteEvent(content=content):
             texts: list[str] = []
             for block in content:
@@ -65,24 +66,25 @@ def log_event(event: Event) -> None:
             if texts:
                 joined = "\n".join(texts)
                 preview = joined if len(joined) <= 240 else joined[:237] + "..."
-                print(f"  ◁ assistant: {preview}")
+                console.print(f"  ◁ assistant: {preview}", markup=False)
             else:
                 kinds = [key for block in content for key in block]
                 summary = ", ".join(kinds) if kinds else "empty"
-                print(f"  ◁ assistant: <{summary}>")
+                console.print(f"  ◁ assistant: <{summary}>", markup=False)
         case ToolCallEvent(tool_name=tool_name, arguments=arguments):
-            print(f"    ⚙ tool call: {tool_name}({_format_args(arguments)})")
+            console.print(f"    ⚙ tool call: {tool_name}({_format_args(arguments)})", markup=False)
         case ToolResultEvent(status=status, content=content):
             preview = _format_tool_result(content) or "<empty>"
             error = "[error] " if status == "error" else ""
-            print(f"    ⚙ tool result: {error}{preview}")
+            console.print(f"    ⚙ tool result: {error}{preview}", markup=False)
         case TokenUsageEvent(token_usage=usage):
             total_input = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
             total = total_input + usage.output_tokens
-            print(
+            console.print(
                 f"  Σ tokens: in={usage.input_tokens} "
                 f"cache_r={usage.cache_read_tokens} cache_w={usage.cache_write_tokens} "
                 f"out={usage.output_tokens} (total={total})",
+                markup=False,
             )
         case _:
             pass
@@ -130,11 +132,7 @@ async def main() -> None:
             "List the three files in the current directory whose names end in .md, "
             "and in one short sentence say what the project is about based on README.md.",
         )
-        print()
-        print("─" * 60)
-        print("RESULT")
-        print("─" * 60)
-        print(result)
+        display("Result", str(result))
     finally:
         await handle.terminate_now()
         await worker.close()

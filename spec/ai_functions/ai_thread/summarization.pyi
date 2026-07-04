@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from strands.types.content import Messages
+
 from ..types import Event, RenderableEvent, ThreadContext
 from .config import ThreadConfig
 from .errors import AIFunctionError
@@ -132,6 +134,70 @@ class DefaultSummarizationStrategy:
             SummarizationFailedError: The history cannot be compacted at the  configured
                 bounds, the helper thread failed, or ``summarize_by_forking=True`` was
                 requested against a structured-output parent with a non-``str`` output.
+        """
+        ...
+
+
+class ContextFitter:
+    """Drive one invocation's summarization loop: fit history to the context budget.
+
+    Runs a :class:`SummarizationStrategy` on both the proactive threshold check
+    and the reactive post-overflow path, emitting a ``ContextSummarizedEvent``
+    boundary for each compaction.
+
+    One instance serves one ``invoke`` call. A shared attempt counter bounds
+    total summarizations per invocation so a strategy that fails to shrink the
+    history cannot loop forever. Do not reuse an instance across invocations:
+    a long-lived counter would starve later cycles of their summarization budget.
+
+    Args:
+        strategy: The pluggable compaction strategy to run.
+        function_name: Owning ``AIFunction`` name, for error attribution.
+        max_attempts: Cap on summarizations per invocation (proactive +
+            reactive combined).
+    """
+
+    def __init__(
+        self,
+        strategy: SummarizationStrategy,
+        function_name: str,
+        max_attempts: int = 3,
+    ) -> None: ...
+
+    async def fit(self, ctx: ThreadContext, cycle_config: ThreadConfig) -> Messages:
+        """Fetch the event log and return a message history under the threshold.
+
+        Proactively compacts (possibly repeatedly, up to the attempt cap) while
+        the estimated token count of the reconstructed history exceeds
+        ``cycle_config.summarization_threshold``. With no threshold configured,
+        this is a plain fetch-and-reconstruct.
+
+        Returns:
+            The reconstructed (possibly compacted) message history.
+        """
+        ...
+
+    async def compact_after_overflow(
+        self,
+        ctx: ThreadContext,
+        cycle_config: ThreadConfig,
+        exc: Exception,
+    ) -> None:
+        """Compact reactively after a ``ContextWindowOverflowException``.
+
+        Re-fetches the event log so the compaction includes the user turns the
+        failed model call had already appended.
+
+        With ``summarization_enabled=False`` the overflow is not compacted: the
+        original ``exc`` is re-raised unchanged so the thread fails loudly. This
+        also keeps summarizer helper threads non-recursive, since their template
+        sets the flag ``False``.
+
+        Raises:
+            ContextWindowOverflowException: ``summarization_enabled`` is
+                ``False``; the original ``exc`` propagates unchanged.
+            SummarizationFailedError: The attempt cap was already exhausted;
+                chained to ``exc``.
         """
         ...
 

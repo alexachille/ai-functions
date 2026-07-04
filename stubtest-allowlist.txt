@@ -20,13 +20,22 @@ ai_functions.types.graph.Result.__type_params__
 ai_functions.ai_thread.ai_function._TypedDecorator.__call__
 ai_functions.ai_thread.ai_function._AIFunctionFactory.__call__
 
-# Annotated[Union[...], Field(...)] aliases are callable _AnnotatedAlias at runtime, not Union types
+# Annotated[Union[...], Field(...)] aliases are callable _AnnotatedAlias at runtime, not Union types.
+# On Python 3.12, stubtest resolves an ``Annotated[str/bytes, ...]`` alias to its underlying
+# builtin class and flags every inherited method (``zfill``, ``upper``, ``__add__`` …) as absent;
+# the ``.*`` suffix suppresses that per-method noise for the str/bytes-backed aliases.
 ai_functions.network.wire.Binary
+ai_functions.network.wire.Binary.*
 ai_functions.network.wire.Frame
 ai_functions.types.events.SystemEvent
 ai_functions.types.policy.Policy
 ai_functions.memory.frozen.Frozen
 ai_functions.memory.procedural.Procedural
+ai_functions.memory.procedural.Procedural.*
+
+# PEP 695 ``type`` alias: ``type Traceable[T] = T | ParameterView[T] | Result[T]``. The stub
+# declares it identically, but stubtest cannot represent a TypeAliasType as a Union and flags it.
+ai_functions.types.graph.Traceable
 
 # NewType creates functions at runtime; stubs declare them as classes (TypeInfo)
 ai_functions.types.ids.EventId
@@ -62,3 +71,9 @@ ai_functions.optimizer.textgrad.logger
 # Memory backend module loggers are internal implementation detail.
 ai_functions.memory.agentcore_backend.logger
 ai_functions.memory.base.logger
+
+# debug.py is an opt-in console dump of the exact per-model-call request,
+# gated on the AI_FUNCTIONS_SHOW_PROMPTS env var and imported lazily inside
+# AIThread._build_agent. It is a diagnostics helper below the public surface
+# (exported nowhere, no external consumers), so the spec does not stub it.
+ai_functions.ai_thread.debug

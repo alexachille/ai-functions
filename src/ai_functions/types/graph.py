@@ -68,6 +68,7 @@ class ParameterNode(Node):
     derivation: Literal["full", "query", "search"] = "full"
     backend: MemoryBackend | None = field(default=None, repr=False)
     description: str = ""
+    procedural: bool = False
     meta: dict[str, Any] = field(default_factory=dict)  # pyright: ignore[reportExplicitAny]
 
 
@@ -132,6 +133,7 @@ class ParameterView[T]:
     emitted: bool = False
 
     def __str__(self) -> str:
+        """Render the wrapped value for casual printing (drops the dataflow edge)."""
         return str(self.value)
 
 
@@ -162,18 +164,21 @@ class Result[T]:
     inputs: list[ParameterView[Any] | Result[Any]] = field(default_factory=list)  # pyright: ignore[reportExplicitAny]
 
     def __str__(self) -> str:
+        """Render the wrapped value for casual printing (drops the dataflow edge)."""
         return str(self.value)
 
 
 type Traceable[T] = T | ParameterView[T] | Result[T]
 """A value of type ``T``, or a dataflow handle wrapping one.
 
-Annotate prompt-function parameters that may receive a recalled
-``ParameterView`` or a traced ``Result`` — e.g.
-``def email_writer(jokes: Traceable[str], ...)`` — so passing handles
-type-checks. The runtime unwraps handles to their ``.value`` at the
-``ThreadHandle.run`` boundary either way; the alias only makes the
-already-supported call pattern visible to the type checker.
+Names the union a dataflow edge can take — a plain ``T``, a recalled
+``ParameterView[T]``, or a traced ``Result[T]``. It is a documentation and
+introspection aid, **not** something to annotate prompt-function parameters
+with: a prompt function should declare its parameters as the plain type it
+actually receives (``def email_writer(jokes: str, ...)``), because the runtime
+unwraps every handle to its ``.value`` at the ``ThreadHandle.run`` boundary
+before ``prompt_fn`` runs. Passing handles is type-checked by ``trace``'s own
+``*args: Any`` signature, not by widening the body's parameters.
 """
 
 

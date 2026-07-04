@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Hashable, Sequence, Unpack, final, overload, override
+from typing import Any, Callable, Hashable, Sequence, Unpack, final, overload, override
 
 from strands.tools import ToolProvider
 from strands.types.tools import AgentTool
@@ -150,7 +150,7 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
         """
         ...
 
-    async def trace(self, *args: P.args, **kwargs: P.kwargs) -> Result[T]:
+    async def trace(self, *args: Any, **kwargs: Any) -> Result[T]:
         """Run one cycle like ``__call__``, returning a :class:`Result` node.
 
         The traced counterpart of ``__call__`` for optimization workflows: the
@@ -162,6 +162,13 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
             cat = await joke_writer.trace(topic="cats", joke_guidelines=await memory.recall("joke_guidelines"))
             email = await email_writer.trace(jokes=cat, formatting_guidelines=await memory.recall("fmt"))
             await optimizer.step(email, "titles please", backends=[memory])
+
+        Accepts ``*args: Any`` rather than the wrapped signature ``P`` on
+        purpose: each argument may be the declared value *or* a
+        ``ParameterView`` / ``Result`` handle wrapping it, and a ``ParamSpec``
+        cannot express "``P`` with every parameter widened to accept its
+        handle". Handles are unwrapped before ``prompt_fn`` runs, so the body
+        still receives the plain declared types.
 
         Args:
             args: Positional arguments forwarded to ``prompt_fn``; handles are

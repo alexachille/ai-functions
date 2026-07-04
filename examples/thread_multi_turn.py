@@ -7,31 +7,33 @@ typed result.
 
 import asyncio
 
+from _utils import display
+
 from ai_functions import ai_function
 
 
-@ai_function[str]
-def assistant(message: str):
+@ai_function
+def assistant(message: str) -> str:
     """{message}"""
 
 
 async def main():
-    # spawn() creates a handle with its own session — no runtime needed
+    # spawn() creates a handle with its own session.
     handle = await assistant.spawn()
 
     r1 = await handle.run(message="What is the capital of France?")
-    print(f"Turn 1: {r1}")
+    display("Turn 1", str(r1))
 
-    # The agent sees the full conversation history from turn 1
+    # The follow-up sees the full conversation history from turn 1.
     r2 = await handle.run(message="What about Germany?")
-    print(f"Turn 2: {r2}")
+    display("Turn 2", str(r2))
 
-    # Inject context without starting a cycle
-    await handle.notify("The user prefers short answers.")
+    # notify() injects context without starting a cycle.
+    await handle.notify("The user prefers single-word answers.")
 
-    # The agent sees the injected message on the next run
+    # The injected message is visible on the next run.
     r3 = await handle.run(message="And Spain?")
-    print(f"Turn 3: {r3}")
+    display("Turn 3", str(r3))
 
     await handle.terminate_now()
 
