@@ -22,6 +22,7 @@ Because AI Functions *are* functions, developers can construct agentic workflows
 - [Threads as a protocol: Claude Code and Kiro](#threads-as-a-protocol-claude-code-and-kiro)
 - [Events and observability](#events-and-observability)
 - [Memory and optimization](#memory-and-optimization)
+- [Economics-aware execution](#economics-aware-execution)
 - [Distributed operation](#distributed-operation)
 - [Running agents across processes](#running-agents-across-processes)
 - [Going further](#going-further)
@@ -1101,6 +1102,36 @@ def travel_assistant(request: str) -> str:
 ```
 
 `tool_provider` generates schema-scoped tools (`recall_<name>`, `query_<name>`, `search_<name>` for lists, and `save_<name>` / `delete_<name>` for scalars). You can restrict which operations are available: for example, `memory.tool_provider(..., operations={"recall", "search", "query"})` provides read-only access. See `examples/memory_tools.py` for a complete example.
+
+## Economics-aware execution
+
+Post-conditions give an AI Function correctness semantics; the `ai_functions.experimental.economics` module adds the economics: what a result is worth in dollars, what each candidate model's tokens cost, and therefore which model to try, whether to switch after a failure, and when to stop. One rule governs every attempt: **an attempt is worth making only when it's expected to yield more than it costs**.
+
+```python
+from ai_functions.experimental.economics import PricedModel, Prices, routed
+
+# The candidate models, priced at what *you* pay (dollars per million tokens).
+HAIKU = PricedModel(model="global.anthropic.claude-haiku-4-5-20251001-v1:0",
+                    prices=Prices(input=1.00, output=5.00))
+SONNET = PricedModel(model="global.anthropic.claude-sonnet-4-6",
+                     prices=Prices(input=3.00, output=15.00))
+
+
+# A solved instance is worth 50 cents to us; check_sat is an ordinary
+# post-condition that verifies the assignment against the clauses.
+@routed(models=[HAIKU, SONNET], value=0.50)
+@ai_function(post_conditions=[check_sat])
+def solve(clauses: str, n_vars: int) -> Assignment:
+    """Find a satisfying assignment for this 3-SAT formula over variables x1..x{n_vars}.
+
+    {clauses}"""
+
+result = await solve(clauses=clauses, n_vars=8)   # called like any AI Function
+```
+
+`@routed` stacks on an ordinary `@ai_function`, routing each call across several models. Three pieces define the economics: `value` is what a verified success is worth in dollars; `models` are the candidates, each pairing a model with its token prices; and the post-conditions define success. Each call starts from per-candidate estimates (the chance of passing and expected cost), tries the most profitable candidate, returns its result if it passes, switches if it fails, and abstains when no candidate is worth its cost.
+
+See the [economics documentation](economics.md) for more details, including alternative search policies, estimation via learned/custom beliefs, and adaptive stopping on graded tasks. Note: the module is experimental — the API may change in future releases.
 
 ## Distributed operation
 
