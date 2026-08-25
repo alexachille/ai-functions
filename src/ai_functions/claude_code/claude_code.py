@@ -35,9 +35,14 @@ emitted by the runtime dispatcher, never by the thread.
   per-``AssistantMessage`` totals) so usage is never double-counted.
 - ``RateLimitEvent``: ``CustomEvent(kind="claude_rate_limit", payload=...)``.
   Observability only — does not currently drive ``Coordinator.pause_signal``.
+- ``ConversationResetMessage``: ``CustomEvent(kind="claude_conversation_reset",
+  payload=...)`` carrying the new conversation id.
 - ``SystemMessage`` variants (``TaskStartedMessage``, ``TaskProgressMessage``,
   ``TaskNotificationMessage``, ``MirrorErrorMessage``, …):
   ``CustomEvent(kind=f"claude_system_{subtype}", payload=...)``.
+- Any other member of the SDK's ``Message`` union (it grows across releases):
+  ``CustomEvent(kind="claude_message", payload=...)`` with the dataclass fields
+  flattened — unknown messages degrade to observability, never to an error.
 
 Invariants:
     I2 — every emitted event goes through ``Coordinator.append_event``.
@@ -56,6 +61,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ConversationResetMessage,
     McpServerConfig,
     Message,
     PermissionResult,
@@ -80,8 +86,7 @@ from strands.tools.decorator import tool as _strands_tool  # pyright: ignore[rep
 from strands.types.interrupt import InterruptResponseContent
 from strands.types.tools import AgentTool
 
-from ..ai_thread.errors import AIFunctionError
-from ..ai_thread.postcondition import PostCondition
+from ..ai_thread.postcondition import PostCondition, run_post_condition_loop
 from ..protocols import Spawnable, Thread
 from ..types import (
     CustomEvent,
@@ -91,7 +96,6 @@ from ..types import (
     MessageAssistantThinkingEvent,
     MessageAssistantTokenEvent,
     MessageId,
-    MessageUserEvent,
     ThreadContext,
     TokenUsage,
     TokenUsageEvent,
@@ -238,6 +242,15 @@ def _system_message_payload(message: SystemMessage) -> dict[str, object]:
         for field in dataclasses.fields(message):
             if field.name in ("subtype", "data"):
                 continue
+            payload[field.name] = getattr(message, field.name)
+    return payload
+
+
+def _unknown_message_payload(message: Message) -> dict[str, object]:
+    """Flatten an SDK message this adapter has no mapping for to a payload dict."""
+    payload: dict[str, object] = {"message_type": type(message).__name__}
+    if dataclasses.is_dataclass(message) and not isinstance(message, type):
+        for field in dataclasses.fields(message):
             payload[field.name] = getattr(message, field.name)
     return payload
 
@@ -461,90 +474,22 @@ class ClaudeAgentThread(Thread[[str], str]):
         try:
             await self._ensure_connected()
 
-            post_conditions = self._template.post_conditions
-            max_attempts = self._template.max_attempts if post_conditions else 1
-
-            result = ""
-            for attempt in range(max(1, max_attempts)):
-                # Drain inject buffer: each pending message is emitted as its
-                # own MESSAGE_USER event, then prepended to the outgoing turn.
-                # On the first attempt the buffer holds any caller-supplied
-                # side-channel messages; on retries it holds the
-                # post-condition failure feedback appended below. The original
-                # ``prompt`` is only sent on the first attempt — the SDK owns
-                # the conversation history, so retries ride the feedback turn
-                # (mirrors ``AIThread``: failures are injected as the next
-                # user turn, the task stays in context).
-                pending = list(self._inject_buffer)
-                self._inject_buffer.clear()
-
-                parts: list[str] = []
-                for injected in pending:
-                    ctx.on_event(MessageUserEvent(text=injected))
-                    parts.append(injected)
-                if attempt == 0:
-                    ctx.on_event(MessageUserEvent(text=prompt))
-                    parts.append(prompt)
-                combined = "\n\n".join(parts)
-
+            async def _send_turn(combined: str) -> str:
                 assert self._client is not None
                 await self._client.query(combined)
-                result = await self._consume_stream(ctx)
+                return await self._consume_stream(ctx)
 
-                if not post_conditions:
-                    return result
-
-                errors = await self._validate_result(result, post_conditions)
-                if not errors:
-                    return result
-
-                # Feed failures back as the next user turn and retry.
-                failures = "\n".join(f"- {e}" for e in errors)
-                self._inject_buffer.append(
-                    f"[{self.name}] Post-condition failures (attempt {attempt + 1}/{max_attempts}):\n{failures}"
-                )
-
-            raise AIFunctionError(
-                f"Post-conditions not satisfied after {max_attempts} attempt(s)",
-                function_name=self.name,
+            return await run_post_condition_loop(
+                ctx,
+                prompt,
+                thread_name=self.name,
+                post_conditions=self._template.post_conditions,
+                max_attempts=self._template.max_attempts,
+                inject_buffer=self._inject_buffer,
+                send_turn=_send_turn,
             )
         finally:
             self._active_ctx = None
-
-    async def _validate_result(
-        self,
-        result: str,
-        post_conditions: tuple[PostCondition, ...],
-    ) -> list[str]:
-        """Evaluate every post-condition against ``result`` in parallel.
-
-        Mirrors ``AIThread._validate_result``: a condition returning
-        ``None``/``passed`` passes; ``passed=False`` contributes its message;
-        a raised exception is treated as failure with the exception text.
-        ``ClaudeAgentThread`` takes a single string prompt, so there are no
-        bound keyword arguments to offer condition callables.
-
-        Args:
-            result: The candidate result string from the Claude Agent stream.
-            post_conditions: Validators to run.
-
-        Returns:
-            Failure messages; empty when all conditions pass.
-        """
-
-        async def _run_one(cond: PostCondition) -> str | None:
-            try:
-                cond_result = cond(result)
-                if asyncio.iscoroutine(cond_result):
-                    cond_result = await cond_result
-            except Exception as exc:
-                return str(exc)
-            if cond_result is None or cond_result.passed:
-                return None
-            return cond_result.message
-
-        outcomes = await asyncio.gather(*(_run_one(c) for c in post_conditions))
-        return [msg for msg in outcomes if msg is not None]
 
     async def fork(self) -> Spawnable[[str], str]:
         """Not supported.
@@ -701,11 +646,31 @@ class ClaudeAgentThread(Thread[[str], str]):
                 CustomEvent(kind="claude_rate_limit", payload=_rate_limit_payload(message)),
             )
             return None
+        if isinstance(message, ConversationResetMessage):
+            # Not a SystemMessage — it carries ids, no subtype.
+            ctx.on_event(
+                CustomEvent(
+                    kind="claude_conversation_reset",
+                    payload={
+                        "new_conversation_id": message.new_conversation_id,
+                        "uuid": message.uuid,
+                        "session_id": message.session_id,
+                    },
+                ),
+            )
+            return None
+        if isinstance(message, SystemMessage):
+            ctx.on_event(
+                CustomEvent(
+                    kind=f"claude_system_{message.subtype}",
+                    payload=_system_message_payload(message),
+                ),
+            )
+            return None
+        # The ``Message`` union grows with the SDK; degrade members we don't know
+        # to observability rather than raising AttributeError on ``subtype``.
         ctx.on_event(
-            CustomEvent(
-                kind=f"claude_system_{message.subtype}",
-                payload=_system_message_payload(message),
-            ),
+            CustomEvent(kind="claude_message", payload=_unknown_message_payload(message)),
         )
         return None
 
