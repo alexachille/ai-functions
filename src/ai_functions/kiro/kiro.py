@@ -87,7 +87,6 @@ try:
         Client as _AcpClient,
     )
     from acp import (
-        ClientSideConnection,
         RequestPermissionResponse,
     )
     from acp.schema import (
@@ -109,7 +108,13 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 if TYPE_CHECKING:
+    # Annotation-only: ``ClientSideConnection`` is deprecated for direct runtime
+    # use (``acp.connect_to_agent`` supersedes it) but remains the type of the
+    # connection ``acp.spawn_agent_process`` yields.
+    from acp import ClientSideConnection
     from acp.schema import (
+        AgentPlanContentUpdate,
+        AgentPlanRemovedUpdate,
         AgentPlanUpdate,
         AvailableCommandsUpdate,
         ConfigOptionUpdate,
@@ -753,6 +758,8 @@ class _KiroAcpClient(_AcpClient):
         | ToolCallStart
         | ToolCallProgress
         | AgentPlanUpdate
+        | AgentPlanContentUpdate
+        | AgentPlanRemovedUpdate
         | AvailableCommandsUpdate
         | CurrentModeUpdate
         | ConfigOptionUpdate
@@ -766,13 +773,28 @@ class _KiroAcpClient(_AcpClient):
     @override
     async def request_permission(
         self,
-        options: list[PermissionOption],
         session_id: str,
         tool_call: ToolCallUpdate,
+        options: list[PermissionOption],
         **kwargs: object,
     ) -> RequestPermissionResponse:
-        """Resolve a permission request via the owning thread."""
+        """Resolve a permission request via the owning thread.
+
+        The connection router invokes client methods by keyword, so parameter
+        order is free — this matches the ``acp.Client`` declaration so the
+        override checks structurally.
+        """
         return await self._thread._handle_permission(options, tool_call)  # pyright: ignore[reportPrivateUsage]
+
+    @override
+    async def create_elicitation(self, *args: object, **kwargs: object) -> NoReturn:
+        """Unsupported; ``elicitation`` capability is not advertised."""
+        raise acp.exceptions.RequestError(code=-32601, message="session/create_elicitation not supported")
+
+    @override
+    async def complete_elicitation(self, *args: object, **kwargs: object) -> NoReturn:
+        """Unsupported; ``elicitation`` capability is not advertised."""
+        raise acp.exceptions.RequestError(code=-32601, message="session/complete_elicitation not supported")
 
     @override
     async def read_text_file(self, *args: object, **kwargs: object) -> NoReturn:
