@@ -56,6 +56,22 @@ falling back to the last message with no phase (mirrors the SDK's own
 not_loaded`` with an empty ``items`` list, so items are accumulated from the
 stream, never read from the completion payload.
 
+Forking
+───────
+
+Codex allows exactly one writer per stored thread: the app-server that has a
+thread loaded holds its writer lock, and any other app-server asking to resume
+it is refused ("thread ... already has an active writer"). Forking, by
+contrast, only reads the source, so any app-server may fork a thread another
+one is writing to — or one nobody has loaded.
+
+``fork()`` therefore records the branch point (``fork_of_thread_id``) rather
+than creating the fork, and the forked thread's own app-server calls
+``thread/fork`` when it connects — the writer of a fork is always its creator,
+and the source keeps running untouched. Consequences: the branch point is the
+source transcript as it stands when the fork first connects, and spawning one
+forked template twice yields two independent forks.
+
 Runtime tools
 ─────────────
 
@@ -255,11 +271,12 @@ class CodexAgent(Spawnable[[str], str], ToolProvider):
     """Immutable template for an OpenAI-Codex-backed thread.
 
     Carries the configuration used to launch the ``codex app-server``
-    subprocess and start (or resume) its conversation thread, plus the
-    display metadata needed to expose the resulting thread as a Strands
-    tool. Picklable and safe to share across runtimes: session identity is
-    a string (``resume_thread_id``), so a template can travel to any host
-    that has Codex auth and an equivalent working directory.
+    subprocess and start (or resume, or branch from) its conversation thread,
+    plus the display metadata needed to expose the resulting thread as a
+    Strands tool. Picklable and safe to share across runtimes: session identity
+    is a string (``resume_thread_id`` / ``fork_of_thread_id``), so a template
+    can travel to any host that has Codex auth and an equivalent working
+    directory.
 
     Implements:
         Spawnable, strands.tools.ToolProvider.
@@ -307,8 +324,14 @@ class CodexAgent(Spawnable[[str], str], ToolProvider):
     app-server process's own working directory."""
 
     resume_thread_id: str | None = None
-    """Resume this stored Codex thread instead of starting a fresh one.
-    ``fork()`` returns templates carrying this field."""
+    """Resume this stored Codex thread instead of starting a fresh one. Only one
+    app-server may write to a thread at a time, so resuming a thread another
+    live thread already holds is refused by Codex."""
+
+    fork_of_thread_id: str | None = None
+    """Branch from this stored Codex thread instead of resuming it: the thread
+    forks it on connect and owns the fork. ``fork()`` returns templates
+    carrying this field. Takes precedence over ``resume_thread_id``."""
 
     name: str = "codex"
     """Name used for telemetry and when exposed as a Strands tool."""
@@ -412,7 +435,8 @@ class CodexAgentThread(Thread[[str], str]):
 
     Unlike the Claude and Kiro backends, this thread supports:
 
-    - real ``fork()`` — Codex forks the stored conversation server-side;
+    - real ``fork()`` — Codex branches the stored conversation server-side,
+      with the fork created by the app-server that will write to it;
     - mid-turn ``notify()`` — the message is steered into the in-flight turn;
     - cooperative cancel that interrupts the in-flight turn rather than
       waiting for the cycle boundary.
@@ -554,22 +578,34 @@ class CodexAgentThread(Thread[[str], str]):
             self._active_ctx = None
 
     async def fork(self) -> Spawnable[[str], str]:
-        """Fork the stored Codex conversation into a new template.
+        """Return a template that branches from this thread's conversation.
 
-        Codex forks the transcript server-side; the returned template resumes
-        the forked thread, so ``Coordinator.fork`` (which seeds the new
-        ai_functions event log from the source's) yields a divergent
-        continuation on both sides of the boundary.
+        The returned template names this conversation as its branch point; the
+        fork itself is created by that template's own app-server on connect, so
+        that the writer of the fork is its creator (see the module docstring's
+        "Forking" section). ``Coordinator.fork`` seeds the new ai_functions
+        event log from this thread's, so the result is a divergent continuation
+        on both sides of the boundary.
+
+        The branch point is the source transcript as it stands when the fork
+        first connects. The fork inherits the source thread's personality;
+        ``CodexAgent.personality`` is not re-applied.
 
         Returns:
-            A ``CodexAgent`` carrying ``resume_thread_id`` of the fork — or
-            this thread's own template when no session exists yet, since a
-            never-connected thread's entire state is its template.
+            A ``CodexAgent`` carrying ``fork_of_thread_id`` — or this thread's
+            own template when no session exists yet, since a never-connected
+            thread's entire state is its template.
+
+        Ensures:
+            - No Codex RPC is issued; this thread remains connected and usable.
         """
-        if self._codex is None or self._thread is None:
+        if self._thread is None:
             return self._template
-        forked = await self._codex.thread_fork(self._thread.id)
-        return dataclasses.replace(self._template, resume_thread_id=forked.id)
+        return dataclasses.replace(
+            self._template,
+            fork_of_thread_id=self._thread.id,
+            resume_thread_id=None,
+        )
 
     async def teardown(self) -> None:
         """Close the SDK client and release the ``codex app-server`` subprocess.
@@ -653,7 +689,21 @@ class CodexAgentThread(Thread[[str], str]):
                 await tool_server.stop()
                 raise
             try:
-                if template.resume_thread_id is not None:
+                if template.fork_of_thread_id is not None:
+                    # Forking only reads the source, so this succeeds whether or
+                    # not another app-server holds the source's writer lock.
+                    # ``personality`` has no fork parameter; the fork inherits
+                    # the source's.
+                    thread = await codex.thread_fork(
+                        template.fork_of_thread_id,
+                        approval_mode=template.approval_mode,
+                        base_instructions=template.base_instructions,
+                        cwd=template.cwd,
+                        developer_instructions=template.developer_instructions,
+                        model=template.model,
+                        sandbox=template.sandbox,
+                    )
+                elif template.resume_thread_id is not None:
                     thread = await codex.thread_resume(
                         template.resume_thread_id,
                         approval_mode=template.approval_mode,
