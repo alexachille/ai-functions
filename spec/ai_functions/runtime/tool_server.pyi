@@ -19,8 +19,9 @@ required in the ``Authorization: Bearer`` header (constant-time compared), the
 spec's guidance for local HTTP servers), and deregistration revokes the token
 immediately.
 
-The MCP app runs stateless (``stateless_http=True``): tools and one-shot
-reads only — no server-initiated messages, no resource subscriptions.
+The MCP app runs stateless (``stateless_http=True``) and answers in JSON
+(``json_response=True``): tools and one-shot reads only — no server-initiated
+messages, no resource subscriptions, so nothing needs an SSE stream.
 
 Requires the ``runtime-tools`` extra (``mcp``, ``uvicorn``).
 """
@@ -84,6 +85,11 @@ class CoordinatorToolServer:
         In-flight tool calls are dropped rather than drained: a client waiting
         on one (``send_message(mode="wait")``, say) sees the connection close
         mid-response.
+
+        Ensures:
+            - The listening socket is closed, so the port is free once this
+              returns.
+            - No later server in this process is affected by this one stopping.
 
         Concurrency:
             Idempotent; stopping a never-started server is a no-op.
