@@ -67,15 +67,14 @@ def _usage_error_types() -> tuple[type[click.ClickException], ...]:
 
 
 def _abort_types() -> tuple[type[BaseException], ...]:
-    """Click ``Abort`` classes to translate in :func:`main` (see above)."""
-    types: list[type[BaseException]] = [click.Abort]
-    try:
-        from typer._click import exceptions as _vendored
+    """``Abort`` classes to translate in :func:`main`.
 
-        types.append(_vendored.Abort)
-    except ImportError:
-        pass
-    return tuple(types)
+    ``typer.Abort`` is a ``RuntimeError``, not a ``click.Abort`` subclass, so
+    both types are needed.
+    """
+    import typer
+
+    return (click.Abort, typer.Abort)
 
 
 def main() -> int:
