@@ -29,9 +29,10 @@ header must name the bound address (DNS-rebinding defense per the MCP spec's
 guidance for local HTTP servers), and deregistration revokes the token
 immediately.
 
-The MCP app runs stateless (``stateless_http=True``): tools and one-shot
-reads only — no server-initiated messages, no resource subscriptions.
-Session state lives in the coordinator, not the transport.
+The MCP app runs stateless (``stateless_http=True``) and answers in JSON
+(``json_response=True``): tools and one-shot reads only — no server-initiated
+messages, no resource subscriptions, so nothing needs an SSE stream. Session
+state lives in the coordinator, not the transport.
 
 Requires the ``runtime-tools`` extra (``mcp``, ``uvicorn``).
 """
@@ -121,8 +122,14 @@ def _build_mcp_app() -> FastMCP:
     Tool identity is per-request: the token router resolves which thread is
     calling and parks its registration in a context variable before handing
     the request to this app.
+
+    ``json_response=True`` answers each POST with one JSON object. The SSE
+    response path consults ``sse_starlette.sse.AppStatus.should_exit``, a
+    process-global latch set by any graceful uvicorn shutdown and never
+    cleared, after which every ``EventSourceResponse`` in the process closes
+    its writer before sending a body.
     """
-    mcp = FastMCP("ai_functions_runtime", stateless_http=True)
+    mcp = FastMCP("ai_functions_runtime", stateless_http=True, json_response=True)
 
     @mcp.tool(name="list_threads", description=LIST_THREADS_DESCRIPTION)
     async def list_threads() -> str:
@@ -245,6 +252,7 @@ class CoordinatorToolServer:
         self._by_thread: dict[ThreadId, str] = {}
         self._server: uvicorn.Server | None = None
         self._serve_task: asyncio.Task[None] | None = None
+        self._socket: socket.socket | None = None
         self._bound_port: int | None = None
 
     # ── Lifecycle ──
@@ -268,6 +276,7 @@ class CoordinatorToolServer:
 
         sock = self._bind_socket()
         bound_port = int(sock.getsockname()[1])
+        self._socket = sock
         self._bound_port = bound_port
 
         app = _TokenRouter(_build_mcp_app().streamable_http_app(), self)
@@ -283,7 +292,13 @@ class CoordinatorToolServer:
         deadline = asyncio.get_running_loop().time() + _STARTUP_TIMEOUT
         while not self._server.started:
             if self._serve_task.done():
-                self._serve_task.result()  # surface the startup failure
+                task = self._serve_task
+                self._server = None
+                self._serve_task = None
+                self._socket = None
+                self._bound_port = None
+                sock.close()
+                task.result()  # surface the startup failure
                 raise RuntimeError("tool server exited before startup completed")
             if asyncio.get_running_loop().time() >= deadline:
                 await self.stop()
@@ -299,19 +314,32 @@ class CoordinatorToolServer:
         on one (``send_message(mode="wait")``, say) sees the connection close
         mid-response.
 
+        Ensures:
+            - The listening socket is closed, so the port is free once this
+              returns.
+            - No later server in this process is affected by this one stopping.
+
         Concurrency:
             Idempotent; stopping a never-started server is a no-op.
         """
         self._registrations.clear()
         self._by_thread.clear()
-        server, task = self._server, self._serve_task
+        server, task, sock = self._server, self._serve_task, self._socket
         self._server = None
         self._serve_task = None
+        self._socket = None
         self._bound_port = None
         if server is None or task is None:
             return
+        # Must be uvicorn's graceful shutdown: cancelling the serving task
+        # instead leaves later servers in this process accepting connections
+        # they never answer.
         server.should_exit = True
         await task
+        # Also closed by uvicorn's shutdown; closing here covers a ``start``
+        # that gave up before serving began.
+        if sock is not None:
+            sock.close()
 
     @property
     def base_url(self) -> str:

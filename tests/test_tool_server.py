@@ -220,3 +220,56 @@ async def test_stop_is_idempotent() -> None:
     await srv.start()
     await srv.stop()
     await srv.stop()
+
+
+async def test_stop_frees_the_port() -> None:
+    """A stopped server's port is closed, not merely unrouted."""
+    srv = CoordinatorToolServer()
+    await srv.start()
+    base_url = srv.base_url
+    async with httpx.AsyncClient() as client:
+        assert (await client.post(f"{base_url}/mcp/unknown", json={})).status_code == 404
+    await srv.stop()
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(httpx.HTTPError):
+            _ = await client.post(f"{base_url}/mcp/unknown", json={}, timeout=5)
+
+
+async def test_successive_servers_keep_working() -> None:
+    """Stopping a server does not break the next one in this process.
+
+    ``sse-starlette`` latches a process-global flag off
+    ``uvicorn.Server.should_exit`` and never clears it, which disables every
+    later ``EventSourceResponse`` in the process. Four rounds cover the delay
+    between the first stop and the flag taking effect.
+    """
+    coord = _StubCoordinator()
+    for _ in range(4):
+        srv = CoordinatorToolServer()
+        await srv.start()
+        try:
+            reg = srv.register(coord, ThreadId("t-alice"))  # pyright: ignore[reportArgumentType]
+            reply = await _call(reg.url, reg.token, "send_message", {"thread_id": "t-bob", "message": "x"})
+            assert "pong" in reply
+        finally:
+            await srv.stop()
+
+
+async def test_a_foreign_graceful_shutdown_does_not_break_the_server(
+    server: CoordinatorToolServer,
+) -> None:
+    """Another component's uvicorn shutdown does not disable these tools.
+
+    ``sse-starlette``'s latch is process-global, so an application serving its
+    own uvicorn app alongside a coordinator trips it. Setting the flag directly
+    stands in for that shutdown.
+    """
+    sse = pytest.importorskip("sse_starlette.sse")
+    reg = server.register(_StubCoordinator(), ThreadId("t-alice"))  # pyright: ignore[reportArgumentType]
+    previous = sse.AppStatus.should_exit
+    sse.AppStatus.should_exit = True
+    try:
+        listing = await _call(reg.url, reg.token, "list_threads", {})
+        assert "t-bob" in listing
+    finally:
+        sse.AppStatus.should_exit = previous

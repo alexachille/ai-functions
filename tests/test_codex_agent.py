@@ -394,8 +394,8 @@ async def test_post_condition_failure_rides_next_turn(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-async def test_fork_resumes_a_distinct_codex_thread(tmp_path: Path) -> None:
-    """fork() returns a template resuming a server-side fork of the transcript."""
+async def test_fork_names_the_branch_point_without_creating_it(tmp_path: Path) -> None:
+    """fork() records what to branch from and issues no Codex RPC."""
     with MockModelServer() as model:
         model.enqueue(assistant_turn("first reply", response_id="r1"))
         template = CodexAgent(config=codex_test_config(tmp_path, model.url))
@@ -408,10 +408,53 @@ async def test_fork_resumes_a_distinct_codex_thread(tmp_path: Path) -> None:
 
             forked = await thread.fork()
             assert isinstance(forked, CodexAgent)
-            assert forked.resume_thread_id is not None
-            assert forked.resume_thread_id != source_id
+            assert forked.fork_of_thread_id == source_id
+            assert forked.resume_thread_id is None
+            assert thread.codex_thread_id == source_id
         finally:
             await thread.teardown()
+
+
+@pytest.mark.integration
+async def test_a_fork_and_its_source_run_independently(tmp_path: Path) -> None:
+    """Both sides of a fork stay writable.
+
+    Codex permits one writer per stored thread, so a fork must be created by the
+    app-server that will write to it rather than by the source's.
+    """
+    with MockModelServer() as model:
+        for i in range(1, 5):
+            model.enqueue(assistant_turn(f"reply {i}", response_id=f"r{i}"))
+
+        template = CodexAgent(config=codex_test_config(tmp_path, model.url))
+        coord = InMemoryCoordinator()
+        worker = await LocalWorker(coord).register()
+        source = await worker.spawn_locally(template, thread_name="source")
+        try:
+            _ = await asyncio.wait_for(source.run("REMEMBER-THIS"), timeout=120)
+
+            forked = await coord.fork(source.id)
+            try:
+                # The fork runs while the source is connected, and the source
+                # runs afterwards.
+                fork_reply = await asyncio.wait_for(forked.run("fork turn"), timeout=120)
+                assert fork_reply != ""
+                source_reply = await asyncio.wait_for(source.run("source turn"), timeout=120)
+                assert source_reply != ""
+
+                # Distinct Codex conversations, both carrying the pre-fork turn.
+                live_source = worker._threads[source.id]  # pyright: ignore[reportPrivateUsage]
+                live_fork = worker._threads[forked.id]  # pyright: ignore[reportPrivateUsage]
+                assert isinstance(live_source, CodexAgentThread)
+                assert isinstance(live_fork, CodexAgentThread)
+                assert live_fork.codex_thread_id != live_source.codex_thread_id
+                transcripts = " ".join(" ".join(model.user_texts(i)) for i in range(len(model.requests)))
+                assert transcripts.count("REMEMBER-THIS") >= 2
+            finally:
+                await forked.terminate_now()
+        finally:
+            await source.terminate_now()
+            await worker.close()
 
 
 @pytest.mark.integration
