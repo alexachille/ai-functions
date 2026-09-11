@@ -124,10 +124,12 @@ def format_event_full(event: Event) -> RenderableType:
 
 
 def format_event_plain(event: Event) -> str:
-    """Plain-text convenience wrapper for ``ai-functions logs`` without ``--color``.
+    """Render one event as a single line of plain, ANSI-free text.
 
     Equivalent to rendering :func:`format_event` with ``markup=False``
-    through a Rich console and stripping trailing whitespace.
+    through a colourless Rich console and stripping trailing whitespace —
+    the form to hand to a logger or write to a file, where escapes would
+    be noise.
 
     Args:
         event: Event to format.
@@ -136,5 +138,24 @@ def format_event_plain(event: Event) -> str:
         A single-line, ANSI-free representation of the event, or the
         empty string for events that :func:`filter_events` excludes from
         the feed (the streaming-fragment chunk events).
+    """
+    ...
+
+
+def print_event(event: Event) -> None:
+    """Print one event to standard output in the CLI's event-feed format.
+
+    A ready-made subscriber for
+    :meth:`~ai_functions.protocols.Coordinator.on`::
+
+        coordinator.on(print_event)
+
+    Events that :func:`filter_events` excludes — the streaming token and
+    thinking chunks, whose content is repeated in full by the assistant
+    turn that closes them — print nothing. Colour follows Rich's stdout
+    detection: escapes on a terminal, plain text elsewhere.
+
+    Args:
+        event: The event to print.
     """
     ...
