@@ -8,8 +8,7 @@ TUI share it.
 Output is a ``rich`` :class:`~rich.console.RenderableType` so both the
 plain-stdout logger (``ai-functions logs``) and the Textual ``RichLog`` widget
 (``ai-functions attach``) consume it without double-formatting. Callers that
-need plain text can ``str(Console().render(renderable))`` or pass
-``markup=False``.
+need plain text use :func:`format_event_plain`.
 """
 
 from __future__ import annotations
@@ -79,7 +78,7 @@ def filter_events_full(event: Event) -> bool:
     ...
 
 
-def format_event(event: Event, *, markup: bool = True) -> RenderableType:
+def format_event(event: Event) -> RenderableType:
     """Render one ai-functions event as a one-line Rich renderable.
 
     The renderable is typically a :class:`~rich.text.Text` instance;
@@ -90,9 +89,6 @@ def format_event(event: Event, *, markup: bool = True) -> RenderableType:
 
     Args:
         event: Any :class:`~ai_functions.types.Event` subclass.
-        markup: When ``True`` (default), the returned renderable
-            includes ANSI colours / bold attributes. Pass ``False`` for
-            log-file output where colours would produce escape noise.
 
     Returns:
         A Rich renderable that prints on a single line when measured
@@ -126,10 +122,9 @@ def format_event_full(event: Event) -> RenderableType:
 def format_event_plain(event: Event) -> str:
     """Render one event as a single line of plain, ANSI-free text.
 
-    Equivalent to rendering :func:`format_event` with ``markup=False``
-    through a colourless Rich console and stripping trailing whitespace —
-    the form to hand to a logger or write to a file, where escapes would
-    be noise.
+    Equivalent to rendering :func:`format_event` through a colourless Rich
+    console and stripping trailing whitespace — the form to hand to a logger
+    or write to a file, where escapes would be noise.
 
     Args:
         event: Event to format.

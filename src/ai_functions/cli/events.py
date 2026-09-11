@@ -8,8 +8,7 @@ TUI share it.
 Output is a ``rich`` :class:`~rich.console.RenderableType` so both the
 plain-stdout logger (``ai-functions logs``) and the Textual ``RichLog`` widget
 (``ai-functions attach``) consume it without double-formatting. Callers that
-need plain text can ``str(Console().render(renderable))`` or pass
-``markup=False``.
+need plain text use :func:`format_event_plain`.
 """
 
 from __future__ import annotations
@@ -135,7 +134,7 @@ def filter_events_full(event: Event) -> bool:
     return isinstance(event, MessageUserEvent | MessageAssistantCompleteEvent | ToolCallEvent | ToolResultEvent)
 
 
-def format_event(event: Event, *, markup: bool = True) -> RenderableType:
+def format_event(event: Event) -> RenderableType:
     """Render one ai-functions event as a one-line Rich renderable.
 
     The renderable is typically a :class:`~rich.text.Text` instance;
@@ -146,16 +145,12 @@ def format_event(event: Event, *, markup: bool = True) -> RenderableType:
 
     Args:
         event: Any :class:`~ai_functions.types.Event` subclass.
-        markup: When ``True`` (default), the returned renderable
-            includes ANSI colours / bold attributes. Pass ``False`` for
-            log-file output where colours would produce escape noise.
 
     Returns:
         A Rich renderable that prints on a single line when measured
         against an infinite-width console (multi-line content such as
         long assistant messages is truncated with an ellipsis).
     """
-    del markup  # colour is baked into Text styles; strip via console render.
     match event:
         case StartedEvent(thread_name=name):
             return Text(f"  ▶ {name or 'thread'} started", style="green")
@@ -240,10 +235,9 @@ def format_event_full(event: Event) -> RenderableType:
 def format_event_plain(event: Event) -> str:
     """Render one event as a single line of plain, ANSI-free text.
 
-    Equivalent to rendering :func:`format_event` with ``markup=False``
-    through a colourless Rich console and stripping trailing whitespace —
-    the form to hand to a logger or write to a file, where escapes would
-    be noise.
+    Equivalent to rendering :func:`format_event` through a colourless Rich
+    console and stripping trailing whitespace — the form to hand to a logger
+    or write to a file, where escapes would be noise.
 
     Args:
         event: Event to format.
@@ -255,7 +249,7 @@ def format_event_plain(event: Event) -> str:
     """
     if not filter_events(event):
         return ""
-    renderable = format_event(event, markup=False)
+    renderable = format_event(event)
     console = Console(file=None, color_system=None, force_terminal=False, width=1000)
     with console.capture() as capture:
         console.print(renderable, end="")
