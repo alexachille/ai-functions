@@ -1,9 +1,8 @@
 """Shared event-formatter used by ``ai-functions logs`` and ``ai-functions attach``.
 
-The logic originated in ``examples/integrate_claude_code.py`` — the pretty-
-printer that turns :class:`~ai_functions.types.Event` instances into one-line
-console output. Factored into the package so the CLI commands and the
-TUI share it.
+The pretty-printer that turns :class:`~ai_functions.types.Event` instances
+into one-line console output, shared by the CLI commands, the TUI, and — via
+:func:`print_event` — coordinator subscribers in user scripts.
 
 Output is a ``rich`` :class:`~rich.console.RenderableType` so both the
 plain-stdout logger (``ai-functions logs``) and the Textual ``RichLog`` widget
