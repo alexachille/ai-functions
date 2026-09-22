@@ -317,6 +317,10 @@ class _Translator:
         # misses builtins referenced only inside a nested all()/any(). Resolve
         # globals without executing them, while retaining Python's shadowing.
         self.constants = {**vars(builtins), **fn.__globals__, **closure.nonlocals}
+        # Python already identifies locals, including cells captured by generators.
+        # Only the branch environment may supply their values, never globals.
+        local_names = set(fn.__code__.co_varnames) | set(fn.__code__.co_cellvars)
+        self.constants = {name: value for name, value in self.constants.items() if name not in local_names}
 
     def fail(self, node: ast.AST, message: str) -> typing.NoReturn:
         line = self.line + getattr(node, "lineno", 1) - 1

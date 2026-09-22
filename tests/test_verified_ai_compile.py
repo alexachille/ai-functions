@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from ai_functions import scope
 from ai_functions.ai_thread import PostConditionResult
 from ai_functions.experimental.verified_compile import verified_ai_compile
 from ai_functions.experimental.verified_compile.compiler import Candidate, validate_candidate
@@ -25,6 +26,7 @@ from ai_functions.experimental.verified_compile.errors import (
     SynthesisError,
 )
 from ai_functions.testing import ScriptedModel, Turn
+from ai_functions.types import EventKind
 
 
 def clamp(x: int, lo: int = 0, hi: int = 10) -> int:
@@ -69,11 +71,19 @@ def decorate(cache, llm, **kwargs):
     )(clamp)
 
 
-async def test_real_proof_retry_native_calls_and_unbounded_integers(tmp_path, native_runtime):
+async def test_real_proof_retry_native_calls_and_unbounded_integers(tmp_path, native_runtime, caplog):
     llm = model(WRONG, GOOD)
     fn = decorate(tmp_path, llm, max_attempts=1)
     assert fn.artifact_dir is None
-    assert await fn(12) == 10
+    events = []
+    with caplog.at_level("INFO", logger="ai_functions.experimental.verified_compile.function"):
+        async with scope(on_event=events.append):
+            assert await fn(12) == 10
+    candidates = [event for event in events if event.kind == EventKind.TOOL_CALL]
+    assert [event.arguments for event in candidates] == [WRONG.model_dump(), GOOD.model_dump()]
+    assert "Verification failed for clamp:" in caplog.text
+    assert "Synthesizing clamp: attempt 2/2" in caplog.text
+    assert "Verified and compiled clamp" in caplog.text
     assert fn.is_compiled
     assert fn.artifact_dir is not None
     assert next(fn.artifact_dir.glob("*.lean")).is_file()
@@ -278,6 +288,26 @@ async def test_zero_argument_function_and_explicit_sync_compile(tmp_path, native
     # The sync bridge must also work when the caller already has an event loop.
     assert fn.compile_sync() is fn
     assert await fn() == 7
+
+
+async def test_core_propositional_simp_lemmas_are_accepted(tmp_path, native_runtime):
+    def identity(value: int) -> int:
+        """Return value."""
+
+    def contract(result, value):
+        assert result == value and True
+
+    # A live payout synthesis used and_true after Bool.and_eq_true turned its
+    # contract into a proposition. The lexical filter must admit that core lemma.
+    candidate = Candidate(
+        implementation="v0",
+        proof=("by\n  intro v0 h\n  simp only [post, implementation, Bool.and_eq_true, decide_eq_true_eq, and_true]"),
+    )
+    fn = verified_ai_compile(post_conditions=[contract], model=model(candidate), cache_dir=tmp_path, max_attempts=0)(
+        identity
+    )
+    await fn.compile()
+    assert fn.run_sync(-17) == -17
 
 
 async def test_list_quantifiers_and_list_results_via_native_ffi(tmp_path, native_runtime):

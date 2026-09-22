@@ -115,57 +115,60 @@ proof cannot correct a missing policy rule or stale input data.
 
 ## Install and run
 
-The API is experimental:
-
-```python
-from ai_functions.experimental.verified_compile import verified_ai_compile
-```
-
-Install the ordinary package on standard CPython 3.12–3.14, macOS 15+ or Linux,
-on x86-64 or ARM64:
+Use standard CPython 3.12–3.14 on macOS 15+ or Linux, on x86-64 or ARM64:
 
 ```bash
 pip install strands-ai-functions
 ```
 
-Explicit or first-use compilation resolves Lean 4.33.1 and compiles the direct
-Python/Lean bridge locally with `leanc`. It reuses an exact matching installed
-toolchain or managed cache, downloading official tools only when necessary.
-Importing the package performs no toolchain setup. No runtime wheels are needed.
-The running interpreter's Python headers and working host SDK/linker must be
-available; setup checks them before any model request.
+The first compilation downloads Lean if needed and builds the native runtime
+locally. Python development headers and C build tools are required; on macOS,
+install the Xcode Command Line Tools.
 
-For explicit provisioning and offline use:
+To set up Lean ahead of time, using the payout contracts above:
 
 ```python
 from ai_functions.experimental.lean import LeanConfig
 
-config = LeanConfig()  # mode="system" forbids toolchain downloads
-config.setup()           # provision once, ahead of application execution
-# Pass lean_config=config, offline=True to @verified_ai_compile for offline setup.
-# Call the decorated function's compile_sync() to build the bridge and function.
+lean = LeanConfig()
+lean.setup()
+
+@verified_ai_compile(
+    pre_conditions=[payout_inputs],
+    post_conditions=[maximum_safe_payout],
+    lean_config=lean,
+    offline=True,  # Disable tool downloads; synthesis still uses the model.
+)
+def max_payout(balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int) -> int:
+    """Return the largest affordable payout in cents, subject to the payout limit."""
+
+max_payout.compile_sync()
 ```
 
-`LeanConfig(cache_dir=...)` selects the shared toolchain and bridge cache.
-`AI_FUNCTIONS_LEAN_TOOLCHAIN_MODE` and `AI_FUNCTIONS_LEAN_CACHE_DIR` set defaults.
-The decorator's `cache_dir` selects its separate verified-function artifact cache.
-Offline setup still permits model calls; compile functions ahead of time and
-retain their artifacts for execution without model access.
-
-The default synthesis model is `global.anthropic.claude-opus-5` on Amazon Bedrock,
-with a 65,536-token output budget and a 900-second network read timeout. Compiler
-installation does not configure model credentials. With an authenticated AWS
-profile, run:
+By default, synthesis uses Claude through Amazon Bedrock. Run the payout example
+with an authenticated AWS profile:
 
 ```bash
-AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_payout.py
+STRANDS_TOOL_CONSOLE_MODE=enabled hatch run python examples/verified_payout.py
 ```
 
-Pass `model=` to the decorator to choose another model. A string selects a
-Bedrock model; a Strands `Model` instance selects a provider and its settings.
-A configured `BedrockModel` can also set a different token budget or timeout.
-The separate `CodexAgent` and `ClaudeAgent` adapters are not currently synthesis
-backends for this decorator.
+The examples print agent events and compilation progress, including verification
+failures and retries. Pass `model=` to `verified_ai_compile` to choose another model
+or provider (see also [Getting started](tutorial.md#getting-started)):
+
+```python
+from strands.models.openai import OpenAIModel
+
+model = OpenAIModel(client_args={"api_key": "<KEY>"}, model_id="gpt-4o")
+
+@verified_ai_compile(
+    pre_conditions=[payout_inputs],
+    post_conditions=[maximum_safe_payout],
+    model=model,
+)
+def max_payout(balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int) -> int:
+    """Return the largest affordable payout in cents, subject to the payout limit."""
+```
 
 ## Contract semantics
 
@@ -217,7 +220,7 @@ initiate synthesis. Concurrent calls coordinate compilation through a file
 lock. Verified artifacts are reused across objects and Python processes using
 the same compatible runtime installation. Cache keys include the contracts,
 types, captured constants, guidance, compiler/translator version, platform,
-and the exact Lean installation, Python ABI, and bridge sources. Corrupted or incomplete entries are rebuilt.
+and runtime installation. Corrupted or incomplete entries are rebuilt.
 
 ## Inspect generated artifacts
 
@@ -239,7 +242,7 @@ the internal compiler language is needed to define or call the Python function.
 The example can print the source path directly:
 
 ```bash
-AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_payout.py --show-artifacts
+hatch run python examples/verified_payout.py --show-artifacts
 ```
 
 ## Supported contract types
@@ -306,16 +309,7 @@ decimal conversion. The pinned floating-point model/runtime canonicalizes NaNs;
 preserving a NaN's payload or sign bits is not part of this interface. Contracts
 cannot inspect raw floating-point bits.
 
-Unsupported source is reported with the Python validator's name and location.
-It is never dropped or approximated, including on an unreachable branch.
-An assertion inside a postcondition stays a postcondition; it is not inferred
-to be a precondition.
-
 ## Failures and configuration
-
-`max_attempts` retains the existing convention: it counts retries after the
-initial candidate. `max_attempts=3` permits four candidates; `0` permits one.
-Verification failures are supplied to the model for the next candidate.
 
 Setup errors and native build failures fail directly. Exhausted synthesis raises
 the existing `AIFunctionError` base type, with a function-oriented message and
@@ -329,6 +323,3 @@ locks. `cache_dir` can select a different artifact cache, including for CI.
 Verification establishes the written contracts. Their deterministic translation
 and the native compiler/runtime are trusted implementation components. Keep the
 contracts strong enough to specify the behavior the application needs.
-
-See [native setup and development](verified_compile_setup.md) for prerequisites,
-cache behavior, and native test commands.

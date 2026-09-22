@@ -135,21 +135,6 @@ summary = await summarize_meeting(transcripts)  # a validated MeetingSummary ins
 
 Each direct call is a one-shot: it runs on a fresh, private thread and keeps no history between calls (for state, see [Stateful AI Threads](#stateful-ai-threads) below).
 
-## Verified Native Functions
-
-`verified_ai_compile` generates a reusable native implementation from Python
-preconditions and postconditions, checks its correctness, and caches it for
-subsequent calls. Import this experimental API from
-`ai_functions.experimental.verified_compile`. Ordinary package installation includes
-the feature; explicit or first-use compilation provisions Lean and builds the
-Python/Lean bridge locally. It requires standard CPython 3.12+ on macOS or Linux. The
-[verified functions guide](docs/verified_functions.md) shows how to specify the
-largest affordable payout under fixed fees, rounded percentage fees, and a payout
-limit. Its contracts check feasibility and maximality without calculating the
-answer. See the [payout example](examples/verified_payout.py) and
-[sorted-table lookup](examples/verified_lower_bound.py). Integer lists, bounded
-quantifiers, and binary64 float contracts are supported.
-
 ## Native Python Objects
 
 Agents are usually limited to serializable inputs and outputs. An AI Function can instead be given a Python execution environment, letting the agent generate and run code to process arbitrary data and return native Python objects, with post-conditions guaranteeing the result's shape.

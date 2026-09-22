@@ -21,7 +21,7 @@ def lean_cache(tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def native_runtime(lean_cache):
-    """Run real Lean tests offline; native CI requires the prepared toolchain."""
+    """Run real Lean tests offline, optionally requiring native prerequisites."""
     from ai_functions.experimental.verified_compile._runtime import resolve_runtime
     from ai_functions.experimental.verified_compile.errors import CompilerError
 

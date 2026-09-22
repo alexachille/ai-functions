@@ -13,6 +13,8 @@ from ai_functions.ai_thread import PostConditionResult
 from ai_functions.experimental.verified_compile.contracts import specification
 from ai_functions.experimental.verified_compile.errors import ContractError
 
+_LIMIT = 7
+
 
 def _function(x: int, lo: int = -10, hi: int = 10) -> int:
     """Clamp x to the inclusive interval."""
@@ -158,6 +160,15 @@ def test_immutable_constants_are_snapshotted_into_the_specification():
     bound = 20
     assert spec.post[0].predicate.evaluate({"r": 15})
     assert specification(_function, [], [contract]).post[0].predicate.evaluate({"r": 15}) is False
+
+
+def test_uninitialized_local_does_not_resolve_to_global():
+    def contract(result):
+        assert result == _LIMIT  # noqa: F823 — deliberate uninitialized local
+        _LIMIT = 0
+
+    with pytest.raises(ContractError, match="'_LIMIT' is not a parameter"):
+        specification(_function, [], [contract])
 
 
 def test_large_captured_constants_do_not_use_python_decimal_conversion():

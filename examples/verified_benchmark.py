@@ -7,7 +7,9 @@ checking, compilation, value conversion, and native execution are real.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
 import resource
 import statistics
 import sys
@@ -16,6 +18,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ai_functions import scope
+from ai_functions.cli import print_event
 from ai_functions.experimental.lean.toolchain import DEFAULT_LEAN_TOOLCHAIN
 from ai_functions.experimental.verified_compile import verified_ai_compile
 from ai_functions.experimental.verified_compile.compiler import Candidate
@@ -48,7 +52,7 @@ def latency(call: Callable[[], object], count: int) -> float:
     return statistics.median(samples)
 
 
-def main() -> None:
+async def main() -> None:
     """Compile two functions and report conversion and validation costs."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("verified-benchmark.json"))
@@ -61,7 +65,9 @@ def main() -> None:
         wrapped = verified_ai_compile(
             post_conditions=[unchanged], model=model, max_attempts=0, cache_dir=options.cache_dir
         )(function)
-        wrapped.compile_sync()
+        async with scope(on_event=print_event):
+            print(f"Preparing Lean and compiling {function.__name__}...", flush=True)
+            await wrapped.compile()
         functions.append(wrapped)
 
     cases = [
@@ -92,4 +98,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())

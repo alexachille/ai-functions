@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import shutil
 import tempfile
 import typing
@@ -25,6 +26,7 @@ from ...utils import run_blocking
 from ..lean import LeanConfig
 from ..lean.execution import run_in_thread
 from ..lean.locking import async_exclusive_file_lock
+from ..lean.toolchain import DEFAULT_LEAN_TOOLCHAIN
 from ._runtime import require_supported_python, resolve_runtime
 from .compiler import (
     SPEC_HELPERS,
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
 _DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5"
 _DEFAULT_MAX_TOKENS = 65536
 _DEFAULT_READ_TIMEOUT = 900
+_logger = logging.getLogger(__name__)
 
 
 def _prompt(spec: Specification) -> str:
@@ -76,22 +79,37 @@ Proof vocabulary: intro, exact, apply, refine, have, show, cases, constructor,
 split, simp, simp_all, only, at, all_goals, first, try, repeat, omega, grind,
 decide, rfl, assumption, contradiction, trivial, by_cases, subst, rw, simpa, unfold,
 dsimp, change, revert, rcases, induction, calc. Use explicit binders for local names.
-Core Int/Nat/Bool/List/Array/Float lemmas are allowed.
-The trusted environment imports Lean, including omega and grind, but no Mathlib.
+Core Int/Nat/Bool/List/Array/Float lemmas are allowed. Propositional simplification
+lemmas and_true, true_and, and_false, false_and, or_true, true_or, or_false, false_or,
+and_self, and or_self are allowed too; these differ from the Bool-prefixed lemmas.
+The trusted environment is {DEFAULT_LEAN_TOOLCHAIN}, with `public import Init`
+and `meta import all Lean`, including omega and grind, but no Mathlib.
+You have only the Candidate output tool; Lean checking runs after you submit it.
 Useful list lemmas include List.all_eq_true, List.any_eq_true, List.pairwise_cons,
 List.findIdx_nil, List.findIdx_cons, List.findIdx_le_length, List.not_of_lt_findIdx,
 List.Pairwise.rel_of_mem_take_of_mem_drop, List.take_succ_cons, List.drop_succ_cons,
 List.length_take, List.length_drop, and List.length_cons. Sortedness is List.Pairwise.
 For min/max arithmetic, unfold Int.min_def and Int.max_def before using omega.
-For integer division, useful bounds are Int.mul_ediv_self_le (nonzero denominator)
-and Int.lt_mul_ediv_self_add (positive denominator). Normalize distributive products
-with Int.add_mul, Int.mul_add, and Int.sub_mul; explicit product sign or monotonicity
-lemmas such as Int.mul_nonneg and Int.mul_le_mul_of_nonneg_left can reduce the
-remaining obligations to linear arithmetic for omega.
+For integer division, the exact core lemma signatures are:
+  Int.mul_ediv_self_le {{x k : Int}} (h : k ≠ 0) : k * (x / k) <= x
+  Int.lt_mul_ediv_self_add {{x k : Int}} (h : 0 < k) : x < k * (x / k) + k
+  Int.mul_nonneg {{a b : Int}} (ha : 0 <= a) (hb : 0 <= b) : 0 <= a * b
+  Int.mul_le_mul_of_nonneg_left {{a b c : Int}} : a <= b -> 0 <= c -> c * a <= c * b
+Implicit arguments can be supplied by name, e.g. (x := t0) (k := t1).
+Normalize distributive products with Int.add_mul, Int.mul_add, and Int.sub_mul.
+Use explicit product sign or monotonicity facts to reduce the remaining
+obligations to linear arithmetic for omega.
 Before omega on Int.ofNat expressions, normalize casts with
 `simp only [Int.ofNat_eq_natCast] at *`. For nonnegative, in-range slice indices,
 pythonIndex_ofNat, pythonSlice_prefix, and pythonSlice_suffix are available.
 An often useful proof is: by intro v0 v1 v2 h; simp_all [pre, post, implementation]; split <;> simp_all <;> omega
+For nested conditionals, split all remaining branches, not just the outermost one.
+After simplifying Boolean contracts and case-splitting comparisons, omega may still
+fail on goals containing conjunctions and disjunctions. Use `first | omega | grind`
+to finish those branches instead of treating omega failure as a counterexample.
+The `first` tactic accepts the first alternative that does not fail, even if goals
+remain. Do not put bare simp or simp_all among its closing alternatives; follow
+simplification with a tactic that closes every remaining goal.
 Use the appropriate number of inputs. No comments, strings, imports, commands,
 custom attributes, sorry/admit, unsafe code, native_decide, or run_tac.
 """
@@ -171,6 +189,7 @@ class _VerifiedFunction[**P, T]:
             await run_in_thread(runtime.preflight, self._timeout)
             if artifact is not None:
                 self._artifact = artifact
+                _logger.info("Reusing verified %s from %s", self.name, target)
                 return self
 
             synthesis_model = self._model
@@ -193,19 +212,21 @@ class _VerifiedFunction[**P, T]:
             def synthesize(prompt: str) -> str:
                 return prompt
 
-            # Proof/code messages belong to the internal compiler, not the
-            # application's conversation or normal event feed.
-            handle = await synthesize.spawn()
+            # Reuse the caller's scope so explicit event subscribers can inspect
+            # synthesis and its verification retries.
+            handle = await synthesize._spawn_in_context()
             diagnostics: list[str] = []
             prompt = _prompt(self._spec)
             try:
                 for _attempt in range(self._max_attempts + 1):
+                    _logger.info("Synthesizing %s: attempt %d/%d", self.name, _attempt + 1, self._max_attempts + 1)
                     try:
                         candidate = await handle.run(prompt)
                     except MaxTokensReachedException:
                         diagnostics.append(
                             "The model exhausted its output-token limit before returning a complete candidate."
                         )
+                        _logger.warning("%s: %s", self.name, diagnostics[-1])
                         prompt = (
                             "Your previous output reached the token limit. Return a concise, complete Candidate "
                             "containing implementation and proof. Reuse standard-library lemmas where possible. "
@@ -225,15 +246,19 @@ class _VerifiedFunction[**P, T]:
                             function_name=self.name,
                         ) from None
                     with tempfile.TemporaryDirectory(prefix="candidate-", dir=self._cache) as temporary:
+                        _logger.debug("Candidate for %s:\n%s", self.name, candidate.model_dump_json(indent=2))
                         directory = Path(temporary)
                         try:
                             module = await build_candidate(runtime, self._spec, candidate, directory, self._timeout)
                         except CandidateError as exc:
                             diagnostics.append(str(exc))
+                            _logger.warning("Verification failed for %s:\n%s", self.name, exc)
                             prompt = (
                                 "Your candidate failed verification. Keep the specification unchanged and return "
                                 "a revised "
-                                f"implementation and proof. Diagnostics:\n{exc}"
+                                "implementation and proof. Fix the first proof or elaboration errors; "
+                                "a later sorryAx audit error can be caused by Lean's recovery from those errors. "
+                                f"Diagnostics:\n{exc}"
                             )
                             continue
                         write_manifest(directory, module, key)
@@ -243,6 +268,7 @@ class _VerifiedFunction[**P, T]:
                             shutil.rmtree(target)
                         directory.rename(target)
                         self._artifact = Artifact(target, module, runtime)
+                        _logger.info("Verified and compiled %s in %s", self.name, target)
                         return self
             finally:
                 await handle.terminate_now()
