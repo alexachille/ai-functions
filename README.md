@@ -141,12 +141,13 @@ Each direct call is a one-shot: it runs on a fresh, private thread and keeps no 
 preconditions and postconditions, checks its correctness, and caches it for
 subsequent calls. Its API is Python-only; the private compiler runtime is
 installed with `pip install 'strands-ai-functions[verified]'`. This optional
-feature requires CPython 3.12+ on macOS or Linux. See the
-[verified functions guide](docs/verified_functions.md) and
-[sorted-table lookup](examples/verified_lower_bound.py) and
-[median examples](examples/verified_median.py), whose contracts specify result
-properties without prescribing an algorithm. Integer lists, bounded quantifiers,
-and binary64 float contracts are supported.
+feature requires CPython 3.12+ on macOS or Linux. The
+[verified functions guide](docs/verified_functions.md) shows how to specify the
+largest affordable payout under fixed fees, rounded percentage fees, and a payout
+limit. Its contracts check feasibility and maximality without calculating the
+answer. See the [payout example](examples/verified_payout.py) and
+[sorted-table lookup](examples/verified_lower_bound.py). Integer lists, bounded
+quantifiers, and binary64 float contracts are supported.
 
 ## Native Python Objects
 

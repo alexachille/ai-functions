@@ -1,6 +1,6 @@
 """A verified native function defined entirely through Python contracts.
 
-Requires CPython 3.14+ and the verified installation extra. The first valid call
+Requires CPython 3.12+ and the verified installation extra. The first valid call
 synthesizes and checks one implementation; subsequent calls reuse it.
 
 The default model uses Amazon Bedrock. Select your AWS credentials with

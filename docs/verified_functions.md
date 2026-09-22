@@ -1,15 +1,122 @@
 # Verified native functions
 
-`ai_verified_function` synthesizes one native implementation from Python
-contracts, checks a proof that it satisfies those contracts for every valid
-input, and caches the result. Subsequent calls execute the compiled function
-without contacting a model.
+Use `ai_verified_function` for pure calculations governed by precise policies:
+which outputs are allowed, which limits must hold, and what makes an answer
+optimal. Write Python contracts that check a proposed result. The system
+synthesizes an implementation and checks a proof that it satisfies those
+contracts for every valid input. Subsequent calls reuse the compiled native
+function without contacting a model.
 
-## Install
+A useful contract should be easier to review than the code that finds the
+answer. Repeating a reference implementation inside an assertion provides little
+benefit. The example below specifies feasibility and maximality; it does not
+calculate the result.
 
-Use CPython 3.12 or newer with the GIL enabled. The initial runtime wheels target
-macOS 15+ and Linux with glibc 2.34+, on x86-64 and ARM64. Other library features,
-including `ai_function`, continue to support Python 3.12+.
+## Example: the largest payout that fits after fees
+
+A payout service has a balance, a fixed processing fee, a percentage fee, and a
+limit on the amount it can send. All amounts are integer cents. The percentage
+fee is charged on the payout and rounded **up** to a whole cent. A zero payout
+incurs no fee.
+
+The policy has three requirements:
+
+1. The payout is nonnegative and respects the supplied balance and payout limit.
+2. A positive payout leaves enough money to pay both fees.
+3. Unless the payout limit is reached, increasing the payout by one cent would
+   exceed the balance.
+
+The third requirement matters: returning zero for every input would satisfy
+many safety-only contracts. Here, an unnecessarily small payout is also wrong.
+Because fees increase monotonically with the payout, rejecting the next cent
+establishes that no larger permitted payout fits.
+
+```python
+from ai_functions import ai_verified_function
+
+
+def payout_inputs(balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int):
+    assert balance_cents >= 0
+    assert fixed_fee_cents >= 0
+    assert 0 <= fee_bps <= 10_000
+    assert payout_limit_cents >= 0
+
+
+def maximum_safe_payout(result: int, balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int):
+    assert 0 <= result <= payout_limit_cents
+    assert result <= balance_cents
+    if result > 0:
+        fee_budget = balance_cents - result - fixed_fee_cents
+        assert result * fee_bps <= fee_budget * 10_000
+    if result < payout_limit_cents:
+        next_payout = result + 1
+        next_fee_budget = balance_cents - next_payout - fixed_fee_cents
+        assert next_payout * fee_bps > next_fee_budget * 10_000
+
+
+@ai_verified_function(
+    pre_conditions=[payout_inputs],
+    post_conditions=[maximum_safe_payout],
+    max_attempts=5,
+)
+def max_payout(balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int) -> int:
+    """Return the largest affordable payout in cents, subject to the payout limit.
+
+    For a positive payout p, charge a fixed fee plus ceil(p * fee_bps / 10000)
+    cents. A zero payout incurs no fee. Include fees in the balance constraint.
+    """
+
+
+payout = max_payout.run_sync(
+    balance_cents=10_000,
+    fixed_fee_cents=30,
+    fee_bps=290,               # 2.90% of the payout, rounded up.
+    payout_limit_cents=20_000,
+)
+assert payout == 9_689
+```
+
+The fee checks use multiplication and inequalities. If a proposed payout has
+`fee_budget` whole cents available, its rounded-up percentage fee fits exactly
+when `payout * fee_bps <= fee_budget * 10_000`. This avoids floating-point
+rounding in the contract. It does not tell the synthesizer how to choose the
+payout; that requires deriving a formula or a search procedure and proving it
+meets both requirements.
+
+For a $100.00 balance, a $0.30 fixed fee, and a 2.90% percentage fee, the answer is
+$96.89. The percentage fee rounds up to $2.81, so the payout and fees use exactly
+$100.00. Sending $96.90 would make the percentage fee $2.82 and the total $100.02.
+A superficially plausible extra cent would violate the policy.
+
+The same contracts cover the less obvious boundaries:
+
+| Balance | Payout limit | Payout | Total fees | Reason |
+| --- | --- | --- | --- | --- |
+| $100.00 | $200.00 | $96.89 | $3.11 | Largest amount that fits after fees |
+| $100.00 | $50.00 | $50.00 | $1.75 | The payout limit binds |
+| $1.00 | $10.00 | $0.68 | $0.32 | Percentage-fee rounding still matters |
+| $0.31 | $10.00 | $0.00 | $0.00 | Even a one-cent payout would cost $0.32 |
+| $0.00 | $10.00 | $0.00 | $0.00 | No funds; no payout or fee |
+
+All rows use the same $0.30 fixed fee and 2.90% rate. The proof covers every
+combination admitted by `payout_inputs`, including zero rates, zero limits,
+fees larger than the balance, and integers beyond machine-word precision.
+These examples illustrate the policy; they are not the scope of verification.
+
+The [runnable payout example](../examples/verified_payout.py) generates the
+implementation and proof and prints these cases. The value of the feature is a
+checked relationship between the implementation and a reviewable policy. The
+contracts can be longer than a particular implementation; the system also
+constructs and checks the proof that the implementation meets them.
+
+This guarantee covers the calculation for the supplied values. The service
+still owns balance reads, fee configuration, and atomic payment execution. A
+proof cannot correct a missing policy rule or stale input data.
+
+## Install and run
+
+Use CPython 3.12 or newer with the GIL enabled. Runtime wheels target macOS 15+
+and Linux with glibc 2.34+, on x86-64 and ARM64.
 
 ```bash
 pip install 'strands-ai-functions[verified]'
@@ -21,70 +128,22 @@ and caches normally. Importing the package and calling or compiling a function
 never downloads compiler tools. No separate compiler commands or development
 headers are needed.
 
-New synthesis uses the same model providers as `ai_function`; pass `model=` to
-choose one. An existing compiled artifact can be used without model access.
-
-The default provider is Amazon Bedrock. Compiler installation does not configure
-AWS credentials. For a named, authenticated profile, run the example with:
+The default synthesis model is `global.anthropic.claude-opus-5` on Amazon Bedrock,
+with a 65,536-token output budget and a 900-second network read timeout. Compiler
+installation does not configure model credentials. With an authenticated AWS
+profile, run:
 
 ```bash
-AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_clamp.py
+AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_payout.py
 ```
 
-Replace `my-bedrock-profile` with your profile name. Missing credentials fail
-directly with setup guidance and do not consume verification retries.
+Pass `model=` to the decorator to choose another model. A string selects a
+Bedrock model; a Strands `Model` instance selects a provider and its settings.
+A configured `BedrockModel` can also set a different token budget or timeout.
+The separate `CodexAgent` and `ClaudeAgent` adapters are not currently synthesis
+backends for this decorator.
 
-Model selection is explicit when desired:
-
-```python
-@ai_verified_function(
-    model="global.anthropic.claude-opus-5",
-    post_conditions=[check_result],
-)
-def function(x: int) -> int:
-    """Describe the desired result."""
-```
-
-A string selects a Bedrock model. A Strands `Model` instance selects a provider
-and its settings. Omitting `model` uses `global.anthropic.claude-opus-5`, with a
-16,384-token output budget and a 300-second network read timeout. Passing a
-configured `BedrockModel` lets you change those settings explicitly.
-The current synthesis path uses a Strands model with structured output, followed
-by this library's checking and retry loop. The separate `CodexAgent` and
-`ClaudeAgent` adapters are not currently synthesis backends for this decorator.
-
-## Define Python contracts
-
-```python
-from ai_functions import ai_verified_function
-
-
-def valid_bounds(lo: int, hi: int):
-    assert lo <= hi
-
-
-def check_clamp(result: int, x: int, lo: int, hi: int):
-    assert lo <= result <= hi
-    if x < lo:
-        assert result == lo
-    elif x > hi:
-        assert result == hi
-    else:
-        assert result == x
-
-
-@ai_verified_function(
-    pre_conditions=[valid_bounds],
-    post_conditions=[check_clamp],
-    max_attempts=3,
-)
-def clamp(x: int, lo: int, hi: int) -> int:
-    """Clamp x to the inclusive interval [lo, hi]."""
-
-
-assert clamp.run_sync(12, 0, 10) == 10
-assert clamp.run_sync(-5, 0, 10) == 0  # Reuses the compiled implementation.
-```
+## Contract semantics
 
 The contracts define correctness. The docstring provides synthesis guidance;
 the decorated Python body is not executed. Contracts are translated
@@ -97,83 +156,66 @@ function's types. At least one postcondition is required.
 
 Assertions and early returns retain their control-flow meaning. A successful
 `None` return passes, while an assertion failure or supported explicit `raise`
-fails. The existing result-object form is also supported:
+fails. You can also return the existing result object:
 
 ```python
 from ai_functions.ai_thread import PostConditionResult
 
 
-def nonnegative(result: int):
-    return PostConditionResult(passed=result >= 0, message="Expected a nonnegative result")
+def within_payout_limit(result: int, payout_limit_cents: int):
+    return PostConditionResult(
+        passed=0 <= result <= payout_limit_cents,
+        message="Payout must be nonnegative and within its limit",
+    )
 ```
 
-Contracts remain enforced when Python runs with `-O`.
-
-## Specify properties instead of an algorithm
-
-The [median example](../examples/verified_median.py) specifies three properties:
-the result is one of the inputs, at least two inputs are at most the result, and
-at least two inputs are at least the result. Ties are included. These properties
-allow an implementation based on comparisons, a sorting network, or min/max
-operations; the contract does not prescribe the computation.
-
-```python
-def is_median(result: int, a: int, b: int, c: int):
-    assert result == a or result == b or result == c
-    assert (a <= result and b <= result) or (a <= result and c <= result) or (b <= result and c <= result)
-    assert (a >= result and b >= result) or (a >= result and c >= result) or (b >= result and c >= result)
-```
-
-Run it with an authenticated profile:
-
-```bash
-AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_median.py
-```
+A bare Boolean return is not supported. Contracts remain enforced when Python
+runs with `-O`.
 
 ## Compile explicitly or on first use
 
 ```python
-await clamp.compile()       # Optional: prepare the implementation at startup.
-result = await clamp(12, 0, 10)
+await max_payout.compile()  # Prepare the implementation at service startup.
+payout = await max_payout(10_000, 30, 290, 20_000)
 
-clamp.compile_sync()         # Equivalent preparation from synchronous code.
-result = clamp.run_sync(12, 0, 10)
+max_payout.compile_sync()   # Equivalent preparation from synchronous code.
+payout = max_payout.run_sync(10_000, 30, 290, 20_000)
 ```
 
 Both compile methods are idempotent and return the decorated function. Without
 an explicit compile call, the first valid function call performs compilation.
-`clamp.is_compiled` reports whether this object has resolved a compiled artifact.
+`max_payout.is_compiled` reports whether this object has resolved a compiled
+artifact. Compilation proves one reusable function; it is not specialized to
+the first balance, fee, or limit.
 
-The implementation is verified for all inputs satisfying the preconditions,
-rather than specialized to the first call's values. Preconditions are checked
-before every invocation. Invalid inputs do not initiate synthesis.
-
-Concurrent calls coordinate compilation through a file lock. Verified artifacts
-are reused across objects and Python processes using the same compatible runtime
-installation. Cache keys include the contracts, scalar types, captured constants,
-guidance, compiler/translator version, platform, and runtime installation.
-Corrupted or incomplete entries are rebuilt.
+Preconditions are checked before every invocation. Invalid inputs do not
+initiate synthesis. Concurrent calls coordinate compilation through a file
+lock. Verified artifacts are reused across objects and Python processes using
+the same compatible runtime installation. Cache keys include the contracts,
+types, captured constants, guidance, compiler/translator version, platform,
+and runtime installation. Corrupted or incomplete entries are rebuilt.
 
 ## Inspect generated artifacts
 
-After compiling, `function.artifact_dir` returns the directory containing the
+After compiling, `max_payout.artifact_dir` returns the directory containing the
 verified source and native binary. Before compilation it returns `None`; merely
 reading this property never starts synthesis.
 
 ```python
-clamp.compile_sync()
-print(clamp.artifact_dir)
+max_payout.compile_sync()
+print(max_payout.artifact_dir)
 ```
 
 The directory's `Verified<hash>.lean` file contains `pre` and `post` (the
 translated specification), `implementation`, and `implementation_correct` (the
 proof). The same directory also contains generated C, compiled artifacts, and
-their integrity manifest. Treat these cache files as read-only.
+their integrity manifest. Treat these cache files as read-only. No knowledge of
+the internal compiler language is needed to define or call the Python function.
 
-The median example can print the source path directly:
+The example can print the source path directly:
 
 ```bash
-AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_median.py --show-artifacts
+AWS_PROFILE=my-bedrock-profile hatch run verified:python examples/verified_payout.py --show-artifacts
 ```
 
 ## Supported contract types

@@ -151,6 +151,40 @@ async def test_quantified_lower_bound_matches_bisect(tmp_path, native_runtime):
         fn.run_sync([2, 1], 1)
 
 
+async def test_maximum_payout_matches_exhaustive_fee_accounting(tmp_path, native_runtime):
+    root = Path(__file__).resolve().parents[1]
+    definitions = runpy.run_path(str(root / "examples" / "verified_payout.py"), run_name="payout_tests")
+    candidate = Candidate.model_validate_json((root / "tests" / "fixtures" / "verified_payout.json").read_text())
+    fn = ai_verified_function(
+        pre_conditions=[definitions["payout_inputs"]],
+        post_conditions=[definitions["maximum_safe_payout"]],
+        model=model(candidate),
+        cache_dir=tmp_path,
+        max_attempts=0,
+    )(definitions["max_payout"].__wrapped__)
+    await fn.compile()
+    for balance, fixed, rate, cap in product(range(41), (0, 1, 3, 10, 50), (0, 1, 290, 3333, 10000), (0, 1, 5, 20, 50)):
+        # Enumerate proposed payments and compute the actual rounded fees.
+        # This oracle does not use the generated closed-form payout formula.
+        feasible = []
+        for proposed in range(min(balance, cap) + 1):
+            fees = fixed + (proposed * rate + 9999) // 10000 if proposed else 0
+            if proposed + fees <= balance:
+                feasible.append(proposed)
+        expected = max(feasible)
+        assert fn.run_sync(balance, fixed, rate, cap) == expected
+        for wrong in (expected - 1, expected + 1):
+            with pytest.raises(AssertionError):
+                definitions["maximum_safe_payout"](wrong, balance, fixed, rate, cap)
+    assert fn.run_sync(10000, 30, 290, 20000) == 9689
+    huge = 2**20000
+    assert fn.run_sync(huge, 0, 0, huge) == huge
+    assert fn.run_sync(huge, 0, 10000, huge) == huge // 2
+    for invalid in ((-1, 0, 0, 1), (1, -1, 0, 1), (1, 0, 10001, 1), (1, 0, 0, -1)):
+        with pytest.raises(ContractError, match="payout_inputs"):
+            fn.run_sync(*invalid)
+
+
 async def test_cached_artifact_works_in_a_fresh_python_process(tmp_path, native_runtime):
     fn = decorate(tmp_path, model(GOOD), max_attempts=0)
     await fn.compile()
