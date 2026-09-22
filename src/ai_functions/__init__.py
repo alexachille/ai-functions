@@ -1,5 +1,6 @@
 """AI-enhanced functions and thread orchestration."""
 
+from ._verified import ai_verified_function
 from .ai_thread import (
     AIFunction,
     AIThread,
@@ -33,6 +34,7 @@ from .utils import run_blocking
 __all__ = [
     "AgentCoreMemoryBackend",
     "ai_function",
+    "ai_verified_function",
     "AIFunction",
     "AIThread",
     "aserve",

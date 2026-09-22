@@ -8,6 +8,7 @@ from .ai_thread import (
     SummarizationStrategy,
     ai_function,
 )
+from ._verified import ai_verified_function
 from .connect import connect
 from .discovery import (
     CoordinatorAlreadyRunningError,
@@ -33,6 +34,7 @@ from .utils import run_blocking
 __all__ = [
     "AgentCoreMemoryBackend",
     "ai_function",
+    "ai_verified_function",
     "AIFunction",
     "AIThread",
     "aserve",
