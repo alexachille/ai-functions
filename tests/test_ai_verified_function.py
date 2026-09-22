@@ -368,8 +368,8 @@ async def test_default_synthesis_uses_opus_5_with_a_proof_sized_budget(tmp_path,
     fn = decorate(tmp_path, None, max_attempts=0)
     assert await fn(12) == 10
     assert settings["model_id"] == "global.anthropic.claude-opus-5"
-    assert settings["max_tokens"] == 16384
-    assert settings["boto_client_config"].read_timeout == 300
+    assert settings["max_tokens"] == 65536
+    assert settings["boto_client_config"].read_timeout == 900
 
 
 async def test_corrupted_cache_is_rebuilt(tmp_path, native_runtime):

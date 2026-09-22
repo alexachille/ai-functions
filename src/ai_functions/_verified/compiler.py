@@ -1,8 +1,8 @@
 """Private proof checking, native compilation, and typed native calls.
 
-Candidate text has a small lexical vocabulary and occupies only expression and
-proof positions in a trusted template. In particular it cannot introduce
-commands, imports, metaprograms, strings, attributes, options, or external code.
+Candidate text is filtered to a small lexical vocabulary and placed in expression
+and proof positions in a trusted template. The filter rejects known unsupported
+constructs; it is not a Lean parser or a process sandbox.
 The saved declarations are replayed by the kernel in a separate process before
 native compilation or loading. The public API never downloads a toolchain.
 """
@@ -174,6 +174,7 @@ _PROOF_WORDS = _IMPL_WORDS | {
     "rw",
     "rwa",
     "simpa",
+    "using",
     "suffices",
     "pre",
     "post",
@@ -294,7 +295,7 @@ _FORBIDDEN_WORDS = {
 
 
 def _local_names(source: str) -> set[str]:
-    """Recognize explicit binders without allowing new global capabilities."""
+    """Collect apparent binder names for the lexical vocabulary checks."""
     names: set[str] = set()
     patterns = [
         r"\b(?:intro|intros|rename_i)\s+([^;\n<|]+)",
@@ -312,7 +313,7 @@ def _local_names(source: str) -> set[str]:
 
 
 def validate_candidate(candidate: Candidate, arity: int) -> None:
-    """Reject source capable of changing the trusted template or running metacode."""
+    """Apply lexical restrictions before Lean parsing and proof checking."""
     for name, source, words in (
         ("implementation", candidate.implementation, _IMPL_WORDS),
         ("proof", candidate.proof, _PROOF_WORDS),
@@ -321,7 +322,7 @@ def validate_candidate(candidate: Candidate, arity: int) -> None:
             raise CandidateError(
                 f"The {name} must be a nonempty term without comments, at most {_MAX_SOURCE} characters."
             )
-        if re.search(r"[^a-zA-Z0-9_\s()\[\]{}:;,=<>+*/!&|.?'\-≤≥≠¬∧∨→←↔↦∀∃∈∉⟨⟩↑·]", source):
+        if re.search(r"[^a-zA-Z0-9_\s()\[\]{}:;,=<>+*/!&|.?'\-≤≥≠¬∧∨→←↔↦∀∃∈∉⟨⟩↑·⊢]", source):
             raise CandidateError(f"The {name} contains unsupported syntax. Do not use strings, comments, or commands.")
         if re.search(r"[\]A-Za-z0-9_']!(?!=)", source):
             raise CandidateError("Panicking operations and native proof shortcuts are not permitted.")

@@ -42,7 +42,8 @@ if TYPE_CHECKING:
     from strands.models import Model
 
 _DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5"
-_DEFAULT_MAX_TOKENS = 16384
+_DEFAULT_MAX_TOKENS = 65536
+_DEFAULT_READ_TIMEOUT = 900
 
 
 @asynccontextmanager
@@ -88,7 +89,7 @@ Your proof field is ONLY the term beginning with `by` proving:
 
 Implementation vocabulary: inputs v0, v1, ...; locals t0, t1, ...; decimal or
 hexadecimal integer literals; true/false; if/then/else; let; +, -, *; comparisons and Boolean
-operators; min, max, abs, Int.natAbs, Int.ofNat, Nat.sqrt; pure List/Array functions,
+operators; min, max, abs, Int.natAbs, Int.ofNat, Int.ediv, Nat.sqrt; pure List/Array functions,
 and Float arithmetic/classification. Explicitly terminating local recursion is allowed.
 List inputs/outputs are List Int. Float inputs/outputs use binary64, not real arithmetic.
 Use Float.beq for floating-point equality; NaN is unequal to itself, while signed zeroes compare equal.
@@ -104,6 +105,11 @@ List.findIdx_nil, List.findIdx_cons, List.findIdx_le_length, List.not_of_lt_find
 List.Pairwise.rel_of_mem_take_of_mem_drop, List.take_succ_cons, List.drop_succ_cons,
 List.length_take, List.length_drop, and List.length_cons. Sortedness is List.Pairwise.
 For min/max arithmetic, unfold Int.min_def and Int.max_def before using omega.
+For integer division, useful bounds are Int.mul_ediv_self_le (nonzero denominator)
+and Int.lt_mul_ediv_self_add (positive denominator). Normalize distributive products
+with Int.add_mul, Int.mul_add, and Int.sub_mul; explicit product sign or monotonicity
+lemmas such as Int.mul_nonneg and Int.mul_le_mul_of_nonneg_left can reduce the
+remaining obligations to linear arithmetic for omega.
 Before omega on Int.ofNat expressions, normalize casts with
 `simp only [Int.ofNat_eq_natCast] at *`. For nonnegative, in-range slice indices,
 pythonIndex_ofNat, pythonSlice_prefix, and pythonSlice_suffix are available.
@@ -189,7 +195,7 @@ class _VerifiedFunction[**P, T]:
                 synthesis_model = BedrockModel(
                     model_id=_DEFAULT_MODEL_ID,
                     max_tokens=_DEFAULT_MAX_TOKENS,
-                    boto_client_config=BotocoreConfig(read_timeout=300, connect_timeout=30),
+                    boto_client_config=BotocoreConfig(read_timeout=_DEFAULT_READ_TIMEOUT, connect_timeout=30),
                 )
 
             @ai_function[Candidate](
