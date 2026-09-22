@@ -1,6 +1,6 @@
 """Measure warm FFI and public-call latency using verified identity functions.
 
-Run after installing the verified extra. Model responses are fixed; proof
+Run after an ordinary package installation. Model responses are fixed; proof
 checking, compilation, value conversion, and native execution are real.
 """
 
@@ -16,8 +16,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ai_functions import ai_verified_function
-from ai_functions._verified.compiler import RUNTIME_VERSION, Candidate
+from ai_functions.experimental.lean.toolchain import DEFAULT_LEAN_TOOLCHAIN
+from ai_functions.experimental.verified_compile import verified_ai_compile
+from ai_functions.experimental.verified_compile.compiler import Candidate
 from ai_functions.testing import ScriptedModel, Turn
 
 
@@ -57,7 +58,7 @@ def main() -> None:
     functions = []
     for function in (integer, sequence):
         model = ScriptedModel([Turn(tool_calls=(("Candidate", candidate.model_dump()),))])
-        wrapped = ai_verified_function(
+        wrapped = verified_ai_compile(
             post_conditions=[unchanged], model=model, max_attempts=0, cache_dir=options.cache_dir
         )(function)
         wrapped.compile_sync()
@@ -83,7 +84,7 @@ def main() -> None:
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     report = {
         "python": sys.version,
-        "runtime": RUNTIME_VERSION,
+        "toolchain": DEFAULT_LEAN_TOOLCHAIN,
         "cases": results,
         "peak_rss_mib": peak / (1024**2 if sys.platform == "darwin" else 1024),
     }

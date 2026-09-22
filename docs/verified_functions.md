@@ -1,6 +1,6 @@
 # Verified native functions
 
-Use `ai_verified_function` for pure calculations governed by precise policies:
+Use `verified_ai_compile` for pure calculations governed by precise policies:
 which outputs are allowed, which limits must hold, and what makes an answer
 optimal. Write Python contracts that check a proposed result. The system
 synthesizes an implementation and checks a proof that it satisfies those
@@ -32,7 +32,7 @@ Because fees increase monotonically with the payout, rejecting the next cent
 establishes that no larger permitted payout fits.
 
 ```python
-from ai_functions import ai_verified_function
+from ai_functions.experimental.verified_compile import verified_ai_compile
 
 
 def payout_inputs(balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int):
@@ -54,7 +54,7 @@ def maximum_safe_payout(result: int, balance_cents: int, fixed_fee_cents: int, f
         assert next_payout * fee_bps > next_fee_budget * 10_000
 
 
-@ai_verified_function(
+@verified_ai_compile(
     pre_conditions=[payout_inputs],
     post_conditions=[maximum_safe_payout],
     max_attempts=5,
@@ -115,18 +115,42 @@ proof cannot correct a missing policy rule or stale input data.
 
 ## Install and run
 
-Use CPython 3.12 or newer with the GIL enabled. Runtime wheels target macOS 15+
-and Linux with glibc 2.34+, on x86-64 and ARM64.
+The API is experimental:
 
-```bash
-pip install 'strands-ai-functions[verified]'
+```python
+from ai_functions.experimental.verified_compile import verified_ai_compile
 ```
 
-Python setup installs the private compiler runtime as a dependency. It is a
-substantial download, split into data wheels that the package manager installs
-and caches normally. Importing the package and calling or compiling a function
-never downloads compiler tools. No separate compiler commands or development
-headers are needed.
+Install the ordinary package on standard CPython 3.12–3.14, macOS 15+ or Linux,
+on x86-64 or ARM64:
+
+```bash
+pip install strands-ai-functions
+```
+
+Explicit or first-use compilation resolves Lean 4.33.1 and compiles the direct
+Python/Lean bridge locally with `leanc`. It reuses an exact matching installed
+toolchain or managed cache, downloading official tools only when necessary.
+Importing the package performs no toolchain setup. No runtime wheels are needed.
+The running interpreter's Python headers and working host SDK/linker must be
+available; setup checks them before any model request.
+
+For explicit provisioning and offline use:
+
+```python
+from ai_functions.experimental.lean import LeanConfig
+
+config = LeanConfig()  # mode="system" forbids toolchain downloads
+config.setup()           # provision once, ahead of application execution
+# Pass lean_config=config, offline=True to @verified_ai_compile for offline setup.
+# Call the decorated function's compile_sync() to build the bridge and function.
+```
+
+`LeanConfig(cache_dir=...)` selects the shared toolchain and bridge cache.
+`AI_FUNCTIONS_LEAN_TOOLCHAIN_MODE` and `AI_FUNCTIONS_LEAN_CACHE_DIR` set defaults.
+The decorator's `cache_dir` selects its separate verified-function artifact cache.
+Offline setup still permits model calls; compile functions ahead of time and
+retain their artifacts for execution without model access.
 
 The default synthesis model is `global.anthropic.claude-opus-5` on Amazon Bedrock,
 with a 65,536-token output budget and a 900-second network read timeout. Compiler
@@ -193,7 +217,7 @@ initiate synthesis. Concurrent calls coordinate compilation through a file
 lock. Verified artifacts are reused across objects and Python processes using
 the same compatible runtime installation. Cache keys include the contracts,
 types, captured constants, guidance, compiler/translator version, platform,
-and runtime installation. Corrupted or incomplete entries are rebuilt.
+and the exact Lean installation, Python ABI, and bridge sources. Corrupted or incomplete entries are rebuilt.
 
 ## Inspect generated artifacts
 
@@ -306,5 +330,5 @@ Verification establishes the written contracts. Their deterministic translation
 and the native compiler/runtime are trusted implementation components. Keep the
 contracts strong enough to specify the behavior the application needs.
 
-Maintainers can find runtime build and release instructions in
-[`runtime/README.md`](../runtime/README.md).
+See [native setup and development](verified_compile_setup.md) for prerequisites,
+cache behavior, and native test commands.

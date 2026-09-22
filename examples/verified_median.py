@@ -8,8 +8,8 @@ Add --show-artifacts to print the generated specification, code, and proof path.
 
 import argparse
 
-from ai_functions import ai_verified_function
 from ai_functions.ai_thread import AIFunctionError
+from ai_functions.experimental.verified_compile import verified_ai_compile
 
 
 def is_median(result: int, a: int, b: int, c: int):
@@ -19,7 +19,7 @@ def is_median(result: int, a: int, b: int, c: int):
     assert (a >= result and b >= result) or (a >= result and c >= result) or (b >= result and c >= result)
 
 
-@ai_verified_function(
+@verified_ai_compile(
     model="global.anthropic.claude-opus-5",
     post_conditions=[is_median],
     max_attempts=5,

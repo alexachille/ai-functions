@@ -8,8 +8,8 @@ The native function is verified once for every sorted integer list and key.
 
 import argparse
 
-from ai_functions import ai_verified_function
 from ai_functions.ai_thread import AIFunctionError
+from ai_functions.experimental.verified_compile import verified_ai_compile
 
 
 def sorted_values(values: list[int]):
@@ -22,7 +22,7 @@ def insertion_position(result: int, values: list[int], key: int):
     assert all(value >= key for value in values[result:])
 
 
-@ai_verified_function(
+@verified_ai_compile(
     pre_conditions=[sorted_values],
     post_conditions=[insertion_position],
     max_attempts=5,

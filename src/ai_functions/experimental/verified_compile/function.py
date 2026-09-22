@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import os
 import shutil
 import tempfile
 import typing
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
@@ -21,18 +19,20 @@ from strands.models import BedrockModel
 from strands.types.exceptions import MaxTokensReachedException
 from urllib3.exceptions import ReadTimeoutError as HTTPReadTimeoutError
 
-from ..ai_thread.ai_function import ai_function
-from ..ai_thread.errors import AIFunctionError
-from ..utils import run_blocking
+from ...ai_thread.ai_function import ai_function
+from ...ai_thread.errors import AIFunctionError
+from ...utils import run_blocking
+from ..lean import LeanConfig
+from ..lean.execution import run_in_thread
+from ..lean.locking import async_exclusive_file_lock
+from ._runtime import require_supported_python, resolve_runtime
 from .compiler import (
     SPEC_HELPERS,
     Artifact,
     Candidate,
     build_candidate,
     cache_key,
-    find_runtime,
     read_artifact,
-    require_supported_python,
     write_manifest,
 )
 from .contracts import Scalar, Specification, kind_name, specification
@@ -44,28 +44,6 @@ if TYPE_CHECKING:
 _DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5"
 _DEFAULT_MAX_TOKENS = 65536
 _DEFAULT_READ_TIMEOUT = 900
-
-
-@asynccontextmanager
-async def _cache_lock(path: Path) -> AsyncIterator[None]:
-    # File locks work across processes, threads and the separate loops used by
-    # run_sync. Nonblocking polling keeps cancellation responsive.
-    import fcntl
-
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                await asyncio.sleep(0.05)
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
 
 
 def _prompt(spec: Specification) -> str:
@@ -132,6 +110,8 @@ class _VerifiedFunction[**P, T]:
         max_attempts: int = 10,
         compile_timeout: float = 120,
         cache_dir: str | Path | None = None,
+        lean_config: LeanConfig | None = None,
+        offline: bool = False,
         output_type: type[T] | None = None,
     ) -> None:
         require_supported_python()
@@ -146,8 +126,10 @@ class _VerifiedFunction[**P, T]:
         self._cache = (
             Path(cache_dir).expanduser().resolve()
             if cache_dir is not None
-            else Path(platformdirs.user_cache_dir("ai_functions")) / "verified"
+            else Path(platformdirs.user_cache_dir("ai_functions")) / "verified_compile"
         )
+        self._lean_config = lean_config or LeanConfig()
+        self._offline = offline
         self._artifact: Artifact | None = None
         functools.update_wrapper(self, fn, updated=())
 
@@ -174,18 +156,19 @@ class _VerifiedFunction[**P, T]:
         """Prepare one reusable implementation, or reuse a verified cached artifact.
 
         Synthesis runs once for all inputs satisfying the Python preconditions.
-        The compiler runtime must already have been installed during Python
-        setup. This method never installs software or downloads compiler tools.
+        Resolve the pinned Lean toolchain and build the Python bridge locally.
+        Setup reuses installed/cached tools and provisions missing tools unless
+        offline=True or the toolchain uses system mode.
         """
         if self._artifact is not None:
             return self
-        runtime = find_runtime()
+        runtime = await run_in_thread(resolve_runtime, self._lean_config, offline=self._offline)
         key = cache_key(self._spec, runtime)
         self._cache.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = self._cache / key
-        async with _cache_lock(self._cache / (key + ".lock")):
+        async with async_exclusive_file_lock(self._cache / (key + ".lock")):
             artifact = await asyncio.to_thread(read_artifact, target, runtime, key)
-            await asyncio.to_thread(runtime.preflight)
+            await run_in_thread(runtime.preflight, self._timeout)
             if artifact is not None:
                 self._artifact = artifact
                 return self
@@ -341,6 +324,8 @@ class _VerifiedFactory:
         max_attempts: int = 10,
         compile_timeout: float = 120,
         cache_dir: str | Path | None = None,
+        lean_config: LeanConfig | None = None,
+        offline: bool = False,
     ) -> Callable[[Callable[..., T]], _VerifiedFunction[..., T]]: ...
 
     def __call__(self, fn: Callable[..., Any] | None = None, /, **kwargs: Any) -> Any:
@@ -350,10 +335,11 @@ class _VerifiedFactory:
         return decorate(fn) if fn is not None else decorate
 
 
-ai_verified_function = _VerifiedFactory()
+verified_ai_compile = _VerifiedFactory()
 """Generate and cache a verified native implementation from Python contracts.
 
-Requires CPython 3.12+ and the ``verified`` installation extra. Preconditions and
+Experimental. Requires standard CPython 3.12+; Lean and the native bridge are
+prepared on explicit or first-use compilation. Preconditions and
 postconditions use ordinary synchronous Python validator functions. The initial
 supported domain is pure ``int``/``bool``/``float``/``list[int]`` functions with explicit type hints.
 ``max_attempts`` is the number of retries after the initial synthesis attempt.

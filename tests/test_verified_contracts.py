@@ -9,9 +9,9 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from ai_functions._verified.contracts import specification
-from ai_functions._verified.errors import ContractError
 from ai_functions.ai_thread import PostConditionResult
+from ai_functions.experimental.verified_compile.contracts import specification
+from ai_functions.experimental.verified_compile.errors import ContractError
 
 
 def _function(x: int, lo: int = -10, hi: int = 10) -> int:
@@ -189,8 +189,8 @@ def test_boolean_predicates_match_python(result, a, b):
 
 def test_contracts_remain_enforced_under_python_optimization(tmp_path):
     script = tmp_path / "optimized.py"
-    script.write_text("""from ai_functions._verified.contracts import specification
-from ai_functions._verified.errors import ContractError
+    script.write_text("""from ai_functions.experimental.verified_compile.contracts import specification
+from ai_functions.experimental.verified_compile.errors import ContractError
 def function(x: int) -> int:
     pass
 def pre(x):

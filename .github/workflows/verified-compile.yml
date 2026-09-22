@@ -1,0 +1,63 @@
+name: Experimental verified compilation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/ai_functions/experimental/lean/**'
+      - 'src/ai_functions/experimental/verified_compile/**'
+      - 'spec/ai_functions/experimental/**'
+      - 'src/ai_functions/__init__.py'
+      - 'src/ai_functions/utils.py'
+      - 'tests/conftest.py'
+      - 'tests/test_verified_ai_compile.py'
+      - 'tests/test_verified_*.py'
+      - 'tests/test_lean_*.py'
+      - 'tests/fixtures/verified_*.json'
+      - 'examples/verified_*.py'
+      - 'pyproject.toml'
+      - '.github/workflows/verified-compile.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native tests on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      AI_FUNCTIONS_REQUIRE_VERIFIED_NATIVE: '1'
+      AI_FUNCTIONS_LEAN_CACHE_DIR: ${{ runner.temp }}/ai-functions-lean
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the ordinary Python wheel
+        run: |
+          uv python install 3.12 3.13 3.14
+          uv build --wheel
+      - name: Test source and wheel installs with real Lean on each interpreter
+        run: |
+          for version in 3.12 3.13 3.14; do
+            for installation in source wheel; do
+              test_env=".venv-$version-$installation"
+              uv venv --python "$version" --managed-python "$test_env"
+              if [ "$installation" = source ]; then
+                uv pip install --python "$test_env/bin/python" -e . pytest pytest-asyncio hypothesis
+              else
+                uv pip install --python "$test_env/bin/python" dist/*.whl pytest pytest-asyncio hypothesis
+              fi
+              "$test_env/bin/python" -c \
+                'from ai_functions.experimental.lean import LeanConfig; LeanConfig().setup()'
+              "$test_env/bin/python" -m pytest -q \
+                tests/test_lean_*.py tests/test_verified_runtime.py \
+                tests/test_verified_contracts.py tests/test_verified_compiler.py \
+                tests/test_verified_value_types.py tests/test_verified_ai_compile.py \
+                tests/test_verified_ffi.py
+            done
+          done

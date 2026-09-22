@@ -137,11 +137,12 @@ Each direct call is a one-shot: it runs on a fresh, private thread and keeps no 
 
 ## Verified Native Functions
 
-`ai_verified_function` generates a reusable native implementation from Python
+`verified_ai_compile` generates a reusable native implementation from Python
 preconditions and postconditions, checks its correctness, and caches it for
-subsequent calls. Its API is Python-only; the private compiler runtime is
-installed with `pip install 'strands-ai-functions[verified]'`. This optional
-feature requires CPython 3.12+ on macOS or Linux. The
+subsequent calls. Import this experimental API from
+`ai_functions.experimental.verified_compile`. Ordinary package installation includes
+the feature; explicit or first-use compilation provisions Lean and builds the
+Python/Lean bridge locally. It requires standard CPython 3.12+ on macOS or Linux. The
 [verified functions guide](docs/verified_functions.md) shows how to specify the
 largest affordable payout under fixed fees, rounded percentage fees, and a payout
 limit. Its contracts check feasibility and maximality without calculating the

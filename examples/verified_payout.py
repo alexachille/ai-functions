@@ -8,8 +8,8 @@ rounded up to a whole cent; the fixed fee is charged only for a nonzero payout.
 
 import argparse
 
-from ai_functions import ai_verified_function
 from ai_functions.ai_thread import AIFunctionError
+from ai_functions.experimental.verified_compile import verified_ai_compile
 
 
 def payout_inputs(balance_cents: int, fixed_fee_cents: int, fee_bps: int, payout_limit_cents: int):
@@ -31,7 +31,7 @@ def maximum_safe_payout(result: int, balance_cents: int, fixed_fee_cents: int, f
         assert next_payout * fee_bps > next_fee_budget * 10_000
 
 
-@ai_verified_function(
+@verified_ai_compile(
     pre_conditions=[payout_inputs],
     post_conditions=[maximum_safe_payout],
     max_attempts=5,

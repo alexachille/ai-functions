@@ -7,8 +7,8 @@ The default model uses Amazon Bedrock. Select your AWS credentials with
 AWS_PROFILE when running the example.
 """
 
-from ai_functions import ai_verified_function
 from ai_functions.ai_thread import AIFunctionError
+from ai_functions.experimental.verified_compile import verified_ai_compile
 
 
 def valid_bounds(lo: int, hi: int):
@@ -25,7 +25,7 @@ def check_clamp(result: int, x: int, lo: int, hi: int):
         assert result == x
 
 
-@ai_verified_function(pre_conditions=[valid_bounds], post_conditions=[check_clamp], max_attempts=3)
+@verified_ai_compile(pre_conditions=[valid_bounds], post_conditions=[check_clamp], max_attempts=3)
 def clamp(x: int, lo: int, hi: int) -> int:
     """Clamp x to the inclusive interval [lo, hi]."""
 
