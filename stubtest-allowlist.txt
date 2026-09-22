@@ -105,3 +105,8 @@ ai_functions.ai_thread.debug
 # ``ErrorKind = Literal["cancelled", "not_found", ...]``: same Literal-alias false positive as
 # runtime.coordinator_tools_core.SendMessageMode.
 ai_functions.network.wire.ErrorKind
+
+# Private compiler, contract IR, and failure categories are implementation
+# details behind the single ai_verified_function decorator, not additional APIs.
+ai_functions._verified.contracts
+ai_functions._verified.errors
