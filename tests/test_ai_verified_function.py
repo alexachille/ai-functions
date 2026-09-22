@@ -6,9 +6,13 @@ import asyncio
 import json
 import math
 import os
+import runpy
 import struct
 import subprocess
 import sys
+from bisect import bisect_left
+from itertools import product
+from pathlib import Path
 
 import pytest
 
@@ -98,6 +102,53 @@ async def test_concurrent_calls_compile_once_and_reuse_across_instances(tmp_path
     assert await cached.compile() is cached
     assert cached.run_sync(7) == 7
     assert cached.artifact_dir == fn.artifact_dir
+
+
+async def test_property_specified_median_matches_independent_sorting_oracle(tmp_path, native_runtime):
+    example = Path(__file__).resolve().parents[1] / "examples" / "verified_median.py"
+    definitions = runpy.run_path(str(example), run_name="median_test_definitions")
+    candidate = Candidate(
+        implementation="max (min v0 v1) (min (max v0 v1) v2)",
+        proof=(
+            "by\n  intro v0 v1 v2 h\n"
+            "  simp_all [pre, post, implementation, Int.min_def, Int.max_def]\n"
+            "  repeat first | omega | (split <;> simp_all)"
+        ),
+    )
+    fn = ai_verified_function(
+        post_conditions=[definitions["is_median"]],
+        model=model(candidate),
+        cache_dir=tmp_path,
+        max_attempts=0,
+    )(definitions["median_of_three"].__wrapped__)
+    await fn.compile()
+    for values in product((-7, 0, 9), repeat=3):
+        assert fn.run_sync(*values) == sorted(values)[1]
+    assert fn.run_sync(2**10000, -(2**10000), 42) == 42
+
+
+async def test_quantified_lower_bound_matches_bisect(tmp_path, native_runtime):
+    # Captured from a real Opus 5 synthesis, then checked by the kernel. The
+    # independent Python oracle tests execution and the conversion boundary.
+    root = Path(__file__).resolve().parents[1]
+    definitions = runpy.run_path(str(root / "examples" / "verified_lower_bound.py"), run_name="lower_bound_tests")
+    candidate = Candidate.model_validate_json((root / "tests" / "fixtures" / "verified_lower_bound.json").read_text())
+    fn = ai_verified_function(
+        pre_conditions=[definitions["sorted_values"]],
+        post_conditions=[definitions["insertion_position"]],
+        model=model(candidate),
+        cache_dir=tmp_path,
+        max_attempts=0,
+    )(definitions["lower_bound"].__wrapped__)
+    await fn.compile()
+    for length in range(5):
+        for values in sorted({tuple(sorted(values)) for values in product((-2, 0, 2), repeat=length)}):
+            for key in range(-3, 4):
+                assert fn.run_sync(list(values), key) == bisect_left(values, key)
+    large = [-(2**10000), 0, 2**10000]
+    assert fn.run_sync(large, 2**10000) == 2
+    with pytest.raises(ContractError, match="sorted_values"):
+        fn.run_sync([2, 1], 1)
 
 
 async def test_cached_artifact_works_in_a_fresh_python_process(tmp_path, native_runtime):
