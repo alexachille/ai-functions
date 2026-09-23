@@ -17,6 +17,8 @@ The tests below cover:
   - The dispatcher emits the correct lifecycle sequence on success/failure/cancel.
   - ``RESULT`` appears before ``COMPLETED`` on success and never appears on
     failure or cancel.
+  - Losing a worker fails the threads it hosted, and a terminal status is
+    never downgraded by a lifecycle event that lands afterwards.
 """
 
 from __future__ import annotations
@@ -26,11 +28,12 @@ import asyncio
 import pytest
 
 from ai_functions import ai_function
-from ai_functions.runtime import EventEmissionError
+from ai_functions.runtime import EventEmissionError, InMemoryCoordinator, LocalWorker, WorkerLostError
 from ai_functions.testing import RuntimeHarness, ScriptedModel, Turn
-from ai_functions.types import EventKind
+from ai_functions.types import Event, EventKind, ThreadId, ThreadStatus
 from ai_functions.types.events import (
     CompletedEvent,
+    FailedEvent,
     MessageUserEvent,
     StartedEvent,
 )
@@ -248,3 +251,174 @@ async def test_multiple_cycles_produce_matching_lifecycle_counts() -> None:
         assert kinds.count(EventKind.STARTED) == 3
         assert kinds.count(EventKind.RESULT) == 3
         assert kinds.count(EventKind.COMPLETED) == 3
+
+
+# ── Worker loss cascades into the threads it hosted ───────────────────────
+
+
+async def test_deregister_worker_fails_the_threads_it_still_hosted() -> None:
+    """A thread whose host is gone reports ``failed``, not ``idle``.
+
+    ``list_threads`` and the routing table must agree: before the cascade a
+    thread orphaned by a lost worker stayed ``idle`` in the registry while
+    every routed call on it raised, so discovery advertised a thread nothing
+    could reach.
+    """
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="ok")])))
+        assert (await handle.run("prompt")).strip() == "ok"
+
+        await h.coordinator.deregister_worker(h.worker.worker_id)
+
+        infos = {info.thread_id: info for info in await h.coordinator.list_threads()}
+        assert infos[handle.id].status is ThreadStatus.FAILED
+        assert await h.coordinator.get_thread_status(handle.id) is ThreadStatus.FAILED
+
+        terminal = (await h.events(handle.id))[-1]
+        assert isinstance(terminal, FailedEvent)
+        assert str(h.worker.worker_id) in terminal.error
+        assert str(handle.id) in terminal.error
+
+
+async def test_operations_on_an_orphaned_thread_name_the_lost_worker() -> None:
+    """Routing to a gone worker raises ``WorkerLostError``, not ``ThreadNotFoundError``.
+
+    The thread *is* registered; reporting "not found" sends the caller looking
+    for a spawn bug instead of a dead host.
+    """
+    async with RuntimeHarness() as h:
+        first = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="a")])))
+        second = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="b")])))
+        await h.coordinator.deregister_worker(h.worker.worker_id)
+
+        with pytest.raises(WorkerLostError) as exc_info:
+            _ = first.run("again")
+        assert exc_info.value.worker_id == h.worker.worker_id
+        assert exc_info.value.thread_ids[0] == first.id
+        assert set(exc_info.value.thread_ids) == {first.id, second.id}
+
+        with pytest.raises(WorkerLostError):
+            await h.coordinator.notify(first.id, "hello")
+        with pytest.raises(WorkerLostError):
+            await h.coordinator.cancel(first.id)
+        with pytest.raises(WorkerLostError):
+            await h.coordinator.terminate(first.id)
+
+
+async def test_worker_loss_is_fully_recorded_before_failure_callbacks() -> None:
+    """Subscribers see every affected thread failed and the complete loss set."""
+    coordinator = InMemoryCoordinator()
+    async with RuntimeHarness(coordinator=coordinator) as h:
+        first = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="a")])))
+        second = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="b")])))
+        thread_ids = {first.id, second.id}
+        observed: list[tuple[ThreadId, dict[ThreadId, ThreadStatus], WorkerLostError]] = []
+
+        def on_failure(event: Event) -> None:
+            assert event.thread_id is not None
+            # Synchronous callbacks cannot await discovery; snapshot the cache
+            # they observe and assert outside append_event's exception isolation.
+            statuses = {
+                tid: coordinator._infos[tid].status  # noqa: SLF001
+                for tid in thread_ids
+            }
+            try:
+                coordinator.submit(event.thread_id, "retry")
+            except WorkerLostError as exc:
+                observed.append((event.thread_id, statuses, exc))
+
+        with coordinator.on(on_failure, kinds=[EventKind.FAILED]):
+            await coordinator.deregister_worker(h.worker.worker_id)
+
+        assert len(observed) == 2
+        assert {tid for tid, _, _ in observed} == thread_ids
+        for tid, statuses, error in observed:
+            assert statuses == dict.fromkeys(thread_ids, ThreadStatus.FAILED)
+            assert error.worker_id == h.worker.worker_id
+            assert error.thread_ids[0] == tid
+            assert set(error.thread_ids) == thread_ids
+
+
+async def test_in_flight_pause_does_not_downgrade_worker_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pause response arriving after worker loss must leave the thread failed."""
+    pause_started = asyncio.Event()
+    release_pause = asyncio.Event()
+    original_pause = LocalWorker.pause
+
+    async def delayed_pause(worker: LocalWorker, thread_id: ThreadId) -> None:
+        await original_pause(worker, thread_id)
+        pause_started.set()
+        await release_pause.wait()
+
+    monkeypatch.setattr(LocalWorker, "pause", delayed_pause)
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="ok")])))
+        assert (await handle.run("prompt")).strip() == "ok"
+        pause_task = asyncio.create_task(h.coordinator.pause(handle.id))
+        try:
+            await asyncio.wait_for(pause_started.wait(), timeout=2)
+            await h.coordinator.deregister_worker(h.worker.worker_id)
+            assert await handle.status() is ThreadStatus.FAILED
+
+            release_pause.set()
+            await asyncio.wait_for(pause_task, timeout=2)
+            assert await handle.status() is ThreadStatus.FAILED
+        finally:
+            release_pause.set()
+            await asyncio.gather(pause_task, return_exceptions=True)
+
+
+async def test_deregister_worker_is_idempotent_and_fails_each_thread_once() -> None:
+    """A second deregistration finds nothing non-terminal left to fail."""
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="ok")])))
+        await h.coordinator.deregister_worker(h.worker.worker_id)
+        await h.coordinator.deregister_worker(h.worker.worker_id)
+
+        kinds = [e.kind for e in await h.events(handle.id)]
+        assert kinds.count(EventKind.FAILED) == 1
+
+
+async def test_a_terminal_status_is_never_downgraded_by_a_later_lifecycle_event() -> None:
+    """A lifecycle event that lands after the thread died leaves the status alone.
+
+    A cycle already in flight when its worker is lost still emits ``COMPLETED``.
+    Mapping that to ``idle`` would resurrect a thread nothing can route to.
+    """
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_simple.replace(model=ScriptedModel([Turn(text="ok")])))
+        await h.coordinator.deregister_worker(h.worker.worker_id)
+        assert await h.coordinator.get_thread_status(handle.id) is ThreadStatus.FAILED
+
+        h.worker._route_event(  # noqa: SLF001 -- standing in for a cycle that was already in flight
+            CompletedEvent(thread_id=handle.id),
+            thread_id=handle.id,
+            source="runtime",
+        )
+        assert await h.coordinator.get_thread_status(handle.id) is ThreadStatus.FAILED
+
+
+async def test_a_failed_cycle_leaves_the_thread_runnable() -> None:
+    """A dispatcher ``FAILED`` reports one broken cycle, not a dead thread."""
+    async with RuntimeHarness() as h:
+        handle = await h.spawn(_simple.replace(model=ScriptedModel([])))
+        with pytest.raises(Exception):  # noqa: B017, PT011
+            await handle.run("prompt")
+        assert await h.coordinator.get_thread_status(handle.id) is ThreadStatus.IDLE
+
+
+async def test_an_orderly_worker_close_fails_nothing() -> None:
+    """``LocalWorker.close`` reaps its threads before it leaves the pool.
+
+    ``_teardown`` only schedules each deregistration, so a close that did not
+    drain those tasks would hand ``deregister_worker`` a registry still full of
+    threads and publish every one of them as ``failed``.
+    """
+    async with RuntimeHarness() as h:
+        handle = await h.coordinator.spawn(_simple.replace(model=ScriptedModel([Turn(text="ok")])))
+        assert (await handle.run("prompt")).strip() == "ok"
+        await h.worker.close()
+
+        assert await h.coordinator.list_threads() == []
+        kinds = [e.kind for e in await h.events(handle.id)]
+        assert kinds.count(EventKind.FAILED) == 0
