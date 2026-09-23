@@ -888,6 +888,47 @@ coord.append_event(CustomEvent(
 ))
 ```
 
+Custom events use the same flat wire format as built-in events: the example's
+`step` and `duration_ms` appear alongside `kind`, `id`, `timestamp`, `thread_id`,
+`thread_name`, and `message_id`. There is no automatic `payload` wrapper in
+the serialized event.
+
+Those framework names, plus the `payload` carrier itself, are reserved.
+Application payload keys must not shadow a declared field or its alias.
+For example, `payload={"id": "source-id"}` raises a validation error; use
+`payload={"item_id": "source-id"}` or explicitly nest source data:
+
+```python
+event = CustomEvent(
+    kind="source_item",
+    thread_id=handle.id,
+    payload={"item": {"id": "source-id", "thread_id": "source-thread"}},
+)
+```
+
+The runtime's `event.id` and `event.thread_id` remain distinct from
+`event.payload["item"]`. Existing saved events whose top-level reserved names
+represented application data need an explicit migration before those fields
+can be interpreted as runtime metadata.
+
+Users can also subclass `CustomEvent` and declare ordinary typed Pydantic
+fields. Subclasses may specialize `kind`, but cannot redefine `BaseEvent`
+fields or alias application fields onto framework names. The default network
+decoder returns generic `CustomEvent` instances for unknown kinds; consumers
+apply their own model when they need typed application data.
+
+Use the shared `Event` type for event fields and containers in Pydantic models.
+Its serialization policy preserves fields declared by custom subclasses through
+RPC parameters, lists, and session logs, while honoring their serializers and
+excluded fields. Generic receivers collect the serialized application fields
+into `payload`; consumers can reconstruct their subclass with
+`MyEvent.model_validate(received.model_dump())`.
+
+The built-in adapters follow this contract: Codex plan items expose
+`item_id` and `text`, opaque Codex notifications use `payload["data"]`, and
+unmapped Codex items use `payload["item"]`. Claude system and unmapped messages
+keep SDK fields under `payload["message"]`.
+
 ### Observing bare calls
 
 A bare call — `await my_function(...)` or `run_sync`, with no coordinator in sight — runs on a private coordinator and worker built for that call and dropped when it returns, so there is nothing to subscribe to and no log to replay. `ai_functions.scope()` binds one shared runtime for a block and yields its coordinator; every bare call inside the block runs there:

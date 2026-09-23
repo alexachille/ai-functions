@@ -6,10 +6,10 @@ fields that apply to that kind.
 
 System events have ``kind`` values drawn from ``EventKind`` (a ``StrEnum``).
 User-defined events use any other string: subclass ``CustomEvent``, set
-``kind`` to a stable application-level identifier, and add whatever fields
-you need. Pydantic routes unknown ``kind`` values to ``CustomEvent`` via a
-custom discriminator function, so the full ``Event`` union round-trips
-across the wire without losing user-defined subclasses.
+``kind`` to a stable application-level identifier, and add application fields
+that do not redefine event metadata. The default ``Event`` union parses
+unknown kinds as generic ``CustomEvent`` instances; consumers that need their
+own subclass apply its model or a union containing it explicitly.
 
 Filtering is uniform for both system and custom events — pass any ``kind``
 string (``EventKind`` member or plain string) to ``Coordinator.on(kinds=...)``
@@ -25,7 +25,7 @@ import enum
 import time
 from typing import Annotated, Literal, TypeGuard
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny
 from strands.types.content import ContentBlock
 from strands.types.tools import ToolResultContent, ToolResultStatus
 
@@ -449,18 +449,44 @@ class TraceDelegationEvent(BaseEvent):
 # ── User-defined extension ──
 
 
-class CustomEvent(BaseModel):
+class CustomEvent(BaseEvent):
     """Catch-all event for user-defined ``kind`` values.
 
-    A ``mode="before"`` validator reshapes flat input dicts: all keys
-    other than declared model fields land inside ``payload``. A
-    ``model_serializer`` flattens on the way out, so the wire format
-    round-trips through pydantic.
+    Carries the same routing fields as every other event (``id``,
+    ``timestamp``, ``thread_id``, ``thread_name``, ``message_id``), so routing
+    survives the wire: a subscription filtered by ``thread_id`` matches a
+    custom event that arrived over a ``CoordinatorClient``, ``get_events``
+    returns it under its own thread, and ``Coordinator.append_event`` accepts
+    it from a client that stamped the id itself.
+
+    A ``mode="before"`` validator reshapes flat input dicts: all keys other
+    than declared model fields land inside ``payload``. A ``model_serializer``
+    flattens on the way out, emitting the declared fields next to the
+    payload's entries, so the wire format round-trips through pydantic.
+
+    A top-level key that names a declared field binds to that field, so
+    ``CustomEvent(kind="k", thread_id=tid)`` routes rather than filling
+    ``payload``. Payload entries must not shadow any declared field or field
+    alias, including ``kind`` and ``payload`` itself. Conflicts raise an error;
+    rename application fields (for example, ``item_id``) or nest them under an
+    application key (for example, ``payload={"item": {"id": ...}}``). The wire
+    representation stays flat; the serializer never nests conflicting keys.
+
+    Subclasses may declare typed application fields and specialize ``kind``.
+    They must not redefine ``BaseEvent`` fields or alias application fields
+    onto the routing fields, ``kind``, or ``payload``. These names retain their
+    framework meanings, including when the model is serialized with aliases.
+
+    ``BaseEvent`` is frozen, so an instance is immutable; build a routed copy
+    with ``model_copy(update={"thread_id": ...})``.
 
     If ``payload`` is provided explicitly, any extra top-level keys are
     merged into it (extras take precedence over explicit-payload entries
     that have the same key). Known declared fields on subclasses (if any)
     are preserved as-is and not swept into ``payload``.
+
+    Invariants:
+        I2.
     """
 
     kind: str
@@ -479,17 +505,30 @@ SystemEvent = Annotated[
     Field(discriminator="kind")
 ]
 
-Event = SystemEvent | CustomEvent
+Event = Annotated[SystemEvent | SerializeAsAny[CustomEvent], Field(union_mode="left_to_right")]
 """Tagged union of every built-in event variant plus the ``CustomEvent`` fallback.
 
-Pydantic tries union members left-to-right (with the discriminated union
-as a single fast-path attempt first). If ``kind`` does not match any
-``SystemEvent``, it falls through to ``CustomEvent``, whose
+Pydantic tries union members left-to-right: the discriminated ``SystemEvent``
+union is a single fast-path attempt on ``kind``, and only a kind that matches
+no built-in variant falls through to ``CustomEvent``, whose
 ``model_validator(mode="before")`` reshapes the raw dict into
-``{kind, payload}``.
+``{kind, routing fields, payload}`` — every key outside ``CustomEvent``'s
+declared fields lands in ``payload``, so an unknown kind never loses data
+and never loses its routing.
+
+``union_mode="left_to_right"`` is what keeps a built-in kind out of
+``CustomEvent``: smart mode tie-breaks two matching members by the number of
+fields set, and ``CustomEvent`` declares every routing field, so it would
+outscore the concrete variant a built-in kind belongs to and swallow it.
 
 Users can write their own union to add correct parsing of their own
 event types.
+
+``SerializeAsAny`` makes the custom branch serialize the concrete model's fields
+and serializers, including inside ``Event``-typed fields and containers. RPC
+parameters and session logs inherit this policy without per-call flags. Input
+validation still uses the declared union: a peer that does not know the subclass
+receives a generic ``CustomEvent`` with application fields collected in ``payload``.
 """
 
 

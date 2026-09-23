@@ -6,10 +6,10 @@ fields that apply to that kind.
 
 System events have ``kind`` values drawn from ``EventKind`` (a ``StrEnum``).
 User-defined events use any other string: subclass ``CustomEvent``, set
-``kind`` to a stable application-level identifier, and add whatever fields
-you need. Pydantic routes unknown ``kind`` values to ``CustomEvent`` via a
-custom discriminator function, so the full ``Event`` union round-trips
-across the wire without losing user-defined subclasses.
+``kind`` to a stable application-level identifier, and add application fields
+that do not redefine event metadata. The default ``Event`` union parses
+unknown kinds as generic ``CustomEvent`` instances; consumers that need their
+own subclass apply its model or a union containing it explicitly.
 
 Filtering is uniform for both system and custom events — pass any ``kind``
 string (``EventKind`` member or plain string) to ``Coordinator.on(kinds=...)``
@@ -26,7 +26,16 @@ import time
 import uuid
 from typing import Annotated, Any, Literal, TypeGuard, cast, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    model_serializer,
+    model_validator,
+)
 from strands.types.content import ContentBlock
 from strands.types.tools import ToolResultContent, ToolResultStatus
 
@@ -471,22 +480,98 @@ class TraceDelegationEvent(BaseEvent):
 # ── User-defined extension ────────────────────────────────────────────────────
 
 
-class CustomEvent(BaseModel):
+def _alias_keys(alias: str | AliasPath | AliasChoices | None) -> set[str]:
+    """Return the top-level input keys consumed by a field's validation alias."""
+    if isinstance(alias, str):
+        return {alias}
+    if isinstance(alias, AliasPath):
+        return {alias.path[0]} if isinstance(alias.path[0], str) else set()
+    if isinstance(alias, AliasChoices):
+        return {key for choice in alias.choices for key in _alias_keys(choice)}
+    return set()
+
+
+class CustomEvent(BaseEvent):
     """Catch-all event for user-defined ``kind`` values.
 
-    A ``mode="before"`` validator reshapes flat input dicts: all keys
-    other than declared model fields land inside ``payload``. A
-    ``model_serializer`` flattens on the way out, so the wire format
-    round-trips through pydantic.
+    Carries the same routing fields as every other event (``id``,
+    ``timestamp``, ``thread_id``, ``thread_name``, ``message_id``), so routing
+    survives the wire: a subscription filtered by ``thread_id`` matches a
+    custom event that arrived over a ``CoordinatorClient``, ``get_events``
+    returns it under its own thread, and ``Coordinator.append_event`` accepts
+    it from a client that stamped the id itself.
+
+    A ``mode="before"`` validator reshapes flat input dicts: all keys other
+    than declared model fields land inside ``payload``. A ``model_serializer``
+    flattens on the way out, emitting the declared fields next to the
+    payload's entries, so the wire format round-trips through pydantic.
+
+    A top-level key that names a declared field binds to that field, so
+    ``CustomEvent(kind="k", thread_id=tid)`` routes rather than filling
+    ``payload``. Payload entries must not shadow any declared field or field
+    alias, including ``kind`` and ``payload`` itself. Conflicts raise an error;
+    rename application fields (for example, ``item_id``) or nest them under an
+    application key (for example, ``payload={"item": {"id": ...}}``). The wire
+    representation stays flat; the serializer never nests conflicting keys.
+
+    Subclasses may declare typed application fields and specialize ``kind``.
+    They must not redefine ``BaseEvent`` fields or alias application fields
+    onto the routing fields, ``kind``, or ``payload``. These names retain their
+    framework meanings, including when the model is serialized with aliases.
+
+    ``BaseEvent`` is frozen, so an instance is immutable; build a routed copy
+    with ``model_copy(update={"thread_id": ...})``.
 
     If ``payload`` is provided explicitly, any extra top-level keys are
     merged into it (extras take precedence over explicit-payload entries
     that have the same key). Known declared fields on subclasses (if any)
     are preserved as-is and not swept into ``payload``.
+
+    Invariants:
+        I2.
     """
 
     kind: str
     payload: dict[str, object] = Field(default_factory=dict[str, object])
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:  # pyright: ignore[reportExplicitAny]
+        """Reject subclass declarations that repurpose framework field names."""
+        super().__pydantic_init_subclass__(**kwargs)
+        metadata = set(BaseEvent.model_fields)
+        redefined: set[str] = set()
+        for base in cls.__mro__:
+            if base is CustomEvent:
+                break
+            redefined.update(metadata.intersection(base.__dict__.get("__annotations__", {})))
+        if redefined:
+            raise TypeError(f"CustomEvent subclasses cannot redefine BaseEvent fields: {', '.join(sorted(redefined))}")
+        reserved = metadata | {"kind", "payload"}
+        for name, field in cls.model_fields.items():
+            aliases = _alias_keys(field.validation_alias)
+            if field.serialization_alias is not None:
+                aliases.add(field.serialization_alias)
+            conflicts = (aliases - {name}) if name in reserved else (aliases & reserved)
+            if conflicts:
+                raise TypeError(
+                    f"CustomEvent field {name!r} has an alias conflicting with framework fields: "
+                    f"{', '.join(sorted(conflicts))}; rename or nest application data"
+                )
+
+    @classmethod
+    def _check_payload_keys(cls, payload: dict[str, object]) -> None:
+        """Reject keys that would overwrite declared fields when flattened."""
+        declared = set(cls.model_fields)
+        for field in cls.model_fields.values():
+            declared.update(_alias_keys(field.validation_alias))
+            if field.serialization_alias is not None:
+                declared.add(field.serialization_alias)
+        conflicts = declared.intersection(payload)
+        if conflicts:
+            raise ValueError(
+                f"CustomEvent payload keys conflict with declared event fields: {', '.join(sorted(conflicts))}; "
+                "rename or nest application data"
+            )
 
     @model_validator(mode="before")
     @classmethod
@@ -504,6 +589,8 @@ class CustomEvent(BaseModel):
             return data
         raw = cast("dict[object, object]", data)
         known = set(cls.model_fields.keys())
+        for field in cls.model_fields.values():
+            known.update(_alias_keys(field.validation_alias))
         explicit_payload = raw.get("payload")
         payload: dict[str, object] = {}
         if isinstance(explicit_payload, dict):
@@ -514,26 +601,31 @@ class CustomEvent(BaseModel):
                 continue
             extras[key] = value
         payload.update(extras)
+        cls._check_payload_keys(payload)
         reshaped: dict[str, object] = {k: v for k, v in raw.items() if isinstance(k, str) and k in known}
         reshaped["payload"] = payload
         return reshaped
 
     @model_serializer(mode="wrap")
     def _flatten_payload(self, handler: Any) -> dict[str, object]:  # pyright: ignore[reportAny, reportExplicitAny]
-        """Emit a flat dict: ``{"kind": ..., **payload}``.
+        """Emit a flat dict: the declared fields plus the payload's entries.
 
         Args:
             handler: Pydantic's default serializer for the model.
 
         Returns:
-            A flat dict where ``payload`` contents appear at the top
-            level alongside ``kind``. ``payload`` itself is never a key
-            in the output, even when empty.
+            A flat dict carrying ``kind``, the routing fields inherited from
+            :class:`BaseEvent`, and every payload entry at the top level.
+            ``payload`` itself never appears as a key. A conflicting payload
+            raises even if it was introduced after validation by mutating the
+            payload dict or using ``model_copy(update=...)``.
         """
         default = cast("dict[str, object]", handler(self))
         payload = default.pop("payload", None)
         if isinstance(payload, dict):
-            default.update(cast("dict[str, object]", payload))
+            entries = cast("dict[str, object]", payload)
+            self._check_payload_keys(entries)
+            default.update(entries)
         return default
 
 
@@ -564,16 +656,28 @@ SystemEvent = Annotated[
     Field(discriminator="kind"),
 ]
 
-Event = SystemEvent | CustomEvent
+Event = Annotated[SystemEvent | SerializeAsAny[CustomEvent], Field(union_mode="left_to_right")]
 """Tagged union of every built-in event variant plus the ``CustomEvent`` fallback.
 
-Pydantic tries union members left-to-right (with the discriminated union as a single
-fast-path attempt first). If kind doesn't match any SystemEvent, it falls through to
-CustomEvent, whose model_validator(mode="before") reshapes the raw dict into
-{kind, payload}.
+Pydantic tries union members left-to-right: the discriminated SystemEvent union is a
+single fast-path attempt on ``kind``, and only a kind that matches no built-in variant
+falls through to CustomEvent, whose model_validator(mode="before") reshapes the raw dict
+into {kind, routing fields, payload} — every key outside CustomEvent's declared fields
+lands in payload, so an unknown kind never loses data and never loses its routing.
+
+``union_mode="left_to_right"`` is what keeps a built-in kind out of CustomEvent: smart
+mode tie-breaks two matching members by the number of fields set, and CustomEvent
+declares every routing field, so it would outscore the concrete variant a built-in kind
+belongs to and swallow it.
 
 Users can write their own union like the above to add correct parsing of their own
 event types.
+
+``SerializeAsAny`` makes the custom branch serialize the concrete model's fields and
+serializers, including when it appears inside an ``Event``-typed field or container.
+RPC parameters and session logs inherit this policy without per-call flags. Input
+validation still uses the declared union: a peer that does not know the subclass
+receives a generic ``CustomEvent`` with the application fields collected in ``payload``.
 """
 
 
