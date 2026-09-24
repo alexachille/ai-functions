@@ -78,7 +78,7 @@ This project uses [hatchling](https://hatch.pypa.io/latest/build/#hatchling) as 
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run the default suite (excludes Lean and optional tests)
 hatch run test
 
 # Run tests with coverage
@@ -90,6 +90,30 @@ hatch run test tests/test_specific.py
 # Run tests with hypothesis for property-based testing
 pytest tests/
 ```
+
+Verification tests use real Lean with scripted model responses:
+
+```bash
+# Regular verification checks
+pytest -m 'lean and not optional'
+
+# Native ABI and floating-point build checks
+pytest -m optional tests/test_verified_compile_ffi.py tests/test_verified_compile_compile.py
+
+# Optional parallel execution, grouping tests that share prepared projects
+pytest -n auto --dist loadgroup -m 'lean and not optional'
+```
+
+Lean helpers and the native bridge use a persistent test cache. First runs can
+take longer to build them. Set `AI_FUNCTIONS_REQUIRE_VERIFIED_NATIVE=1` on a
+native verification job so missing prerequisites or bridge build failures fail
+the job instead of skipping its native tests.
+
+Keep routine Lean tests focused on a few complete verification scenarios.
+Reuse a compiled fixture when only the checker expectation changes, and add
+input cases to an existing native function instead of building another one.
+The optional ABI tests exercise the C bridge and compiler flags; run them when
+changing native code or upgrading the toolchain.
 
 ### Code Quality Tools
 

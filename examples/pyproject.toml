@@ -10,6 +10,7 @@ dependencies = [
     "yfinance>=0.2.40",
     "plotly>=5.20",
     "sympy>=1.14.0",
+    "networkx>=3.0",
     "strands-agents-tools>=0.8.2",
 ]
 

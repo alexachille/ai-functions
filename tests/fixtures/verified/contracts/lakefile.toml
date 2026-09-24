@@ -1,0 +1,4 @@
+name = "contracts"
+
+[[lean_lib]]
+name = "Contracts"

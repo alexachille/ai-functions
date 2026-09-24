@@ -36,6 +36,8 @@ dependencies = [
     "rich>=13.7",
     "textual>=0.70",
     "platformdirs>=4.0",
+    # Lean cache locks, shared by threads and processes.
+    "filelock>=3.15",
     # Memory/optimizer rendering serializes parameter values to YAML.
     "pyyaml>=6.0.1",
     "smolagents>=1.24.0",
@@ -90,6 +92,8 @@ dependencies = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0",
+    "pytest-xdist>=3.6",
+    "pytest-timeout>=2.3",
     "hypothesis>=6.92.0",
     "ruff>=0.1.0",
     "mypy>=1.20.0",
@@ -100,6 +104,8 @@ dependencies = [
     "rich>=13.7",
     "textual>=0.70",
     "platformdirs>=4.0",
+    # Lean cache locks, shared by threads and processes.
+    "filelock>=3.15",
     "agent-client-protocol>=0.12.1,<0.13",
     "mcp>=1.29,<3",
     "uvicorn>=0.30",
@@ -130,7 +136,13 @@ python_files = ["test_*.py", "*_test.py"]
 asyncio_mode = "auto"
 markers = [
     "integration: runs a real agent runtime binary (hermetic; model layer mocked)",
+    "optional: unlikely to catch regressions from ordinary edits; run with `-m optional` when touching that area",
+    "lean: starts a Lean process (server, lake, lean, leanc, a support executable, or a compile); run with `-m lean`",
 ]
+# For parallel runs use `-n auto --dist loadgroup` to share prepared projects.
+addopts = ["-m", "not lean and not optional"]
+# Include first-run Lean helper builds; individual process operations also have deadlines.
+timeout = 120
 filterwarnings = [
     "ignore:websockets\\.legacy is deprecated:DeprecationWarning:websockets.legacy",
 ]

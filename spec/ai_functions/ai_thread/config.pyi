@@ -74,6 +74,7 @@ class ThreadKwargs(TypedDict, total=False):
     post_conditions: list[PostCondition]
     max_attempts: int
     structured_output: bool
+    result_tool: str | None
     code_execution_mode: CodeExecutionMode | str
     code_executor_additional_imports: list[str]
     code_executor_kwargs: dict[str, Any]
@@ -116,6 +117,8 @@ class ThreadConfig:
     structured_output: bool = True
     """Whether to use structured output mode (agent has to call a tool to
     provide an answer). Can be ``False`` only if the output type is ``str``."""
+    result_tool: str | None = None
+    """Optional tool returning a checked result through request_state["tool_result"]."""
 
     code_execution_mode: CodeExecutionMode | str = CodeExecutionMode.DISABLED
     """Whether the agent may execute Python via a sandboxed ``python_executor``

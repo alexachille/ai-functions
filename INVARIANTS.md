@@ -280,3 +280,54 @@ condition stops the search, keeping the best result so far.
 Classes that must agree: every value-ranking `Policy`
 (`ReservationPricePolicy`, `Greedy`), `EconomicThread.execute`
 (which raises the typed failure), and `EconomicFunction.plan`.
+
+# Verification invariants (V-series)
+
+Principles of `ai_functions.experimental.verified` (`verified.ai_function` and
+`verified.ai_compile`). An AI agent writes Lean code
+(definitions, proofs, answers, tool arguments) that is combined with Lean code
+the system generates (the call's inputs, the goal to prove, facts observed from
+tools) and checked by Lean.
+
+## V1 — Trust comes only from an independent final check
+
+A result is certified, or a native function accepted, only after a fresh,
+independent checker has verified the complete Lean file from scratch. What Lean
+reports while the agent is working is feedback to the agent, never evidence. If
+the interactive and the final check disagree, the run fails.
+
+## V2 — Restrictions on the AI's Lean code are exact and applied everywhere
+
+The restrictions on the agent's code — no new axioms, no unfinished proofs,
+nothing that executes code on the host — apply to exactly the parts the agent
+wrote, and identically during interactive work and in the final check. The
+system's own code is not subject to them, and the agent's code cannot escape
+them.
+
+## V3 — The agent cannot change what the system's Lean code means
+
+The final check interprets the system's own declarations — the inputs, the goal,
+the observed facts — separately, without any of the agent's code, and requires
+the checked file to contain exactly those declarations. Agent code cannot
+redefine or reinterpret them, for example by declaring a name, notation or
+instance that changes how the goal reads.
+
+## V4 — Application declarations are fixed once prepared
+
+The Lean declarations an application supplies are fixed when its Lean project is
+prepared. The same declarations, unchanged, are then used by every agent
+session, every final check, every saved certificate, and every compiled function
+built from that project.
+
+## V5 — Only the system introduces assumptions
+
+A certified result may rely only on Lean's standard logical axioms and on facts
+the system recorded during that call: values returned by tools, and readings the
+agent was explicitly allowed to assert. The agent cannot add an assumption of its
+own, and every assumption a result relies on is listed with it.
+
+## V6 — Application sources are never modified
+
+The application's Lean project folder is only ever read. Build outputs,
+downloaded dependencies, scratch files and compiled artifacts are stored
+elsewhere.

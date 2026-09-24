@@ -108,16 +108,24 @@ ai_functions.ai_thread.debug
 # ``ErrorKind = Literal["cancelled", "not_found", ...]``: same Literal-alias false positive as
 # runtime.coordinator_tools_core.SendMessageMode.
 ai_functions.network.wire.ErrorKind
+# ``Kind = Literal["definition", "provenance", ...]``: the same Literal-alias false positive.
+ai_functions.experimental.verified.function._session.Kind
 
-# Same PEP 695 and optional-first-argument factory limitations as ai_function.
-# The public decorator and callable methods are specified in experimental/verified_compile/function.pyi.
-ai_functions.experimental.verified_compile.function._TypedDecorator.__type_params__
-ai_functions.experimental.verified_compile.function._VerifiedFunction.__type_params__
-ai_functions.experimental.verified_compile.function._TypedDecorator.__call__
-ai_functions.experimental.verified_compile.function._VerifiedFactory.__call__
+# Same PEP 695 limitations as ai_function.
+# The public decorator and callable methods are specified in experimental/verified/compile/function.pyi.
+ai_functions.experimental.verified.compile.function._CompiledFunction.__type_params__
 
-# Private compiler, contract IR, and failure categories are implementation
-# details behind the single verified_ai_compile decorator, not additional APIs.
-ai_functions.experimental.verified_compile.compiler
-ai_functions.experimental.verified_compile.contracts
-ai_functions.experimental.verified_compile.errors
+# The private compiler and native signature (including the native ABI's type
+# table) are implementation details behind the verified.ai_compile decorator.
+ai_functions.experimental.verified.compile.compiler
+ai_functions.experimental.verified.compile.signature
+
+# PEP 695 generic metadata and recursive alias representation, as above.
+ai_functions.experimental.verified.function._decorator.VerifiedFunction.__type_params__
+ai_functions.experimental.verified.function.types.Guarantees
+
+# The DSL translator is private machinery behind dsl.definitions; the spec
+# documents only that surface.
+ai_functions.experimental.verified.dsl.translate
+# Definitions are made only by a project's decorators; the constructor is private.
+ai_functions.experimental.verified.dsl.definitions.Definition.__init__
