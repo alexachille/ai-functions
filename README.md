@@ -35,7 +35,7 @@
 
 Strands AI Functions is a Python library built around a new abstraction: functions that behave like standard Python functions, but are evaluated by AI agents. The library develops this idea from a single verified call up to distributed teams of agents that improve run over run:
 
-- **Don't prompt-and-pray** — Declare *post-conditions* on a function and the library runs a self-correcting loop until the output satisfies them, preventing cascading errors in complex workflows.
+- **Don't prompt-and-pray** — Declare *post-conditions* on a function and the library runs a self-correcting loop until the output satisfies them, preventing cascading errors in complex workflows. When checking the output isn't enough, ask for a proof: state formal rules, and each answer is returned proven correct. Or have the agent write an implementation proved correct for every input, and run it as native code with no model calls.
 - **Native Python objects** — Agents can dynamically generate and execute code, so an AI Function can take and return real Python values (a `DataFrame`, not a JSON blob).
 - **Just functions** — Run them in parallel with `asyncio.gather`, pass them to other agents as tools, and share them as ordinary Python libraries.
 - **Stateful threads and teams** — Spawn a function into a live **AI Thread** that keeps its history; run several threads on a coordinator and let them discover and message each other.
@@ -134,6 +134,29 @@ summary = await summarize_meeting(transcripts)  # a validated MeetingSummary ins
 ```
 
 Each direct call is a one-shot: it runs on a fresh, private thread and keeps no history between calls (for state, see [Stateful AI Threads](#stateful-ai-threads) below).
+
+### From checks to proofs
+
+Post-conditions work well when the correctness of a result is easy to check. But sometimes a result can only be shown correct by showing that its derivation is correct. For example, the answer to a question about a policy is right only if it follows from records retrieved from trusted sources, with every relevant rule applied correctly. The `ai_functions.experimental.verified` module supports exactly this. You write the policy in Lean or Python, and the agent returns the answer together with a proof, which Lean checks before the call returns. Each answer comes with a certificate listing what the proof trusts: the records returned by your tools, and the agent's judgments, such as how it read the question.
+
+```python
+from ai_functions.experimental import verified
+
+@verified.ai_function(
+    contract=HR.DecisionCorrect,                  # a correct decision, defined in Lean
+    tools=[tenure_months, vacation_days_left],    # tool results become facts the proof can use
+    judgments=[HR.requestedLeave],                # what the agent must read from the message
+)
+def decide(employee: str, message: str) -> bool:
+    """Decide the leave request employee {employee} sent: "{message}" """
+
+
+@verified.ai_compile(contract=best_payout)        # proved once, for every input
+def max_payout(balance_cents: int, fixed_fee_cents: int, fee_bps: int, limit_cents: int) -> int:
+    """Return the largest affordable payout in cents."""
+```
+
+Sometimes the same derivation works for every input, with no records to look up or messages to interpret. Rather than running an agent on every call, `verified.ai_compile` has the agent write a program once and prove that it satisfies the contract for *every* input. After that, the function is compiled to machine code and runs with no model involved. See the [verified documentation](docs/verified.md), and the [leave-request](examples/verified/hr.py) and [payout](examples/verified/payout.py) examples.
 
 ## Native Python Objects
 

@@ -1,0 +1,4 @@
+name = "pricing"
+
+[[lean_lib]]
+name = "Pricing"

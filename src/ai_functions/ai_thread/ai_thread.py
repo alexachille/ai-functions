@@ -418,6 +418,7 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
             not self._output_spec.is_structured
             and self._output_spec.is_wrapped
             and config.code_execution_mode != CodeExecutionMode.LOCAL
+            and config.result_tool is None
         ):
             raise AIFunctionError(
                 f"Return type {template.output_type!r} is not JSON-serializable, so it can only be "
@@ -587,7 +588,7 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         if preamble:
             turn_parts.append(preamble)
         turn_parts.append(prompt)
-        result_instruction = self._final_result_instruction(plan)
+        result_instruction = self._final_result_instruction(plan, cycle_config.result_tool)
         if result_instruction:
             turn_parts.append(result_instruction)
         self._inject_buffer.append("\n\n".join(turn_parts))
@@ -627,12 +628,14 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
                 # calling final_answer; that is recoverable, so retry with
                 # guidance naming the available output channels. Without code
                 # execution there is no channel left to retry, so fail.
-                if isinstance(plan, DisabledPlan):
+                if isinstance(plan, DisabledPlan) and cycle_config.result_tool is None:
                     raise AIFunctionError(
                         "Agent produced neither a structured output nor a python_executor final_answer result.",
                         function_name=function_name,
                     ) from None
-                guidance = f"[VALIDATION ERROR]\nNo result was produced.\n\n{self._final_result_instruction(plan)}"
+                guidance = "[VALIDATION ERROR]\nNo result was produced.\n\n" + self._final_result_instruction(
+                    plan, cycle_config.result_tool
+                )
                 self._inject_buffer.append(guidance)
                 continue
 
@@ -662,13 +665,15 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
             function_name=function_name,
         )
 
-    def _final_result_instruction(self, plan: CodeExecutionPlan | DisabledPlan) -> str:
+    def _final_result_instruction(self, plan: CodeExecutionPlan | DisabledPlan, result_tool: str | None = None) -> str:
         """Compose the final-result instruction from the available output channels.
 
         Lists the structured-output tool (when structured output is on) and/or
         the executor's ``final_answer`` call (when code execution is on). Empty
         when neither channel exists (plain-str output without code execution).
         """
+        if result_tool is not None:
+            return f"IMPORTANT: To provide your final result, use the {result_tool} tool."
         channels: list[str] = []
         if self._output_spec.is_structured and self._output_spec.structured_output_model is not None:
             channels.append(f"use the {self._output_spec.structured_output_model.__name__} tool")
@@ -818,7 +823,9 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         # the type supports it. A wrapped-but-non-serializable type keeps its
         # model on ``spec`` (for the executor's final_answer) but must NOT be
         # passed here, or Strands would fail generating a JSON schema for it.
-        strands_output_model = spec.structured_output_model if spec.is_structured else None
+        strands_output_model = (
+            spec.structured_output_model if spec.is_structured and not cycle_config.result_tool else None
+        )
 
         system_prompt = cycle_config.system_prompt or _DEFAULT_SYSTEM_PROMPT
 
@@ -974,7 +981,9 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
         # it takes precedence — the agent explicitly committed to this
         # answer via final_answer(...). Otherwise fall back to structured
         # output and then to executor result as a last resort.
-        claimed = plan.claim_result(response, state)
+        claimed = state.get("tool_result")
+        if claimed is None:
+            claimed = plan.claim_result(response, state)
         if claimed is not None:
             structured: BaseModel | None = claimed
         else:

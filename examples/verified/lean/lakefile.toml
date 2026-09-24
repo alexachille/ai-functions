@@ -1,0 +1,21 @@
+name = "verified_examples"
+version = "0.1.0"
+defaultTargets = ["HR", "LeavePolicy", "Access", "Audit", "MIS", "Lookup"]
+
+[[lean_lib]]
+name = "HR"
+
+[[lean_lib]]
+name = "LeavePolicy"
+
+[[lean_lib]]
+name = "Access"
+
+[[lean_lib]]
+name = "Audit"
+
+[[lean_lib]]
+name = "MIS"
+
+[[lean_lib]]
+name = "Lookup"
